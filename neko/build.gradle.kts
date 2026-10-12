@@ -10,6 +10,12 @@ repositories {
 }
 
 dependencies {
+    // The root `gradle.properties` turns off the Kotlin plugin's automatic standard-library
+    // dependency, because `plugin/idea` must not receive one: it runs inside the IDE, which already
+    // ships a Kotlin standard library. This module, by contrast, runs on a plain JVM — `neko`'
+    // command line and its tests — so it has to ask for the standard library itself.
+    implementation(kotlin("stdlib"))
+
     implementation("org.ow2.asm:asm:9.9")
 
     testImplementation(kotlin("test"))
