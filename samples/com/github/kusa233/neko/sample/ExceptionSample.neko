@@ -1,0 +1,21 @@
+locate com.github.kusa233.neko.sample
+
+class ExceptionSample() {
+    static fun main(args: string[]) {
+        result: int = try emitTest(true) { emit1, emit2 ->
+            println(emit1)
+            println(emit2)
+            yield 1
+        }
+        println(result)
+    }
+
+    static fun emitTest(flag: bool): int {
+        if (flag) {
+            raise 123, 456
+            // Unreachable, notice as error level.
+        } else {
+            return 789
+        }
+    } emit [int, int]
+}

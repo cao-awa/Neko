@@ -1,0 +1,1990 @@
+package com.github.kusa233.neko.parser
+
+import com.github.kusa233.neko.ast.*
+import com.github.kusa233.neko.diagnostics.DiagnosticBag
+import com.github.kusa233.neko.lexer.Lexer
+import com.github.kusa233.neko.lexer.Token
+import com.github.kusa233.neko.lexer.TokenType
+import com.github.kusa233.neko.source.SourceFile
+import com.github.kusa233.neko.source.Span
+
+/**
+ * A recursive-descent parser for Neko that produces an [NekoFile].
+ *
+ * Two properties matter for the diagnostics requirement:
+ *
+ *  * **Precision.** Every node and every reported error carries the [Span] of the exact token that
+ *    caused it, so an error points at `str` rather than at line 16 as a whole.
+ *  * **Recovery.** On error the parser reports and then synchronises to the next statement or
+ *    member boundary instead of aborting. One bad line therefore yields one clear diagnostic rather
+ *    than a cascade of confusing follow-on errors.
+ *
+ * ### Newline handling
+ *
+ * Neko is newline-sensitive (as Kotlin is): a physical line break ends a statement. Two contexts
+ * deliberately ignore newlines — parenthesised and bracketed lists, so that argument lists and
+ * parameter lists may wrap — while a lambda *body* always restores newline significance, because
+ * its `{ ... }` holds ordinary statements.
+ */
+class Parser(private val source: SourceFile, private val diagnostics: DiagnosticBag) {
+
+    private val tokens: List<Token>
+    private var index = 0
+
+    /** See [skipNestedNewlines]: greater than zero while inside `(` or `[`. */
+    private var newlineInsensitiveDepth = 0
+
+    init {
+        val lexerDiagnostics = DiagnosticBag()
+        tokens = Lexer(source, lexerDiagnostics).lex()
+        diagnostics.addAll(lexerDiagnostics)
+    }
+
+    /** Parses the whole file. */
+    fun parseFile(): NekoFile {
+        val first = current()
+        val packageDeclaration = parsePackageDeclaration()
+        skipNewlines()
+
+        val imports = mutableListOf<ImportDeclaration>()
+        // Imports come between `locate` and the first declaration. They are collected in a loop
+        // rather than required in one run so that a missing `locate` still reports its own error
+        // first, and so `import` remains a keyword the statement parser can point at.
+        while (at(TokenType.IMPORT)) {
+            parseImportDeclaration()?.let { imports += it }
+            skipNewlines()
+        }
+
+        val classes = mutableListOf<ClassDeclaration>()
+        while (!at(TokenType.END_OF_FILE)) {
+            val before = index
+            parseClassDeclaration()?.let { classes += it }
+            if (index == before) advance() // Guarantee progress on malformed input.
+            skipNewlines()
+        }
+
+        val last = current()
+        return NekoFile(
+            packageDeclaration = packageDeclaration,
+            imports = imports,
+            classes = classes,
+            span = Span(source, first.span.start, last.span.end),
+        )
+    }
+
+    // ------------------------------------------------------------- declarations
+
+    /** `locate com.github.kusa233.neko.stdlib.emit` */
+    private fun parsePackageDeclaration(): PackageDeclaration? {
+        if (!at(TokenType.LOCATE)) return null
+        val locateToken = advance()
+        skipNewlines()
+
+        if (!isNameSegment(current())) {
+            error(
+                "expected a package name after 'locate' but found ${current().describe()}",
+                current().span,
+            )
+            return null
+        }
+
+        val (name, nameSpan) = parseDottedName(locateToken, "a package name segment")
+        return PackageDeclaration(name, name.split('.'), nameSpan)
+    }
+
+    /** `import com.github.kusa233.neko.stdlib.emit` */
+    private fun parseImportDeclaration(): ImportDeclaration? {
+        val keyword = advance() // `import`
+        skipNewlines()
+
+        if (!isNameSegment(current())) {
+            error(
+                "expected a package name after 'import' but found ${current().describe()}",
+                current().span,
+            )
+            synchronizeToStatement()
+            return null
+        }
+
+        val (name, nameSpan) = parseDottedName(keyword, "an imported package name segment")
+        return ImportDeclaration(name, name.split('.'), nameSpan)
+    }
+
+    /**
+     * Reads a dotted name, e.g. `com.github.kusa233.neko.stdlib.emit`.
+     *
+     * Shared by `locate` and `import`, which are the two places a fully-qualified package name
+     * appears, so both accept the same segments and report the same way. [owner] is the keyword token
+     * the span starts from when the name turns out to be empty.
+     */
+    private fun parseDottedName(owner: Token, expected: String): Pair<String, Span> {
+        val segments = mutableListOf<String>()
+        var startOffset = -1
+        var endOffset = owner.span.end
+        while (true) {
+            if (!isNameSegment(current())) {
+                error("expected $expected but found ${current().describe()}", current().span)
+                break
+            }
+            val segment = advance()
+            if (startOffset < 0) startOffset = segment.span.start
+            endOffset = segment.span.end
+            segments += segment.text
+            if (at(TokenType.DOT)) {
+                advance()
+                continue
+            }
+            break
+        }
+
+        val span = Span(source, if (startOffset < 0) owner.span.start else startOffset, endOffset)
+        return segments.joinToString(".") to span
+    }
+
+    /**
+     * Whether [token] can stand as one dotted-name segment.
+     *
+     * A keyword is accepted here: a package name is a name, not a use of the language's grammar, and
+     * the standard library lives in `com.github.kusa233.neko.stdlib.emit`. Reserved words stay
+     * reserved everywhere a *statement* or *declaration* is expected — this leniency is confined to
+     * the dotted name after `locate` and `import`, where no keyword could mean anything else.
+     */
+    private fun isNameSegment(token: Token): Boolean =
+        token.type == TokenType.IDENTIFIER || token.type in NAME_SEGMENT_KEYWORDS
+
+    /** What a class member declaration looks like once its modifiers are skipped. */
+    private enum class MemberKind { FIELD, FUNCTION, CONSTRUCTOR, UNKNOWN }
+
+    private fun memberKindAhead(): MemberKind {
+        var offset = 0
+        while (isModifier(peek(offset).type)) offset++
+        return when (peek(offset).type) {
+            TokenType.VAL, TokenType.VAR -> MemberKind.FIELD
+            TokenType.FUN -> MemberKind.FUNCTION
+            TokenType.CONSTRUCTOR -> MemberKind.CONSTRUCTOR
+            else -> MemberKind.UNKNOWN
+        }
+    }
+
+    private fun isModifier(type: TokenType): Boolean =
+        type == TokenType.PRIVATE || type == TokenType.PUBLIC ||
+            type == TokenType.PROTECTED || type == TokenType.STATIC
+
+    /** `private class Sample { ... }`, `interface EmitExtractor<T> { ... }` */
+    private fun parseClassDeclaration(): ClassDeclaration? {
+        val start = current()
+        val modifiers = parseModifiers()
+
+        val isInterface = when {
+            at(TokenType.CLASS) -> false
+            at(TokenType.INTERFACE) -> true
+            else -> {
+                error(
+                    "expected a class declaration but found ${current().describe()}; " +
+                        "only class and interface declarations may appear at the top level of an " +
+                        "Neko file",
+                    current().span,
+                )
+                synchronizeToDeclaration()
+                return null
+            }
+        }
+        val keyword = advance()
+        val kindWord = if (isInterface) "interface" else "class"
+
+        val nameToken = expect(TokenType.IDENTIFIER, "expected a $kindWord name but found ${current().describe()}")
+            ?: run {
+                synchronizeToDeclaration()
+                return null
+            }
+
+        // Type parameters, erased to `Object` at run time: `class Box<T>`.
+        val typeParameters = mutableListOf<String>()
+        if (at(TokenType.LESS)) {
+            advance()
+            skipNestedNewlines()
+            while (true) {
+                skipNestedNewlines()
+                val parameter = expect(
+                    TokenType.IDENTIFIER,
+                    "expected a type parameter name but found ${current().describe()}",
+                ) ?: break
+                if (typeParameters.any { it == parameter.text }) {
+                    error("duplicate type parameter '${parameter.text}'", parameter.span)
+                } else {
+                    typeParameters += parameter.text
+                }
+                skipNestedNewlines()
+                if (at(TokenType.COMMA)) {
+                    advance()
+                    continue
+                }
+                break
+            }
+            skipNestedNewlines()
+            expect(
+                TokenType.GREATER,
+                "expected '>' to close the type parameters of $kindWord '${nameToken.text}' but " +
+                    "found ${current().describe()}",
+            )
+        }
+
+        // A class header may carry an empty parameter list, as in `class ExceptionSample()`. It is
+        // purely conventional now that constructors are declared by name: any parameter written here
+        // is rejected rather than silently ignored.
+        if (at(TokenType.LEFT_PAREN)) {
+            advance()
+            skipNestedNewlines()
+            if (!at(TokenType.RIGHT_PAREN)) {
+                error(
+                    "$kindWord '${nameToken.text}' cannot declare constructor parameters here: " +
+                        "declare a 'constructor(...)' in the body instead",
+                    current().span,
+                )
+                // Recover by skipping to the closing parenthesis, so the body still parses.
+                var depth = 1
+                while (depth > 0 && !at(TokenType.END_OF_FILE)) {
+                    when (advance().type) {
+                        TokenType.LEFT_PAREN -> depth++
+                        TokenType.RIGHT_PAREN -> depth--
+                        else -> {}
+                    }
+                }
+            } else {
+                advance()
+            }
+        }
+
+        // Supertypes: `: Superclass(), Interface, Interface<T>`.
+        var superclass: SuperTypeReference? = null
+        val interfaces = mutableListOf<SuperTypeReference>()
+        if (at(TokenType.COLON)) {
+            advance()
+            while (true) {
+                skipNewlines()
+                val name = expect(
+                    TokenType.IDENTIFIER,
+                    "expected a supertype name but found ${current().describe()}",
+                ) ?: break
+
+                var arguments: List<Expression>? = null
+                var end = name.span.end
+                if (at(TokenType.LEFT_PAREN)) {
+                    advance()
+                    newlineInsensitiveDepth++
+                    val parsed = mutableListOf<Expression>()
+                    skipNestedNewlines()
+                    if (!at(TokenType.RIGHT_PAREN)) {
+                        while (true) {
+                            val argument = parseExpression() ?: break
+                            parsed += argument
+                            skipNestedNewlines()
+                            if (at(TokenType.COMMA)) {
+                                advance()
+                                skipNestedNewlines()
+                                continue
+                            }
+                            break
+                        }
+                    }
+                    skipNestedNewlines()
+                    val close = expectRightParen("supertype '$name'")
+                    newlineInsensitiveDepth--
+                    arguments = parsed
+                    end = close?.span?.end ?: name.span.end
+                }
+
+                // Generic arguments written as `EmitExtractor<T>` are accepted and ignored: Neko
+                // erases them, so the only thing that matters is that the name is closed properly.
+                if (at(TokenType.LESS)) {
+                    var depth = 0
+                    while (!at(TokenType.END_OF_FILE)) {
+                        val token = advance()
+                        if (token.type == TokenType.LESS) depth++
+                        if (token.type == TokenType.GREATER) {
+                            depth--
+                            if (depth == 0) {
+                                end = token.span.end
+                                break
+                            }
+                        }
+                    }
+                }
+
+                val reference = SuperTypeReference(
+                    name = name.text,
+                    nameSpan = name.span,
+                    arguments = arguments,
+                    span = Span(source, name.span.start, end),
+                )
+
+                if (arguments != null) {
+                    // A constructor call means a superclass, and a class may only extend one.
+                    if (superclass != null) {
+                        error(
+                            "$kindWord '${nameToken.text}' already extends " +
+                                "'${superclass.name}', so it cannot also extend '${name.text}'; a " +
+                                "class may have only one superclass",
+                            name.span,
+                        )
+                    } else {
+                        superclass = reference
+                    }
+                } else {
+                    interfaces += reference
+                }
+
+                if (at(TokenType.COMMA)) {
+                    advance()
+                    continue
+                }
+                break
+            }
+        }
+
+        if (!expectLeftBrace(kindWord + " '${nameToken.text}'")) {
+            synchronizeToDeclaration()
+            return null
+        }
+
+        val fields = mutableListOf<FieldDeclaration>()
+        val functions = mutableListOf<FunctionDeclaration>()
+        val constructors = mutableListOf<ConstructorDeclaration>()
+
+        skipNewlines()
+        while (!at(TokenType.RIGHT_BRACE) && !at(TokenType.END_OF_FILE)) {
+            val before = index
+            when (memberKindAhead()) {
+                MemberKind.FUNCTION -> parseFunctionDeclaration()?.let { functions += it }
+                MemberKind.FIELD -> parseFieldDeclaration(isInterface, nameToken)?.let { fields += it }
+                MemberKind.CONSTRUCTOR -> parseConstructorDeclaration(nameToken)?.let { constructors += it }
+                MemberKind.UNKNOWN -> {
+                    error(
+                        "expected a field, function or constructor declaration in $kindWord " +
+                            "'${nameToken.text}' but found ${current().describe()}",
+                        current().span,
+                    )
+                    synchronizeToMember()
+                }
+            }
+            if (index == before) advance()
+            skipNewlines()
+        }
+
+        val closing = expectRightBrace("$kindWord '${nameToken.text}'")
+        val end = closing?.span?.end ?: nameToken.span.end
+
+        return ClassDeclaration(
+            name = nameToken.text,
+            nameSpan = nameToken.span,
+            typeParameters = typeParameters,
+            modifiers = modifiers,
+            superclass = superclass,
+            interfaces = interfaces,
+            fields = fields,
+            constructors = constructors,
+            functions = functions,
+            isInterface = isInterface,
+            span = Span(source, keyword.span.start, end),
+        )
+    }
+
+    /**
+     * `constructor(data: Object[]) { ... }`
+     *
+     * A constructor has no name of its own — it is always called through the class — so the
+     * parameters and body are all it declares. Neko gives it no return type for the same reason.
+     */
+    private fun parseConstructorDeclaration(classToken: Token): ConstructorDeclaration? {
+        val start = current()
+        val modifiers = parseModifiers()
+        advance() // `constructor`
+
+        if (!expectLeftParen("constructor")) {
+            synchronizeToMember()
+            return null
+        }
+        val parameters = parseParameterList()
+        expectRightParen("constructor")
+
+        if (!at(TokenType.LEFT_BRACE)) {
+            error(
+                "expected '{' to start the body of the constructor but found ${current().describe()}",
+                current().span,
+            )
+            synchronizeToMember()
+            return null
+        }
+        val body = parseBlock() ?: run {
+            synchronizeToMember()
+            return null
+        }
+
+        return ConstructorDeclaration(
+            parameters = parameters,
+            body = body,
+            modifiers = modifiers,
+            span = Span(source, start.span.start, body.span.end),
+        )
+    }
+
+    /**
+     * `private val field1: int = 123`
+     *
+     * An interface may not declare instance fields — only `static` constants — which is checked here
+     * rather than in the analyzer so the error points at the field itself.
+     */
+    private fun parseFieldDeclaration(isInterface: Boolean, classToken: Token): FieldDeclaration? {
+        val start = current()
+        val modifiers = parseModifiers()
+
+        val kindToken = current()
+        val kind = when (kindToken.type) {
+            TokenType.VAL -> VariableKind.VAL
+            TokenType.VAR -> VariableKind.VAR
+            else -> {
+                error("expected 'val' or 'var' but found ${kindToken.describe()}", kindToken.span)
+                synchronizeToMember()
+                return null
+            }
+        }
+        advance()
+
+        val nameToken = expect(TokenType.IDENTIFIER, "expected a field name but found ${current().describe()}")
+            ?: run {
+                synchronizeToMember()
+                return null
+            }
+
+        if (!expectColon("field '${nameToken.text}'")) {
+            synchronizeToMember()
+            return null
+        }
+
+        val type = parseType() ?: run {
+            synchronizeToMember()
+            return null
+        }
+
+        var initializer: Expression? = null
+        var end = type.span.end
+        if (at(TokenType.ASSIGN)) {
+            advance()
+            initializer = parseExpression()
+            if (initializer != null) end = initializer.span.end
+        }
+
+        expectStatementEnd("field declaration")
+
+        if (isInterface && !modifiers.any { it.kind == ModifierKind.STATIC }) {
+            error(
+                "interface '${classToken.text}' cannot declare the instance field " +
+                    "'${nameToken.text}': an interface has no state, so a field must be 'static'",
+                nameToken.span,
+            )
+        }
+
+        return FieldDeclaration(
+            kind = kind,
+            kindSpan = kindToken.span,
+            name = nameToken.text,
+            nameSpan = nameToken.span,
+            declaredType = type,
+            initializer = initializer,
+            modifiers = modifiers,
+            span = Span(source, start.span.start, end),
+        )
+    }
+
+    /** `fun main(args: string[]) { ... }` */
+    private fun parseFunctionDeclaration(): FunctionDeclaration? {
+        val start = current()
+        val modifiers = parseModifiers()
+
+        if (!at(TokenType.FUN)) {
+            error("expected 'fun' but found ${current().describe()}", current().span)
+            synchronizeToMember()
+            return null
+        }
+        advance()
+
+        val nameToken = expect(TokenType.IDENTIFIER, "expected a function name but found ${current().describe()}")
+            ?: run {
+                synchronizeToMember()
+                return null
+            }
+
+        if (!expectLeftParen("function '${nameToken.text}'")) {
+            synchronizeToMember()
+            return null
+        }
+
+        val parameters = parseParameterList()
+        expectRightParen("parameter list of function '${nameToken.text}'")
+
+        var returnType: TypeReference? = null
+        if (at(TokenType.COLON)) {
+            advance()
+            returnType = parseType()
+        }
+
+        // A function may be abstract — a signature an implementer must provide — which is written by
+        // omitting the body entirely. That is only meaningful inside an interface, but the body is
+        // optional here and the analyzer decides whether the omission is legal, so the diagnostic can
+        // name the function and the class it was found in.
+        var body: BlockStatement? = null
+        if (at(TokenType.LEFT_BRACE)) {
+            body = parseBlock() ?: run {
+                synchronizeToMember()
+                return null
+            }
+        } else if (!atStatementEnd() && !at(TokenType.RIGHT_BRACE) && !at(TokenType.EMIT)) {
+            error(
+                "expected '{' to start the body of function '${nameToken.text}' but found " +
+                    current().describe(),
+                current().span,
+            )
+            synchronizeToMember()
+            return null
+        }
+
+        // An `emit` clause follows the body: `fun f() { ... } emit [int, int]`.
+        val emitClause = parseEmitClause()
+        val end = emitClause?.endOffset ?: body?.span?.end ?: returnType?.span?.end ?: nameToken.span.end
+
+        return FunctionDeclaration(
+            name = nameToken.text,
+            nameSpan = nameToken.span,
+            parameters = parameters,
+            returnType = returnType,
+            body = body,
+            modifiers = modifiers,
+            emitTypes = emitClause?.types.orEmpty(),
+            hasEmitClause = emitClause != null,
+            span = Span(source, start.span.start, end),
+        )
+    }
+
+    /** A parsed `emit [T, U]` clause: its value types, and where the clause ends. */
+    private class EmitClause(val types: List<TypeReference>, val endOffset: Int)
+
+    /**
+     * Parses an optional `emit [T, U]` clause written after a function body.
+     *
+     * The brackets are required and may be empty, so `emit []` is a clause that names no values — a
+     * function that can only signal failure. Returns `null` when no clause is present.
+     */
+    private fun parseEmitClause(): EmitClause? {
+        val mark = index
+        skipNewlines()
+        if (!at(TokenType.EMIT)) {
+            index = mark
+            return null
+        }
+        val keyword = advance()
+
+        if (!expectLeftBracket("'emit' clause")) {
+            return EmitClause(emptyList(), keyword.span.end)
+        }
+        newlineInsensitiveDepth++
+
+        val types = mutableListOf<TypeReference>()
+        skipNestedNewlines()
+        if (!at(TokenType.RIGHT_BRACKET)) {
+            while (true) {
+                val type = parseType() ?: break
+                types += type
+                skipNestedNewlines()
+                if (at(TokenType.COMMA)) {
+                    advance()
+                    skipNestedNewlines()
+                    continue
+                }
+                break
+            }
+        }
+
+        skipNestedNewlines()
+        val close = expectRightBracket("'emit' clause")
+        newlineInsensitiveDepth--
+        return EmitClause(types, close?.span?.end ?: keyword.span.end)
+    }
+
+    /** `(a: int, b: string)`; the opening parenthesis is consumed by the caller. */
+    private fun parseParameterList(): List<Parameter> {
+        val parameters = mutableListOf<Parameter>()
+        if (at(TokenType.RIGHT_PAREN)) return parameters
+
+        while (true) {
+            skipNestedNewlines()
+            val nameToken = expect(
+                TokenType.IDENTIFIER,
+                "expected a parameter name but found ${current().describe()}",
+            ) ?: break
+
+            if (!expectColon("parameter '${nameToken.text}'")) break
+            val type = parseType() ?: break
+
+            parameters += Parameter(
+                name = nameToken.text,
+                nameSpan = nameToken.span,
+                declaredType = type,
+                span = Span(source, nameToken.span.start, type.span.end),
+            )
+
+            skipNestedNewlines()
+            if (at(TokenType.COMMA)) {
+                advance()
+                continue
+            }
+            break
+        }
+        return parameters
+    }
+
+    private fun parseModifiers(): List<Modifier> {
+        val modifiers = mutableListOf<Modifier>()
+        while (true) {
+            val kind = when (current().type) {
+                TokenType.PRIVATE -> ModifierKind.PRIVATE
+                TokenType.PUBLIC -> ModifierKind.PUBLIC
+                TokenType.PROTECTED -> ModifierKind.PROTECTED
+                TokenType.STATIC -> ModifierKind.STATIC
+                else -> return modifiers
+            }
+            val token = advance()
+            if (modifiers.any { it.kind == kind }) {
+                error("duplicate modifier '${kind.display}'", token.span)
+            } else {
+                modifiers += Modifier(kind, token.span)
+            }
+        }
+    }
+
+    // -------------------------------------------------------------- statements
+
+    /** `{ ... }` */
+    private fun parseBlock(): BlockStatement? {
+        val open = expectLeftBraceReturning("block") ?: run {
+            synchronizeToMember()
+            return null
+        }
+
+        val statements = parseStatementSequence()
+        val close = expectRightBrace("block")
+        val end = close?.span?.end ?: current().span.end
+        return BlockStatement(statements, Span(source, open.span.start, end))
+    }
+
+    /**
+     * Parses statements until the matching `}` or end of file.
+     *
+     * Always treats newlines as significant, which is what makes a lambda body behave like any
+     * other block no matter how deeply it is nested inside a call's argument list.
+     */
+    private fun parseStatementSequence(): List<Statement> {
+        val statements = mutableListOf<Statement>()
+        val savedDepth = newlineInsensitiveDepth
+        newlineInsensitiveDepth = 0
+        try {
+            skipNewlines()
+            while (!at(TokenType.RIGHT_BRACE) && !at(TokenType.END_OF_FILE)) {
+                val before = index
+                if (!rejectRemovedThrow()) parseStatement()?.let { statements += it }
+                if (index == before) advance()
+                skipNewlines()
+            }
+        } finally {
+            newlineInsensitiveDepth = savedDepth
+        }
+        return statements
+    }
+
+    /** Parses one statement, or returns `null` after reporting an error. */
+    private fun parseStatement(): Statement? = when (current().type) {
+        TokenType.LEFT_BRACE -> parseBlock()
+        TokenType.VAL, TokenType.VAR -> parseVariableDeclaration()
+        TokenType.RETURN -> parseReturnStatement()
+        TokenType.YIELD -> parseYieldStatement()
+        TokenType.IF -> parseIfStatement()
+        TokenType.WHILE -> parseWhileStatement()
+        TokenType.WHEN -> parseWhenStatement()
+        TokenType.RAISE -> parseRaiseStatement()
+        TokenType.TRY -> parseTryStatement()
+        TokenType.SEMICOLON -> {
+            advance()
+            null
+        }
+
+        TokenType.IDENTIFIER ->
+            // `name: type = ...` declares; `name = ...` assigns.
+            if (peek(1).type == TokenType.COLON) parseVariableDeclaration() else parseAssignmentOrExpression()
+
+        else -> parseAssignmentOrExpression()
+    }
+
+    /**
+     * Reports a `throw` as the removed keyword it is, rather than as the unknown name it parses to.
+     *
+     * `throw` and `throws` are no longer keywords, so `throw X()` would otherwise be read as a call
+     * and reported as "there is no function named 'throw'" — true, but it leaves the reader guessing.
+     * Recognising the word here, at the start of a statement, is what keeps the diagnostic actionable
+     * while the language deliberately treats both as ordinary identifiers everywhere else.
+     *
+     * Returns true when a diagnostic was reported, so the caller stops before parsing on.
+     */
+    private fun rejectRemovedThrow(): Boolean {
+        val token = current()
+        if (token.type != TokenType.IDENTIFIER) return false
+        if (token.text != "throw" && token.text != "throws") return false
+
+        val replacement = if (token.text == "throw") {
+            "Neko leaves a function early with 'raise <value>, ...', which the caller receives " +
+                "with 'try f(...) { a, b -> ... }'; to let a JVM exception out, there is nothing " +
+                "to write — an uncaught exception already propagates"
+        } else {
+            "Neko records that a function can leave early in its 'emit [...]' clause rather than " +
+                "in a 'throws' clause, and a function that raises always declares one"
+        }
+        diagnostics.error("'${token.text}' is not an Neko keyword: $replacement", token.span)
+        synchronizeToStatement()
+        return true
+    }
+
+    /**
+     * A local declaration: `val a: int = 1`, `a: int = 1`, or `var a: int`.
+     *
+     * The leading `val`/`var` is optional in Neko, which is why `str: string = "..."` and
+     * `str = "new value"` look alike until the `:` or the `=` is reached.
+     */
+    private fun parseVariableDeclaration(): VariableDeclarationStatement? {
+        val start = current()
+        // A declaration without `val`/`var` is mutable. `Sample.neko` pins this down: `str: string`
+        // on line 12 is later reassigned by `str = "new value"`, which the sample marks as valid.
+        var kind = VariableKind.VAR
+        var kindSpan: Span? = null
+
+        if (at(TokenType.VAL) || at(TokenType.VAR)) {
+            val keyword = advance()
+            kind = if (keyword.type == TokenType.VAL) VariableKind.VAL else VariableKind.VAR
+            kindSpan = keyword.span
+        }
+
+        val nameToken = expect(TokenType.IDENTIFIER, "expected a variable name but found ${current().describe()}")
+            ?: run {
+                synchronizeToStatement()
+                return null
+            }
+
+        if (!expectColon("variable '${nameToken.text}'")) {
+            synchronizeToStatement()
+            return null
+        }
+
+        val type = parseType() ?: run {
+            synchronizeToStatement()
+            return null
+        }
+
+        var initializer: Expression? = null
+        var end = type.span.end
+        if (at(TokenType.ASSIGN)) {
+            advance()
+            skipNestedNewlines()
+            initializer = parseExpression()
+            if (initializer != null) end = initializer.span.end
+        }
+
+        expectStatementEnd("variable declaration")
+
+        return VariableDeclarationStatement(
+            kind = kind,
+            kindSpan = kindSpan,
+            name = nameToken.text,
+            nameSpan = nameToken.span,
+            declaredType = type,
+            initializer = initializer,
+            span = Span(source, start.span.start, end),
+        )
+    }
+
+    /** `name = value`, or an expression statement such as `println(field1)`. */
+    private fun parseAssignmentOrExpression(): Statement? {
+        val start = current()
+        val expression = parseExpression() ?: run {
+            synchronizeToStatement()
+            return null
+        }
+
+        if (at(TokenType.ASSIGN)) {
+            advance()
+            // A name assigns a local; a member access assigns a field through its receiver; an index
+            // assigns one element of an array.
+            if (expression is IndexExpression) {
+                skipNestedNewlines()
+                val value = parseExpression() ?: run {
+                    synchronizeToStatement()
+                    return null
+                }
+                expectStatementEnd("assignment")
+                return IndexAssignmentStatement(
+                    array = expression.array,
+                    index = expression.index,
+                    value = value,
+                    indexSpan = expression.indexSpan,
+                    span = Span(source, start.span.start, value.span.end),
+                )
+            }
+            if (expression !is NameExpression && expression !is MemberAccessExpression) {
+                error(
+                    "the left-hand side of an assignment must be a variable name, a field access " +
+                        "or an array element",
+                    expression.span,
+                )
+                parseExpression()
+                expectStatementEnd("assignment")
+                return null
+            }
+            skipNestedNewlines()
+            val value = parseExpression() ?: run {
+                synchronizeToStatement()
+                return null
+            }
+            expectStatementEnd("assignment")
+            return AssignmentStatement(
+                target = expression,
+                value = value,
+                span = Span(source, start.span.start, value.span.end),
+            )
+        }
+
+        expectStatementEnd("expression")
+        return ExpressionStatement(expression, expression.span)
+    }
+
+    /** `return` or `return expression` */
+    private fun parseReturnStatement(): ReturnStatement {
+        val keyword = advance()
+        var value: Expression? = null
+        var end = keyword.span.end
+        if (!atStatementEnd()) {
+            value = parseExpression()
+            if (value != null) end = value.span.end
+        }
+        expectStatementEnd("return statement")
+        return ReturnStatement(keyword.span, value, Span(source, keyword.span.start, end))
+    }
+
+    /** `yield expression` */
+    private fun parseYieldStatement(): YieldStatement? {
+        val keyword = advance()
+        if (atStatementEnd()) {
+            error("'yield' requires a value to produce", keyword.span)
+            return null
+        }
+        val value = parseExpression() ?: run {
+            synchronizeToStatement()
+            return null
+        }
+        expectStatementEnd("yield statement")
+        return YieldStatement(keyword.span, value, Span(source, keyword.span.start, value.span.end))
+    }
+
+    /** `if (condition) statement else statement` */
+    private fun parseIfStatement(): IfStatement? {
+        val keyword = advance()
+        val condition = parseParenthesised("if") ?: run {
+            synchronizeToStatement()
+            return null
+        }
+
+        skipNewlines()
+        val thenBranch = parseStatement() ?: run {
+            synchronizeToStatement()
+            return null
+        }
+
+        // `else` may sit on the same line or on the following one.
+        val mark = index
+        skipNewlines()
+        var elseBranch: Statement? = null
+        var end = thenBranch.span.end
+        if (at(TokenType.ELSE)) {
+            advance()
+            skipNewlines()
+            elseBranch = parseStatement()
+            if (elseBranch != null) end = elseBranch.span.end
+        } else {
+            index = mark
+        }
+
+        return IfStatement(condition, thenBranch, elseBranch, Span(source, keyword.span.start, end))
+    }
+
+    /** `while (condition) statement` */
+    private fun parseWhileStatement(): WhileStatement? {
+        val keyword = advance()
+        val condition = parseParenthesised("while") ?: run {
+            synchronizeToStatement()
+            return null
+        }
+        skipNewlines()
+        val body = parseStatement() ?: run {
+            synchronizeToStatement()
+            return null
+        }
+        return WhileStatement(condition, body, Span(source, keyword.span.start, body.span.end))
+    }
+
+    /**
+     * `when (subject) { 3 -> ...; 2 -> { ... }; else -> ... }`
+     *
+     * The subject is always parenthesised, and each arm is `value -> statement`; the trailing arm may
+     * be `else -> statement`. Newlines separate arms, so a `}` closing an arm body is followed by
+     * either another arm or the `}` that closes the `when`.
+     */
+    private fun parseWhenStatement(): WhenStatement? {
+        val keyword = advance()
+        val subject = parseParenthesised("when") ?: run {
+            synchronizeToStatement()
+            return null
+        }
+
+        if (!expectLeftBrace("'when' statement")) {
+            synchronizeToStatement()
+            return null
+        }
+
+        val branches = mutableListOf<WhenBranch>()
+        var hasElseBranch = false
+        skipNewlines()
+
+        while (!at(TokenType.RIGHT_BRACE) && !at(TokenType.END_OF_FILE)) {
+            val branchStart = current()
+            // A branch separated from the previous one by a comma is tolerated, so that arms may be
+            // written on one line.
+            if (at(TokenType.COMMA)) {
+                advance()
+                skipNewlines()
+                continue
+            }
+
+            var condition: Expression? = null
+            if (at(TokenType.ELSE)) {
+                advance()
+                hasElseBranch = true
+            } else {
+                condition = parseExpression() ?: run {
+                    synchronizeToWhenBranch()
+                    skipNewlines()
+                    continue
+                }
+            }
+
+            if (!at(TokenType.ARROW)) {
+                error(
+                    "expected '->' after the value of a 'when' branch but found ${current().describe()}",
+                    current().span,
+                )
+                synchronizeToWhenBranch()
+                skipNewlines()
+                continue
+            }
+            val arrow = advance()
+
+            skipNewlines()
+            val body = parseStatement()
+            if (body == null) {
+                synchronizeToWhenBranch()
+                skipNewlines()
+                continue
+            }
+
+            branches += WhenBranch(
+                condition = condition,
+                arrowSpan = arrow.span,
+                body = body,
+                span = Span(source, branchStart.span.start, body.span.end),
+            )
+
+            skipNewlines()
+        }
+
+        val close = expectRightBrace("'when' statement")
+        val end = close?.span?.end ?: subject.span.end
+        return WhenStatement(
+            subject = subject,
+            keywordSpan = keyword.span,
+            branches = branches,
+            hasElseBranch = hasElseBranch,
+            span = Span(source, keyword.span.start, end),
+        )
+    }
+
+    /** `raise e1, e2`, or a bare `raise` for a function whose `emit` clause names no values. */
+    private fun parseRaiseStatement(): RaiseStatement? {
+        val keyword = advance()
+        val values = mutableListOf<Expression>()
+        var end = keyword.span.end
+
+        if (!atStatementEnd()) {
+            while (true) {
+                val value = parseExpression() ?: run {
+                    synchronizeToStatement()
+                    return null
+                }
+                values += value
+                end = value.span.end
+                if (at(TokenType.COMMA)) {
+                    advance()
+                    skipNestedNewlines()
+                    continue
+                }
+                break
+            }
+        }
+
+        expectStatementEnd("raise statement")
+        return RaiseStatement(
+            keywordSpan = keyword.span,
+            values = values,
+            span = Span(source, keyword.span.start, end),
+        )
+    }
+
+    /**
+     * Parses a `try` statement, which has two forms that share a keyword.
+     *
+     * `try call(args) { a, b -> ... }` calls a function that may `raise` and receives its values.
+     * `try { ... } catch (e: T) { ... } finally { ... }` runs a block and handles a throwable that
+     * came from code outside this language. They are told apart by what follows the keyword: a brace
+     * begins the block form, anything else must be the call of the extractor form.
+     */
+    private fun parseTryStatement(): Statement? {
+        val keyword = advance()
+        val mark = index
+        skipNewlines()
+
+        if (at(TokenType.LEFT_BRACE)) {
+            return parseTryCatchStatement(keyword)
+        }
+
+        // Not a block, so this must be the extractor form. Parsing is restarted from just after the
+        // keyword so that a malformed call is reported against the call itself.
+        index = mark
+        return parseExtractorTry(keyword)
+    }
+
+    /** `try { ... } catch (e: T) { ... } finally { ... }` */
+    private fun parseTryCatchStatement(keyword: Token): TryCatchStatement? {
+        val body = parseBlock() ?: run {
+            synchronizeToStatement()
+            return null
+        }
+
+        val catches = mutableListOf<CatchClause>()
+        var finallyBlock: BlockStatement? = null
+        var finallySpan: Span? = null
+        var end = body.span.end
+
+        while (true) {
+            val mark = index
+            skipNewlines()
+            when (current().type) {
+                TokenType.CATCH -> {
+                    val clause = parseCatchClause() ?: run {
+                        synchronizeToStatement()
+                        return null
+                    }
+                    catches += clause
+                    end = clause.span.end
+                }
+
+                TokenType.FINALLY -> {
+                    val finallyKeyword = advance()
+                    if (finallyBlock != null) {
+                        error("this 'try' already has a 'finally' block", finallyKeyword.span)
+                    }
+                    skipNewlines()
+                    val block = if (at(TokenType.LEFT_BRACE)) {
+                        parseBlock()
+                    } else {
+                        error(
+                            "expected '{' to start the 'finally' block but found ${current().describe()}",
+                            current().span,
+                        )
+                        null
+                    } ?: run {
+                        synchronizeToStatement()
+                        return null
+                    }
+                    finallyBlock = block
+                    val span = Span(source, finallyKeyword.span.start, block.span.end)
+                    finallySpan = span
+                    end = block.span.end
+                }
+
+                else -> {
+                    index = mark
+                    break
+                }
+            }
+        }
+
+        if (catches.isEmpty() && finallyBlock == null) {
+            error(
+                "a 'try' block must be followed by 'catch' or 'finally': without one there is " +
+                    "nothing to handle",
+                keyword.span,
+            )
+        }
+
+        return TryCatchStatement(
+            keywordSpan = keyword.span,
+            body = body,
+            catches = catches,
+            finallyBlock = finallyBlock,
+            finallySpan = finallySpan,
+            span = Span(source, keyword.span.start, end),
+        )
+    }
+
+    /** `catch (e: CustomException) { ... }` */
+    private fun parseCatchClause(): CatchClause? {
+        val keyword = advance() // `catch`
+        skipNewlines()
+
+        if (!expectLeftParen("'catch' clause")) {
+            return null
+        }
+
+        val nameToken = expect(
+            TokenType.IDENTIFIER,
+            "expected a name for the caught exception but found ${current().describe()}",
+        ) ?: return null
+
+        if (!expectColon("caught exception '${nameToken.text}'")) {
+            return null
+        }
+
+        val type = parseType() ?: return null
+
+        skipNewlines()
+        if (expectRightParen("'catch' clause") == null) {
+            return null
+        }
+
+        skipNewlines()
+        val body = parseBlock() ?: return null
+
+        return CatchClause(
+            parameterName = nameToken.text,
+            parameterNameSpan = nameToken.span,
+            declaredType = type,
+            body = body,
+            span = Span(source, keyword.span.start, body.span.end),
+        )
+    }
+
+    /**
+     * `try call(args) { a, b -> ... }` — calls a function that may `raise`, and runs the extractor
+     * body with the raised values if it does.
+     *
+     * The extractor is written like a lambda parameter list, so the same `{ a, b -> ... }` shape is
+     * reused; there it is parsed as an expression, here as the second half of the statement.
+     */
+    private fun parseExtractorTry(keyword: Token): TryStatement? {
+        val parts = parseExtractorTryParts(keyword) ?: return null
+        return TryStatement(
+            keywordSpan = keyword.span,
+            call = parts.call,
+            extractorParameters = parts.parameters,
+            extractorBody = parts.body,
+            arrowSpan = parts.arrowSpan,
+            span = parts.span,
+        )
+    }
+
+    /**
+     * `try call(args) { a, b -> ... }` in expression position, as in
+     * `result: int = try emitTest(true) { a, b -> yield 1 }`.
+     *
+     * The shape is exactly the statement's; only what the construct is worth differs, which the
+     * analyzer decides from the `yield` the extractor body may write.
+     */
+    private fun parseExtractorTryExpression(keyword: Token): TryExpression? {
+        val parts = parseExtractorTryParts(keyword) ?: return null
+        return TryExpression(
+            keywordSpan = keyword.span,
+            call = parts.call,
+            extractorParameters = parts.parameters,
+            extractorBody = parts.body,
+            arrowSpan = parts.arrowSpan,
+            span = parts.span,
+        )
+    }
+
+    /** The pieces both forms of `try call(...) { a -> ... }` are built from. */
+    private class ExtractorTryParts(
+        val call: CallExpression,
+        val parameters: List<LambdaParameter>,
+        val body: BlockStatement,
+        val arrowSpan: Span?,
+        val span: Span,
+    )
+
+    /**
+     * Parses `call(args) { a, b -> ... }` after the `try` keyword has been consumed.
+     *
+     * Both `try` forms share it so that a malformed extractor is reported once, in the same words,
+     * wherever the construct was written.
+     */
+    private fun parseExtractorTryParts(keyword: Token): ExtractorTryParts? {
+        val call = parseExpression() as? CallExpression ?: run {
+            error(
+                "'try' must be followed by a block, or by a call to a function that may 'raise'",
+                current().span,
+            )
+            synchronizeToStatement()
+            return null
+        }
+
+        skipNewlines()
+        if (!expectLeftBrace("'try' extractor")) {
+            synchronizeToStatement()
+            return null
+        }
+
+        val parameters = mutableListOf<LambdaParameter>()
+        var arrowSpan: Span? = null
+
+        // The extractor may name fewer values than the callee raises, and may name none at all:
+        // `try f(1) { -> ... }`. Parse the parameter list only when an arrow follows it.
+        if (!at(TokenType.ARROW)) {
+            if (!at(TokenType.RIGHT_BRACE)) {
+                parseExtractorParameters(parameters)
+            }
+            skipNewlines()
+            if (at(TokenType.ARROW)) {
+                arrowSpan = advance().span
+            } else {
+                error(
+                    "expected '->' after the extractor parameters of a 'try' but found " +
+                        current().describe(),
+                    current().span,
+                )
+            }
+        } else {
+            arrowSpan = advance().span
+        }
+
+        skipNewlines()
+        val statements = parseStatementSequence()
+        val close = expectRightBrace("'try' extractor")
+        val end = close?.span?.end ?: call.span.end
+        val body = BlockStatement(statements, Span(source, keyword.span.start, end))
+
+        return ExtractorTryParts(
+            call = call,
+            parameters = parameters,
+            body = body,
+            arrowSpan = arrowSpan,
+            span = Span(source, keyword.span.start, end),
+        )
+    }
+
+    /**
+     * Parses `a, b` — the parameter names of a `try` extractor.
+     *
+     * A type annotation is accepted and ignored, so `{ a: int, b: int -> ... }` also parses; the
+     * analyzer takes the real types from the callee's `emit` clause.
+     */
+    private fun parseExtractorParameters(into: MutableList<LambdaParameter>) {
+        while (true) {
+            if (at(TokenType.RIGHT_BRACE) || at(TokenType.ARROW)) return
+            val nameToken = expect(
+                TokenType.IDENTIFIER,
+                "expected an extractor parameter name but found ${current().describe()}",
+            ) ?: return
+
+            var declaredType: TypeReference? = null
+            if (at(TokenType.COLON)) {
+                advance()
+                declaredType = parseType()
+            }
+
+            into += LambdaParameter(
+                name = nameToken.text,
+                nameSpan = nameToken.span,
+                declaredType = declaredType,
+                span = Span(source, nameToken.span.start, declaredType?.span?.end ?: nameToken.span.end),
+            )
+
+            if (at(TokenType.COMMA)) {
+                advance()
+                skipNestedNewlines()
+                continue
+            }
+            return
+        }
+    }
+
+    /** Parses `( expression )`, reporting a precise error when the shape is wrong. */
+    private fun parseParenthesised(owner: String): Expression? {
+        if (!expectLeftParen(owner)) return null
+        newlineInsensitiveDepth++
+        skipNestedNewlines()
+        val condition = parseExpression()
+        skipNestedNewlines()
+        expectRightParen(owner)
+        newlineInsensitiveDepth--
+        return condition
+    }
+
+    // ------------------------------------------------------------- expressions
+
+    /** Entry point of the precedence-climbing expression parser. */
+    private fun parseExpression(): Expression? = parseBinary(0)
+
+    /** Binding power of a binary operator; negative when [type] is not a binary operator. */
+    private fun precedenceOf(type: TokenType): Int = when (type) {
+        TokenType.OR_OR -> 1
+        TokenType.AND_AND -> 2
+        TokenType.EQUALS_EQUALS, TokenType.BANG_EQUALS -> 3
+        TokenType.LESS, TokenType.LESS_EQUALS, TokenType.GREATER, TokenType.GREATER_EQUALS -> 4
+        TokenType.PLUS, TokenType.MINUS -> 5
+        TokenType.STAR, TokenType.SLASH, TokenType.PERCENT -> 6
+        else -> -1
+    }
+
+    private fun binaryOperatorOf(type: TokenType): BinaryOperator? = when (type) {
+        TokenType.PLUS -> BinaryOperator.ADD
+        TokenType.MINUS -> BinaryOperator.SUBTRACT
+        TokenType.STAR -> BinaryOperator.MULTIPLY
+        TokenType.SLASH -> BinaryOperator.DIVIDE
+        TokenType.PERCENT -> BinaryOperator.REMAINDER
+        TokenType.EQUALS_EQUALS -> BinaryOperator.EQUAL
+        TokenType.BANG_EQUALS -> BinaryOperator.NOT_EQUAL
+        TokenType.LESS -> BinaryOperator.LESS
+        TokenType.LESS_EQUALS -> BinaryOperator.LESS_EQUAL
+        TokenType.GREATER -> BinaryOperator.GREATER
+        TokenType.GREATER_EQUALS -> BinaryOperator.GREATER_EQUAL
+        TokenType.AND_AND -> BinaryOperator.AND
+        TokenType.OR_OR -> BinaryOperator.OR
+        else -> null
+    }
+
+    private fun parseBinary(minimumPrecedence: Int): Expression? {
+        var left = parseUnary() ?: return null
+
+        while (true) {
+            skipNestedNewlines()
+            val precedence = precedenceOf(current().type)
+            if (precedence < 0 || precedence < minimumPrecedence) return left
+
+            val operatorToken = advance()
+            skipNestedNewlines()
+            val right = parseBinary(precedence + 1) ?: return left
+            val operator = binaryOperatorOf(operatorToken.type)!!
+
+            // `a > b > c` is a *chain*, meaning `a > b && b > c`; read left-associatively it would
+            // compare a bool with an int. A lone comparison still builds an ordinary
+            // BinaryExpression, and a second relational operator promotes it to a chain.
+            if (isChainable(operatorToken.type)) {
+                left = when (val previous = left) {
+                    is ChainedComparisonExpression -> ChainedComparisonExpression(
+                        operands = previous.operands + right,
+                        operators = previous.operators + operator,
+                        operatorSpans = previous.operatorSpans + operatorToken.span,
+                        span = Span(source, previous.span.start, right.span.end),
+                    )
+
+                    is BinaryExpression ->
+                        if (isChainable(previous.operator)) {
+                            ChainedComparisonExpression(
+                                operands = listOf(previous.left, previous.right, right),
+                                operators = listOf(previous.operator, operator),
+                                operatorSpans = listOf(previous.operatorSpan, operatorToken.span),
+                                span = Span(source, previous.span.start, right.span.end),
+                            )
+                        } else {
+                            BinaryExpression(
+                                left = previous,
+                                operatorSpan = operatorToken.span,
+                                operator = operator,
+                                right = right,
+                                span = Span(source, previous.span.start, right.span.end),
+                            )
+                        }
+
+                    else -> BinaryExpression(
+                        left = previous,
+                        operatorSpan = operatorToken.span,
+                        operator = operator,
+                        right = right,
+                        span = Span(source, previous.span.start, right.span.end),
+                    )
+                }
+                continue
+            }
+
+            left = BinaryExpression(
+                left = left,
+                operatorSpan = operatorToken.span,
+                operator = operator,
+                right = right,
+                span = Span(source, left.span.start, right.span.end),
+            )
+        }
+    }
+
+    /** Whether [type] is a relational operator, i.e. one that may appear in a comparison chain. */
+    private fun isChainable(type: TokenType): Boolean = when (type) {
+        TokenType.LESS, TokenType.LESS_EQUALS, TokenType.GREATER, TokenType.GREATER_EQUALS -> true
+        else -> false
+    }
+
+    /** Whether [operator] is relational, mirroring [isChainable] for an already-parsed operator. */
+    private fun isChainable(operator: BinaryOperator): Boolean = when (operator) {
+        BinaryOperator.LESS, BinaryOperator.LESS_EQUAL,
+        BinaryOperator.GREATER, BinaryOperator.GREATER_EQUAL,
+        -> true
+
+        else -> false
+    }
+
+    private fun parseUnary(): Expression? {
+        val token = current()
+        if (token.type == TokenType.MINUS || token.type == TokenType.BANG) {
+            advance()
+            val operand = parseUnary() ?: return null
+            val operator = if (token.type == TokenType.MINUS) UnaryOperator.NEGATE else UnaryOperator.NOT
+            return UnaryExpression(
+                operatorSpan = token.span,
+                operator = operator,
+                operand = operand,
+                span = Span(source, token.span.start, operand.span.end),
+            )
+        }
+        return parsePostfix()
+    }
+
+    private fun parsePostfix(): Expression? {
+        var expression = parsePrimary() ?: return null
+
+        while (true) {
+            skipNestedNewlines()
+            when {
+                at(TokenType.LEFT_PAREN) -> {
+                    val open = advance()
+                    newlineInsensitiveDepth++
+                    skipNestedNewlines()
+                    val arguments = mutableListOf<Expression>()
+                    if (!at(TokenType.RIGHT_PAREN)) {
+                        while (true) {
+                            val argument = parseExpression() ?: break
+                            arguments += argument
+                            skipNestedNewlines()
+                            if (at(TokenType.COMMA)) {
+                                advance()
+                                skipNestedNewlines()
+                                continue
+                            }
+                            break
+                        }
+                    }
+                    skipNestedNewlines()
+                    val close = expectRightParen("argument list")
+                    newlineInsensitiveDepth--
+                    val end = close?.span?.end ?: current().span.end
+                    expression = CallExpression(
+                        callee = expression,
+                        arguments = arguments,
+                        argumentListSpan = Span(source, open.span.start, end),
+                        span = Span(source, expression.span.start, end),
+                    )
+                }
+
+                at(TokenType.DOT) -> {
+                    advance()
+                    val member = expect(
+                        TokenType.IDENTIFIER,
+                        "expected a member name after '.' but found ${current().describe()}",
+                    ) ?: return expression
+                    expression = MemberAccessExpression(
+                        receiver = expression,
+                        memberName = member.text,
+                        memberSpan = member.span,
+                        span = Span(source, expression.span.start, member.span.end),
+                    )
+                }
+
+                at(TokenType.LEFT_BRACKET) -> {
+                    val open = advance()
+                    newlineInsensitiveDepth++
+                    skipNestedNewlines()
+                    val index = parseExpression() ?: run {
+                        newlineInsensitiveDepth--
+                        synchronizeToStatement()
+                        return expression
+                    }
+                    skipNestedNewlines()
+                    val close = expectRightBracket("array index")
+                    newlineInsensitiveDepth--
+                    val end = close?.span?.end ?: index.span.end
+                    expression = IndexExpression(
+                        array = expression,
+                        index = index,
+                        indexSpan = Span(source, open.span.start, end),
+                        span = Span(source, expression.span.start, end),
+                    )
+                }
+
+                else -> return expression
+            }
+        }
+    }
+
+    private fun parsePrimary(): Expression? {
+        val token = current()
+        return when (token.type) {
+            TokenType.INTEGER_LITERAL -> {
+                advance()
+                IntegerLiteral(token.integerValue, token.span)
+            }
+
+            TokenType.STRING_LITERAL -> {
+                advance()
+                StringLiteral(token.stringValue, token.span)
+            }
+
+            TokenType.TRUE, TokenType.FALSE -> {
+                advance()
+                BoolLiteral(token.type == TokenType.TRUE, token.span)
+            }
+
+            TokenType.IDENTIFIER -> {
+                advance()
+                NameExpression(token.text, token.span, token.span)
+            }
+
+            TokenType.THIS -> {
+                advance()
+                ThisExpression(token.span, token.span)
+            }
+
+            TokenType.LEFT_PAREN -> {
+                advance()
+                newlineInsensitiveDepth++
+                skipNestedNewlines()
+                val inner = parseExpression()
+                skipNestedNewlines()
+                expectRightParen("parenthesised expression")
+                newlineInsensitiveDepth--
+                inner
+            }
+
+            TokenType.LEFT_BRACE -> parseLambdaExpression()
+
+            // `try f(...) { a -> yield 1 }` is an expression when what it is worth is used, as in
+            // `result: int = try f(...) { a -> yield 1 }`. The brace form `try { ... } catch ...`
+            // catches a thrown exception instead and is never worth a value, so it stays a
+            // statement and is rejected here.
+            TokenType.TRY -> {
+                val keyword = advance()
+                skipNestedNewlines()
+                if (at(TokenType.LEFT_BRACE)) {
+                    error(
+                        "'try' is worth a value only with an extractor: write " +
+                            "'try call(...) { values -> yield ... }', or use the statement form " +
+                            "'try { ... } catch ...' on a line of its own",
+                        keyword.span,
+                    )
+                    null
+                } else {
+                    parseExtractorTryExpression(keyword)
+                }
+            }
+
+            else -> {
+                error("expected an expression but found ${token.describe()}", token.span)
+                null
+            }
+        }
+    }
+
+    /**
+     * `{ x, y -> yield x + y }`
+     *
+     * In expression position a `{` always begins a lambda, because blocks are never expressions.
+     */
+    private fun parseLambdaExpression(): LambdaExpression? {
+        val open = advance() // `{`
+        val outerDepth = newlineInsensitiveDepth
+
+        // A lambda's parameter list may wrap across lines.
+        newlineInsensitiveDepth++
+        val parameters = mutableListOf<LambdaParameter>()
+        if (!at(TokenType.ARROW)) {
+            while (true) {
+                skipNestedNewlines()
+                if (at(TokenType.ARROW)) break
+
+                val nameToken = expect(
+                    TokenType.IDENTIFIER,
+                    "expected a lambda parameter name but found ${current().describe()}",
+                ) ?: break
+
+                var declaredType: TypeReference? = null
+                if (at(TokenType.COLON)) {
+                    advance()
+                    declaredType = parseType()
+                }
+
+                parameters += LambdaParameter(
+                    name = nameToken.text,
+                    nameSpan = nameToken.span,
+                    declaredType = declaredType,
+                    span = Span(source, nameToken.span.start, declaredType?.span?.end ?: nameToken.span.end),
+                )
+
+                skipNestedNewlines()
+                if (at(TokenType.COMMA)) {
+                    advance()
+                    continue
+                }
+                break
+            }
+        }
+
+        skipNestedNewlines()
+        var arrowFound = false
+        if (at(TokenType.ARROW)) {
+            advance()
+            arrowFound = true
+        }
+        newlineInsensitiveDepth = outerDepth
+
+        if (!arrowFound) {
+            error(
+                "expected '->' after the lambda parameters but found ${current().describe()}",
+                current().span,
+            )
+            synchronizeToStatement()
+            return null
+        }
+
+        // The body is an ordinary statement block: newlines terminate its statements.
+        val statements = parseStatementSequence()
+        val close = expectRightBrace("lambda body")
+        val end = close?.span?.end ?: current().span.end
+        val body = BlockStatement(statements, Span(source, open.span.start, end))
+
+        return LambdaExpression(
+            parameters = parameters,
+            body = body,
+            span = Span(source, open.span.start, end),
+        )
+    }
+
+    // -------------------------------------------------------------------- types
+
+    /**
+     * Parses a type: `int`, `string[]`, `[int, int] -> int`.
+     *
+     * Returns `null` (after reporting) when no valid type is present.
+     */
+    private fun parseType(): TypeReference? {
+        val start = current()
+        var result: TypeReference = when (start.type) {
+            TokenType.LEFT_BRACKET -> parseFunctionTypeFromBrackets() ?: return null
+            TokenType.IDENTIFIER -> {
+                advance()
+                NamedTypeReference(start.text, start.span, start.span)
+            }
+
+            else -> {
+                error("expected a type but found ${start.describe()}", start.span)
+                return null
+            }
+        }
+
+        // Trailing `[]` suffixes, e.g. `string[]`.
+        while (at(TokenType.LEFT_BRACKET) && peek(1).type == TokenType.RIGHT_BRACKET) {
+            advance()
+            val close = advance()
+            result = ArrayTypeReference(result, Span(source, result.span.start, close.span.end))
+        }
+
+        return result
+    }
+
+    /** Parses the `[int, int]` part of a function type together with its mandatory `-> return`. */
+    private fun parseFunctionTypeFromBrackets(): TypeReference? {
+        val open = advance() // `[`
+        val parameters = mutableListOf<TypeReference>()
+
+        if (!at(TokenType.RIGHT_BRACKET)) {
+            while (true) {
+                val parameter = parseType() ?: break
+                parameters += parameter
+                if (at(TokenType.COMMA)) {
+                    advance()
+                    continue
+                }
+                break
+            }
+        }
+
+        expect(
+            TokenType.RIGHT_BRACKET,
+            "expected ']' to close the parameter types of a function type but found ${current().describe()}",
+        ) ?: return null
+
+        if (!at(TokenType.ARROW)) {
+            error(
+                "expected '->' after the parameter types of a function type but found ${current().describe()}; " +
+                    "write the function type as '[" + parameters.joinToString(", ") { "T" } + "] -> R'",
+                current().span,
+            )
+            return null
+        }
+        advance()
+
+        val returnType = parseType() ?: return null
+        return FunctionTypeReference(
+            parameters = parameters,
+            returnType = returnType,
+            span = Span(source, open.span.start, returnType.span.end),
+        )
+    }
+
+    // ---------------------------------------------------------------- plumbing
+
+    private fun current(): Token = tokens[index]
+
+    private fun peek(offset: Int): Token = tokens[(index + offset).coerceIn(0, tokens.size - 1)]
+
+    private fun advance(): Token {
+        val token = tokens[index]
+        if (index < tokens.size - 1) index++
+        return token
+    }
+
+    private fun at(type: TokenType): Boolean = current().type == type
+
+    /** `true` at a newline, a `}`, a `;`, or end of file. */
+    private fun atStatementEnd(): Boolean =
+        at(TokenType.NEWLINE) || at(TokenType.RIGHT_BRACE) || at(TokenType.SEMICOLON) || at(TokenType.END_OF_FILE)
+
+    /**
+     * Skips newlines only when inside a `(` or `[` list, so wrapped argument lists parse while
+     * statement separation elsewhere is preserved.
+     */
+    private fun skipNestedNewlines() {
+        if (newlineInsensitiveDepth == 0) return
+        while (at(TokenType.NEWLINE)) advance()
+    }
+
+    /** Skips newlines unconditionally; used between statements and members. */
+    private fun skipNewlines() {
+        while (at(TokenType.NEWLINE)) advance()
+    }
+
+    /** Consumes the statement separator, unless the statement already ends at `}` or end of file. */
+    private fun expectStatementEnd(owner: String) {
+        when {
+            at(TokenType.NEWLINE) -> advance()
+            at(TokenType.SEMICOLON) -> {
+                advance()
+                skipNewlines()
+            }
+
+            at(TokenType.RIGHT_BRACE) || at(TokenType.END_OF_FILE) -> Unit
+
+            else -> {
+                error(
+                    "expected a newline to end the $owner but found ${current().describe()}; " +
+                        "each statement must start on its own line",
+                    current().span,
+                )
+                synchronizeToStatement()
+            }
+        }
+    }
+
+    private fun expect(type: TokenType, message: String): Token? {
+        if (at(type)) return advance()
+        error(message, current().span)
+        return null
+    }
+
+    private fun expectColon(owner: String): Boolean {
+        if (at(TokenType.COLON)) {
+            advance()
+            return true
+        }
+        error(
+            "expected ':' after $owner to introduce its type but found ${current().describe()}",
+            current().span,
+        )
+        return false
+    }
+
+    private fun expectLeftBrace(owner: String): Boolean {
+        if (at(TokenType.LEFT_BRACE)) {
+            advance()
+            return true
+        }
+        error("expected '{' to open the body of $owner but found ${current().describe()}", current().span)
+        return false
+    }
+
+    private fun expectLeftBraceReturning(owner: String): Token? = expect(
+        TokenType.LEFT_BRACE,
+        "expected '{' to open the $owner but found ${current().describe()}",
+    )
+
+    private fun expectLeftParen(owner: String): Boolean {
+        if (at(TokenType.LEFT_PAREN)) {
+            advance()
+            return true
+        }
+        error("expected '(' after $owner but found ${current().describe()}", current().span)
+        return false
+    }
+
+    private fun expectRightParen(owner: String): Token? = expect(
+        TokenType.RIGHT_PAREN,
+        "expected ')' to close the $owner but found ${current().describe()}",
+    )
+
+    private fun expectRightBrace(owner: String): Token? = expect(
+        TokenType.RIGHT_BRACE,
+        "expected '}' to close the $owner but found ${current().describe()}",
+    )
+
+    private fun expectLeftBracket(owner: String): Boolean {
+        if (at(TokenType.LEFT_BRACKET)) {
+            advance()
+            return true
+        }
+        error("expected '[' after $owner but found ${current().describe()}", current().span)
+        return false
+    }
+
+    private fun expectRightBracket(owner: String): Token? = expect(
+        TokenType.RIGHT_BRACKET,
+        "expected ']' to close the $owner but found ${current().describe()}",
+    )
+
+    private fun error(message: String, span: Span) {
+        diagnostics.error(message, span)
+    }
+
+    // --------------------------------------------------------------- recovery
+
+    /** Skips to the beginning of the next top-level declaration. */
+    private fun synchronizeToDeclaration() {
+        while (!at(TokenType.END_OF_FILE)) {
+            if (at(TokenType.NEWLINE)) {
+                advance()
+                skipNewlines()
+                if (at(TokenType.CLASS) || isModifier(current().type)) return
+                continue
+            }
+            if (at(TokenType.CLASS)) return
+            advance()
+        }
+    }
+
+    /** Skips to the next class-member boundary. */
+    private fun synchronizeToMember() {
+        var depth = 0
+        while (!at(TokenType.END_OF_FILE)) {
+            when (current().type) {
+                TokenType.LEFT_BRACE -> depth++
+                TokenType.RIGHT_BRACE -> if (depth == 0) return else depth--
+                TokenType.NEWLINE -> if (depth == 0) {
+                    advance()
+                    skipNewlines()
+                    return
+                }
+
+                else -> Unit
+            }
+            advance()
+        }
+    }
+
+    /** Skips to the next statement boundary. */
+    private fun synchronizeToStatement() {
+        var depth = 0
+        while (!at(TokenType.END_OF_FILE)) {
+            when (current().type) {
+                TokenType.LEFT_PAREN, TokenType.LEFT_BRACKET, TokenType.LEFT_BRACE -> depth++
+                TokenType.RIGHT_PAREN, TokenType.RIGHT_BRACKET -> if (depth > 0) depth--
+                TokenType.RIGHT_BRACE -> if (depth == 0) return else depth--
+                TokenType.NEWLINE -> if (depth == 0) {
+                    advance()
+                    skipNewlines()
+                    return
+                }
+
+                else -> Unit
+            }
+            advance()
+        }
+    }
+
+    /**
+     * Skips to the next `when` branch, i.e. to a newline that is followed by a value or by `}`.
+     *
+     * Recovery cannot simply stop at the next newline: an arm body written as a block contains
+     * newlines of its own, so nesting is tracked and only a boundary at depth zero counts.
+     */
+    private fun synchronizeToWhenBranch() {
+        var depth = 0
+        while (!at(TokenType.END_OF_FILE)) {
+            when (current().type) {
+                TokenType.LEFT_PAREN, TokenType.LEFT_BRACKET, TokenType.LEFT_BRACE -> depth++
+                TokenType.RIGHT_PAREN, TokenType.RIGHT_BRACKET -> if (depth > 0) depth--
+                TokenType.RIGHT_BRACE -> {
+                    if (depth == 0) return
+                    depth--
+                }
+
+                TokenType.NEWLINE -> if (depth == 0) {
+                    advance()
+                    skipNewlines()
+                    return
+                }
+
+                else -> Unit
+            }
+            advance()
+        }
+    }
+
+    private companion object {
+        /**
+         * Keywords that may also appear as a package-name segment.
+         *
+         * Only words that cannot begin a declaration need listing: a package segment is read after
+         * `locate` and after a `.`, where no statement could start, so accepting one costs no
+         * ambiguity. The list is deliberately short — `class`, `fun` and `interface` are excluded so
+         * that a malformed `locate` still fails at the word that reveals the mistake.
+         */
+        val NAME_SEGMENT_KEYWORDS: Set<TokenType> = setOf(
+            TokenType.EMIT,
+            TokenType.RAISE,
+            TokenType.YIELD,
+            TokenType.ELSE,
+            TokenType.THIS,
+            TokenType.TRUE,
+            TokenType.FALSE,
+            TokenType.VAL,
+            TokenType.VAR,
+        )
+    }
+}

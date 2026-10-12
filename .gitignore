@@ -1,5 +1,7 @@
 .gradle
 build/
+# Compiled sample output: build product, not source.
+/neko-compile/
 !gradle/wrapper/gradle-wrapper.jar
 !**/src/main/**/build/
 !**/src/test/**/build/

@@ -1,0 +1,229 @@
+locate com.github.kusa233.neko.stdlib.emit
+
+/**
+ * The standard library's `raise` protocol, written in Neko.
+ *
+ * A `try f(...) { a, b -> ... }` — statement or expression — compiles its extractor into a class
+ * implementing one of these interfaces; `EarlyEmitException.doEmit` then calls [extract] with the
+ * `Object[]` a `raise` carried, and `extract` answers the value the `try` produces. The array is
+ * unpacked here rather than in generated code, which is what keeps the compiler's lowering to a
+ * single method call per `try` regardless of how many values were raised.
+ *
+ * There are two families, and which one a `try` uses depends on whether its extractor body writes
+ * `yield`:
+ *
+ *  * `EmitExtractorN` — the body produces nothing, so `invoke` returns no value. These are the
+ *    interfaces a plain `try f(...) { a -> println(a) }` implements.
+ *  * `EmitExtractorWithResultN<R, T1, ...>` — the body writes `yield`, so `invoke` returns `R`: the
+ *    value the `try` produces when the call `raise`s instead of returning. `r: int = try f() { a ->
+ *    yield 1 }` compiles its extractor into an implementation of `EmitExtractorWithResult1<int,
+ *    int>`, and `yield` is what returns from its `invoke`.
+ *
+ * Each family adds one abstract `invoke` taking the arity's values, so the compiler only has to
+ * generate that method: [extract] is a default method that does the unpacking. Its type parameters
+ * erase to `Object`, which is why `extract` can hand each element straight to `invoke` — and why
+ * the value a `WithResult` `invoke` returns travels back to the caller as an `Object` the compiler
+ * unboxes into the `try`'s type.
+ */
+public interface EmitExtractor {
+    /**
+     * Unpacks one `raise`'s values and runs the extractor, returning the value a `try` expression
+     * receives when the call `raise`s instead of returning.
+     *
+     * A body that never `yield`s has no such value, and the implementations below answer it with
+     * `null`; a `try` whose result is discarded — the statement form — never reads it.
+     */
+    fun extract(params: Object[]): Object
+}
+
+public interface EmitExtractor0: EmitExtractor {
+    fun invoke()
+
+    fun extract(params: Object[]): Object {
+        result: Object
+        this.invoke()
+        return result
+    }
+}
+
+public interface EmitExtractor1<T1>: EmitExtractor {
+    fun invoke(o1: T1)
+
+    fun extract(params: Object[]): Object {
+        result: Object
+        this.invoke(params[0])
+        return result
+    }
+}
+
+public interface EmitExtractor2<T1, T2>: EmitExtractor {
+    fun invoke(o1: T1, o2: T2)
+
+    fun extract(params: Object[]): Object {
+        result: Object
+        this.invoke(params[0], params[1])
+        return result
+    }
+}
+
+public interface EmitExtractor3<T1, T2, T3>: EmitExtractor {
+    fun invoke(o1: T1, o2: T2, o3: T3)
+
+    fun extract(params: Object[]): Object {
+        result: Object
+        this.invoke(params[0], params[1], params[2])
+        return result
+    }
+}
+
+public interface EmitExtractor4<T1, T2, T3, T4>: EmitExtractor {
+    fun invoke(o1: T1, o2: T2, o3: T3, o4: T4)
+
+    fun extract(params: Object[]): Object {
+        result: Object
+        this.invoke(params[0], params[1], params[2], params[3])
+        return result
+    }
+}
+
+public interface EmitExtractor5<T1, T2, T3, T4, T5>: EmitExtractor {
+    fun invoke(o1: T1, o2: T2, o3: T3, o4: T4, o5: T5)
+
+    fun extract(params: Object[]): Object {
+        result: Object
+        this.invoke(params[0], params[1], params[2], params[3], params[4])
+        return result
+    }
+}
+
+public interface EmitExtractor6<T1, T2, T3, T4, T5, T6>: EmitExtractor {
+    fun invoke(o1: T1, o2: T2, o3: T3, o4: T4, o5: T5, o6: T6)
+
+    fun extract(params: Object[]): Object {
+        result: Object
+        this.invoke(params[0], params[1], params[2], params[3], params[4], params[5])
+        return result
+    }
+}
+
+public interface EmitExtractor7<T1, T2, T3, T4, T5, T6, T7>: EmitExtractor {
+    fun invoke(o1: T1, o2: T2, o3: T3, o4: T4, o5: T5, o6: T6, o7: T7)
+
+    fun extract(params: Object[]): Object {
+        result: Object
+        this.invoke(params[0], params[1], params[2], params[3], params[4], params[5], params[6])
+        return result
+    }
+}
+
+public interface EmitExtractor8<T1, T2, T3, T4, T5, T6, T7, T8>: EmitExtractor {
+    fun invoke(o1: T1, o2: T2, o3: T3, o4: T4, o5: T5, o6: T6, o7: T7, o8: T8)
+
+    fun extract(params: Object[]): Object {
+        result: Object
+        this.invoke(
+            params[0], params[1], params[2], params[3],
+            params[4], params[5], params[6], params[7]
+        )
+        return result
+    }
+}
+
+public interface EmitExtractor9<T1, T2, T3, T4, T5, T6, T7, T8, T9>: EmitExtractor {
+    fun invoke(o1: T1, o2: T2, o3: T3, o4: T4, o5: T5, o6: T6, o7: T7, o8: T8, o9: T9)
+
+    fun extract(params: Object[]): Object {
+        result: Object
+        this.invoke(
+            params[0], params[1], params[2], params[3], params[4],
+            params[5], params[6], params[7], params[8]
+        )
+        return result
+    }
+}
+
+public interface EmitExtractorWithResult0<R>: EmitExtractor {
+    fun invoke(): R
+
+    fun extract(params: Object[]): Object {
+        return this.invoke()
+    }
+}
+
+public interface EmitExtractorWithResult1<R, T1>: EmitExtractor {
+    fun invoke(o1: T1): R
+
+    fun extract(params: Object[]): Object {
+        return this.invoke(params[0])
+    }
+}
+
+public interface EmitExtractorWithResult2<R, T1, T2>: EmitExtractor {
+    fun invoke(o1: T1, o2: T2): R
+
+    fun extract(params: Object[]): Object {
+        return this.invoke(params[0], params[1])
+    }
+}
+
+public interface EmitExtractorWithResult3<R, T1, T2, T3>: EmitExtractor {
+    fun invoke(o1: T1, o2: T2, o3: T3): R
+
+    fun extract(params: Object[]): Object {
+        return this.invoke(params[0], params[1], params[2])
+    }
+}
+
+public interface EmitExtractorWithResult4<R, T1, T2, T3, T4>: EmitExtractor {
+    fun invoke(o1: T1, o2: T2, o3: T3, o4: T4): R
+
+    fun extract(params: Object[]): Object {
+        return this.invoke(params[0], params[1], params[2], params[3])
+    }
+}
+
+public interface EmitExtractorWithResult5<R, T1, T2, T3, T4, T5>: EmitExtractor {
+    fun invoke(o1: T1, o2: T2, o3: T3, o4: T4, o5: T5): R
+
+    fun extract(params: Object[]): Object {
+        return this.invoke(params[0], params[1], params[2], params[3], params[4])
+    }
+}
+
+public interface EmitExtractorWithResult6<R, T1, T2, T3, T4, T5, T6>: EmitExtractor {
+    fun invoke(o1: T1, o2: T2, o3: T3, o4: T4, o5: T5, o6: T6): R
+
+    fun extract(params: Object[]): Object {
+        return this.invoke(params[0], params[1], params[2], params[3], params[4], params[5])
+    }
+}
+
+public interface EmitExtractorWithResult7<R, T1, T2, T3, T4, T5, T6, T7>: EmitExtractor {
+    fun invoke(o1: T1, o2: T2, o3: T3, o4: T4, o5: T5, o6: T6, o7: T7): R
+
+    fun extract(params: Object[]): Object {
+        return this.invoke(params[0], params[1], params[2], params[3], params[4], params[5], params[6])
+    }
+}
+
+public interface EmitExtractorWithResult8<R, T1, T2, T3, T4, T5, T6, T7, T8>: EmitExtractor {
+    fun invoke(o1: T1, o2: T2, o3: T3, o4: T4, o5: T5, o6: T6, o7: T7, o8: T8): R
+
+    fun extract(params: Object[]): Object {
+        return this.invoke(
+            params[0], params[1], params[2], params[3],
+            params[4], params[5], params[6], params[7]
+        )
+    }
+}
+
+public interface EmitExtractorWithResult9<R, T1, T2, T3, T4, T5, T6, T7, T8, T9>: EmitExtractor {
+    fun invoke(o1: T1, o2: T2, o3: T3, o4: T4, o5: T5, o6: T6, o7: T7, o8: T8, o9: T9): R
+
+    fun extract(params: Object[]): Object {
+        return this.invoke(
+            params[0], params[1], params[2], params[3], params[4],
+            params[5], params[6], params[7], params[8]
+        )
+    }
+}

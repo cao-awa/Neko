@@ -1,0 +1,28 @@
+locate com.github.kusa233.neko.stdlib.emit
+
+/**
+ * The standard library's exception, written in Neko.
+ *
+ * A function that declares an `emit` clause does not return: a `raise` boxes its values into an
+ * `Object[]`, wraps them in this exception, and throws it. The `try` that called the function
+ * catches this and calls [doEmit], which hands the array to the caller's extractor.
+ *
+ * [doEmit] answers whatever the extractor answered, which is how a `try` *expression* gets its
+ * value: `r: int = try f() { a -> yield 1 }` compiles to a `try`/`catch` whose handler stores
+ * `e.doEmit(action)` — the `1` the extractor's `yield` produced — into `r`. A `try` whose result is
+ * discarded, the statement form, simply pops it. Carrying the values rather than returning them is
+ * what keeps a `raise` from being an ordinary return in disguise — the compiler's lowering depends
+ * on that, which is why this class and the `EmitExtractor` families are part of the language's
+ * runtime rather than of any one program.
+ */
+public class EarlyEmitException: RuntimeException() {
+    private val data: Object[]
+
+    constructor(data: Object[]) {
+        this.data = data
+    }
+
+    fun doEmit(extractor: EmitExtractor): Object {
+        return extractor.extract(this.data)
+    }
+}
