@@ -97,16 +97,16 @@ object TestSupport {
      * Compiles [source] together with the Neko standard library.
      *
      * `raise` lowers to the library's `EarlyEmitException` and `EmitExtractorN`, which are themselves
-     * Neko sources under `samples/library`. A program that raises therefore has to be compiled with
+     * Neko sources under `stdlib`. A program that raises therefore has to be compiled with
      * them, just as the build compiles the sample and the library in one run. The library is read
      * from disk rather than inlined so these tests exercise the real files the build uses.
      */
     fun loadWithLibrary(source: String, name: String = "Test.neko"): LoadedProgram =
         load(standardLibrarySources() + SourceFile.of(name, source))
 
-    /** Every Neko source under `samples/library`, in a stable order. */
+    /** Every Neko source under `stdlib`, in a stable order. */
     fun standardLibrarySources(): List<SourceFile> {
-        val root = projectDirectory.resolve("samples/library")
+        val root = projectDirectory.resolve("stdlib")
         check(Files.isDirectory(root)) { "expected the standard library at $root" }
         return Files.walk(root).use { stream ->
             stream.filter { it.toString().endsWith(".neko") }

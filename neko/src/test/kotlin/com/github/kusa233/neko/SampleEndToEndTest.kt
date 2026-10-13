@@ -30,7 +30,7 @@ class SampleEndToEndTest {
     /**
      * Compiles one sample together with the Neko standard library, as the build does.
      *
-     * The library lives in `samples/library` and is ordinary Neko source, so a sample that raises
+     * The library lives in `stdlib` and is ordinary Neko source, so a sample that raises
      * only compiles when both are handed to the compiler at once — a class file's supertypes are
      * resolved when it is loaded, and `EarlyEmitException` is one of them.
      */

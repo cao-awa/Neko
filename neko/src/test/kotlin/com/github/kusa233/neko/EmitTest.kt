@@ -15,7 +15,7 @@ import kotlin.test.assertTrue
  * These programs `locate com.github.kusa233.neko.sample`, the same package as `ExceptionSample.neko`.
  * Neko resolves a name against the file's own package and without an `import`, so the standard
  * library `EarlyEmitException` and `EmitExtractorN` — which are themselves Neko sources under
- * `samples/library` — are only reachable from that package. Writing these fixtures anywhere else
+ * `stdlib` — are only reachable from that package. Writing these fixtures anywhere else
  * would test a program whose generated code names classes it cannot see.
  *
  * A `try` comes in the two forms the language gives it. The *statement* form

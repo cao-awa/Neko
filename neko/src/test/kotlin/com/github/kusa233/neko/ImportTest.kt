@@ -14,7 +14,7 @@ import kotlin.test.assertEquals
  * `locate` package, which is the rule that was there before imports existed.
  *
  * The standard library is the case the language promises to spare the reader: `EarlyEmitException`
- * and `EmitExtractorN` are Neko sources under `samples/library`, compiled alongside the program, so
+ * and `EmitExtractorN` are Neko sources under `stdlib`, compiled alongside the program, so
  * they resolve without an `import` and keep resolving even when one is written.
  */
 class ImportTest {

@@ -1,0 +1,46 @@
+<idea-plugin>
+    <id>com.github.kusa233.nekoj</id>
+    <name>NekoJ</name>
+    <vendor>com.github.kusa233</vendor>
+    <description><![CDATA[
+        NekoJ brings the Neko language to IntelliJ IDEA: syntax highlighting, code completion and
+        error reporting, all computed by the Neko compiler's own lexer, parser and analyzer.
+    ]]></description>
+    <idea-version since-build="261"/>
+
+    <!-- `platform` for the PSI, editor and colour-scheme machinery; `lang` for the language and
+         parser extension points (`lang.parserDefinition`, `lang.syntaxHighlighter`, ...) that make
+         a `.neko` file a language file rather than a text file. -->
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.lang</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- `name` and `language` must agree with NekoFileType.getName() and NekoLanguage's id:
+             the platform compares the bean against the instantiated file type and logs a plugin
+             exception when they differ. -->
+        <fileType name="Neko"
+                  language="Neko"
+                  implementationClass="com.github.kusa233.nekoj.NekoFileType"
+                  fieldName="INSTANCE"
+                  extensions="neko"/>
+
+        <!-- Not optional: without a parser definition the file degrades to plain text, and the
+             annotator and completion contributor below are then never consulted. -->
+        <lang.parserDefinition language="Neko"
+                               implementationClass="com.github.kusa233.nekoj.NekoParserDefinition"/>
+
+        <lang.syntaxHighlighter language="Neko"
+                                implementationClass="com.github.kusa233.nekoj.NekoSyntaxHighlighter"/>
+
+        <lang.commenter language="Neko"
+                        implementationClass="com.github.kusa233.nekoj.NekoCommenter"/>
+
+        <annotator language="Neko"
+                   implementationClass="com.github.kusa233.nekoj.NekoAnnotator"/>
+
+        <completion.contributor language="Neko"
+                                implementationClass="com.github.kusa233.nekoj.NekoCompletionContributor"/>
+
+        <colorSettingsPage implementation="com.github.kusa233.nekoj.NekoColorSettingsPage"/>
+    </extensions>
+</idea-plugin>

@@ -2,13 +2,17 @@ locate com.github.kusa233.neko.sample
 
 class ExceptionSample() {
     static fun main(args: string[]) {
-        result: int = try emitTest(true) { emit1, emit2 ->
+        result: int = try invoker() { emit1, emit2 ->
             println(emit1)
             println(emit2)
             yield 1
         }
         println(result)
     }
+
+    static fun invoker(): int {
+        return emitTest(true)
+    } emit [int, int]
 
     static fun emitTest(flag: bool): int {
         if (flag) {

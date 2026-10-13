@@ -22,7 +22,13 @@ dependencies {
 }
 
 kotlin {
-    jvmToolchain(25)
+    // Java 21, not the newest JDK, because this module is a *library* as well as a command-line
+    // compiler: `plugin/idea` links against it, and the IntelliJ Platform loads plugins on Java 21.
+    // Gradle enforces that across a project dependency -- it refuses to give a Java 21 consumer a
+    // Java 25 producer -- so the two modules have to agree on a target, and 21 is the one both can
+    // meet. Neko gives nothing up by it: the class files it *emits* are Java 8 regardless (see
+    // `BytecodeGenerator`), and everything it uses is long predates 21.
+    jvmToolchain(21)
 }
 
 tasks.test {

@@ -47,12 +47,9 @@ dependencies {
 kotlin {
     // The IntelliJ Platform for 2026.1 is built for Java 21, and `verifyPluginProjectConfiguration`
     // rejects a plugin whose Java target is above the platform's own -- a plugin compiled for Java
-    // 25 could not be loaded by a 21 platform. So the *target* is 21.
-    //
-    // `:neko` targets 25, and that is not a conflict: a class file's version constrains the JVM that
-    // may *load* it, not the JVM that may reference it. The IDE runs on its own JBR 25, which loads
-    // a 21 plugin and the 25 compiler classes it calls into, so both ends of the dependency are
-    // loadable where it matters.
+    // 25 could not be loaded by a 21 platform. So the *target* is 21, and `:neko` targets 21 as
+    // well so the two agree: Gradle refuses a project dependency whose producer needs a newer JVM
+    // than the consumer asks for.
     jvmToolchain(21)
 }
 
@@ -101,6 +98,23 @@ intellijPlatformTesting {
     }
 }
 
+// The platform's test fixtures are JUnit 3/4-style (`BasePlatformTestCase` extends
+// `junit.framework.TestCase`), so the JUnit 4 runner drives them; the JUnit Platform would need the
+// vintage engine and would otherwise discover no tests at all.
 tasks.test {
-    useJUnitPlatform()
+    useJUnit()
+}
+
+// ---------------------------------------------------------------------------------- packaging
+//
+// Both artifacts are named after the plugin rather than after the Gradle module. The module is
+// called `idea` because it sits at `plugin/idea`, but nobody installing a plugin should have to
+// know that: `NekoJ-1.0.0.zip` is what the IDE's "Install Plugin from Disk" dialog is handed, and
+// `NekoJ.jar` is what shows up in the IDE's plugin directory.
+tasks.jar {
+    archiveBaseName.set("NekoJ")
+}
+
+tasks.named<Zip>("buildPlugin") {
+    archiveFileName.set("NekoJ-${project.version}.zip")
 }
