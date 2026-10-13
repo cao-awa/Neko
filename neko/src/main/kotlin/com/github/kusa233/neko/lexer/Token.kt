@@ -11,6 +11,14 @@ enum class TokenType(val display: String) {
     // Declarations and modifiers.
     LOCATE("'locate'"),
     IMPORT("'import'"),
+    /**
+     * `'meow'` — the prefix that turns a class declaration into one whose fields are declared in its
+     * header and whose `equals`/`hashCode` are derived from them.
+     *
+     * It sits beside [CLASS] rather than among the statements because it can only ever introduce a
+     * class declaration; the parser reports a `meow` that introduces anything else.
+     */
+    MEOW("'meow'"),
     CLASS("'class'"),
     INTERFACE("'interface'"),
     FUN("'fun'"),
@@ -111,6 +119,7 @@ class Token(
 internal val KEYWORDS: Map<String, TokenType> = mapOf(
     "locate" to TokenType.LOCATE,
     "import" to TokenType.IMPORT,
+    "meow" to TokenType.MEOW,
     "class" to TokenType.CLASS,
     "interface" to TokenType.INTERFACE,
     "fun" to TokenType.FUN,

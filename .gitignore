@@ -23,3 +23,13 @@ bin/
 /nbdist/
 
 .*
+
+# The plugin sandbox, layout index and downloaded-platform metadata the IntelliJ Platform Gradle
+# Plugin builds under the project directory: derived from the IDE, not source.
+#
+# The `.*` rule above already covers this, but the entry is spelled out because
+# `verifyPluginProjectConfiguration` looks for exactly this line and fails the build without it. It
+# sits *after* the wildcard on purpose: git applies the last matching pattern, so putting it last is
+# what makes `git check-ignore -v .intellijPlatform` name this line, which is what keeps the reason
+# for the entry discoverable.
+/.intellijPlatform/

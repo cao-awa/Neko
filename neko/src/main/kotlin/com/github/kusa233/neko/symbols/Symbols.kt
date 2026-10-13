@@ -42,6 +42,15 @@ class ClassSymbol(
     /** `true` when the declaration was written `interface`. */
     val isInterface: Boolean = false,
     /**
+     * `true` when the declaration was written `meow class`, i.e. its `equals` and `hashCode` are
+     * derived from its fields.
+     *
+     * The declaration itself records this; the symbol carries it too because code generation decides
+     * from the resolved *type* whether `==` dispatches to a derived `equals`, and a type names a
+     * symbol rather than the declaration it came from.
+     */
+    val isMeow: Boolean = false,
+    /**
      * Type parameter names, erased to `Object`.
      *
      * A parameter name is accepted anywhere a type may be written inside the declaring class, and

@@ -153,31 +153,75 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         token.type == TokenType.IDENTIFIER || token.type in NAME_SEGMENT_KEYWORDS
 
     /** What a class member declaration looks like once its modifiers are skipped. */
-    private enum class MemberKind { FIELD, FUNCTION, CONSTRUCTOR, UNKNOWN }
+    private enum class MemberKind { FIELD, FUNCTION, CONSTRUCTOR, STATIC_BLOCK, UNKNOWN }
 
     private fun memberKindAhead(): MemberKind {
         var offset = 0
-        while (isModifier(peek(offset).type)) offset++
+        var sawStatic = false
+        while (isModifier(peek(offset).type)) {
+            if (peek(offset).type == TokenType.STATIC) sawStatic = true
+            offset++
+        }
         return when (peek(offset).type) {
             TokenType.VAL, TokenType.VAR -> MemberKind.FIELD
             TokenType.FUN -> MemberKind.FUNCTION
             TokenType.CONSTRUCTOR -> MemberKind.CONSTRUCTOR
+            // `static { ... }`. Any modifier written alongside `static` is reported by the caller:
+            // `private static {` is not a declaration this grammar has, but recognising it here is
+            // what lets the error say so instead of complaining about an unexpected `private`.
+            TokenType.LEFT_BRACE ->
+                if (sawStatic) MemberKind.STATIC_BLOCK else MemberKind.UNKNOWN
+
             else -> MemberKind.UNKNOWN
         }
+    }
+
+    /**
+     * The `static` modifier written directly on a single member, which is no longer how a static
+     * member is declared.
+     *
+     * Returning it rather than reporting it here lets the caller decide. What the caller does is
+     * report the spelling and then parse the member as static anyway: `static fun f()` and `fun f()`
+     * inside a block mean the same thing, so a reader who has not caught up should see one error
+     * about how it is written, not a cascade about what it means.
+     */
+    private fun staticModifierAhead(): Modifier? {
+        var offset = 0
+        while (isModifier(peek(offset).type)) {
+            val token = peek(offset)
+            if (token.type == TokenType.STATIC) return Modifier(ModifierKind.STATIC, token.span)
+            offset++
+        }
+        return null
     }
 
     private fun isModifier(type: TokenType): Boolean =
         type == TokenType.PRIVATE || type == TokenType.PUBLIC ||
             type == TokenType.PROTECTED || type == TokenType.STATIC
 
-    /** `private class Sample { ... }`, `interface EmitExtractor<T> { ... }` */
+    /** `private class Sample { ... }`, `interface EmitExtractor<T> { ... }`, `meow class Neko(...)` */
     private fun parseClassDeclaration(): ClassDeclaration? {
         val start = current()
         val modifiers = parseModifiers()
 
+        // `meow` marks a class whose fields are declared in its header, so it is read before the
+        // `class`/`interface` choice: the two words together are what the declaration is, and a
+        // `meow interface` has to be told apart from a plain one in order to be reported.
+        val meowToken = if (at(TokenType.MEOW)) advance() else null
+
         val isInterface = when {
             at(TokenType.CLASS) -> false
             at(TokenType.INTERFACE) -> true
+            meowToken != null -> {
+                error(
+                    "'meow' declares a class whose fields are written in its header, so it must be " +
+                        "followed by 'class'; write 'meow class Name(...)'",
+                    current().span,
+                )
+                synchronizeToDeclaration()
+                return null
+            }
+
             else -> {
                 error(
                     "expected a class declaration but found ${current().describe()}; " +
@@ -189,6 +233,10 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
                 return null
             }
         }
+        // `isMeow` is carried to the analyzer rather than reported here, so that a `meow interface`
+        // is still parsed as the interface it looks like and its body's own mistakes surface in the
+        // same run as the one the reader has to fix first.
+        val isMeow = meowToken != null
         val keyword = advance()
         val kindWord = if (isInterface) "interface" else "class"
 
@@ -229,30 +277,66 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             )
         }
 
-        // A class header may carry an empty parameter list, as in `class ExceptionSample()`. It is
-        // purely conventional now that constructors are declared by name: any parameter written here
-        // is rejected rather than silently ignored.
-        if (at(TokenType.LEFT_PAREN)) {
-            advance()
-            skipNestedNewlines()
-            if (!at(TokenType.RIGHT_PAREN)) {
-                error(
-                    "$kindWord '${nameToken.text}' cannot declare constructor parameters here: " +
-                        "declare a 'constructor(...)' in the body instead",
-                    current().span,
-                )
-                // Recover by skipping to the closing parenthesis, so the body still parses.
-                var depth = 1
-                while (depth > 0 && !at(TokenType.END_OF_FILE)) {
-                    when (advance().type) {
-                        TokenType.LEFT_PAREN -> depth++
-                        TokenType.RIGHT_PAREN -> depth--
-                        else -> {}
+        // A `meow class` states its fields here, and the list is the whole point of the form: it is
+        // parsed into the fields and a constructor below. A plain class may write an empty list — as
+        // in `class ExceptionSample()` — but any parameter in it is rejected rather than silently
+        // ignored, because its constructor is the one declared in the body.
+        val meowFields = mutableListOf<FieldDeclaration>()
+        var meowConstructor: ConstructorDeclaration? = null
+        val headerParameters = at(TokenType.LEFT_PAREN)
+        if (headerParameters) {
+            val open = advance()
+            if (isMeow) {
+                newlineInsensitiveDepth++
+                skipNestedNewlines()
+                if (!at(TokenType.RIGHT_PAREN)) {
+                    while (true) {
+                        parseMeowField()?.let { meowFields += it }
+                        skipNestedNewlines()
+                        if (at(TokenType.COMMA)) {
+                            advance()
+                            skipNestedNewlines()
+                            continue
+                        }
+                        break
                     }
                 }
+                skipNestedNewlines()
+                val close = expectRightParen("'meow class ${nameToken.text}'")
+                newlineInsensitiveDepth--
+                meowConstructor = buildMeowConstructor(
+                    fields = meowFields,
+                    openOffset = open.span.start,
+                    closeOffset = close?.span?.end ?: open.span.end,
+                )
             } else {
-                advance()
+                skipNestedNewlines()
+                if (!at(TokenType.RIGHT_PAREN)) {
+                    error(
+                        "$kindWord '${nameToken.text}' cannot declare constructor parameters here: " +
+                            "declare a 'constructor(...)' in the body instead",
+                        current().span,
+                    )
+                    // Recover by skipping to the closing parenthesis, so the body still parses.
+                    var depth = 1
+                    while (depth > 0 && !at(TokenType.END_OF_FILE)) {
+                        when (advance().type) {
+                            TokenType.LEFT_PAREN -> depth++
+                            TokenType.RIGHT_PAREN -> depth--
+                            else -> {}
+                        }
+                    }
+                } else {
+                    advance()
+                }
             }
+        } else if (isMeow) {
+            error(
+                "a 'meow' class must list its fields, because that list is what its 'equals' and " +
+                    "'hashCode' are derived from; write 'meow class ${nameToken.text}()' when it " +
+                    "has none",
+                current().span,
+            )
         }
 
         // Supertypes: `: Superclass(), Interface, Interface<T>`.
@@ -351,13 +435,31 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         val functions = mutableListOf<FunctionDeclaration>()
         val constructors = mutableListOf<ConstructorDeclaration>()
 
+        // The header's fields and constructor come first, so a member written in the body is analyzed
+        // after the ones the header declared — which is the order the source reads in, and what makes
+        // a duplicate between the two report the header's declaration as the previous one.
+        fields += meowFields
+        meowConstructor?.let { constructors += it }
+
         skipNewlines()
         while (!at(TokenType.RIGHT_BRACE) && !at(TokenType.END_OF_FILE)) {
             val before = index
             when (memberKindAhead()) {
-                MemberKind.FUNCTION -> parseFunctionDeclaration()?.let { functions += it }
-                MemberKind.FIELD -> parseFieldDeclaration(isInterface, nameToken)?.let { fields += it }
+                MemberKind.FUNCTION -> {
+                    reportStaticOnASingleMember()
+                    parseFunctionDeclaration()?.let { functions += it }
+                }
+
+                MemberKind.FIELD -> {
+                    reportStaticOnASingleMember()
+                    parseFieldDeclaration(isInterface, nameToken)?.let { fields += it }
+                }
+
                 MemberKind.CONSTRUCTOR -> parseConstructorDeclaration(nameToken)?.let { constructors += it }
+                MemberKind.STATIC_BLOCK -> {
+                    reportModifierOnStaticBlock()
+                    parseStaticMemberBlock(isInterface, nameToken, fields, functions)
+                }
                 MemberKind.UNKNOWN -> {
                     error(
                         "expected a field, function or constructor declaration in $kindWord " +
@@ -385,8 +487,118 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             constructors = constructors,
             functions = functions,
             isInterface = isInterface,
+            isMeow = isMeow,
             span = Span(source, keyword.span.start, end),
         )
+    }
+
+    /**
+     * Reports `static` written on a single member, which is no longer how static members are
+     * declared.
+     *
+     * The member is still parsed as static afterwards, because that is what the reader meant and
+     * `parseModifiers` has already recorded it. Reporting the spelling and keeping the meaning is
+     * what keeps this to one diagnostic.
+     */
+    private fun reportStaticOnASingleMember() {
+        val modifier = staticModifierAhead() ?: return
+        error(
+            "a member cannot be marked 'static' on its own; a static member is written inside a " +
+                "'static { ... }' block, where every member is static",
+            modifier.span,
+        )
+    }
+
+    /**
+     * Reports a modifier written on a `static { ... }` block itself.
+     *
+     * Visibility belongs on the members. A block is a grouping, so a `private` on it would state
+     * once what each member can already state for itself — and the two could then disagree, with no
+     * rule for which wins.
+     */
+    private fun reportModifierOnStaticBlock() {
+        if (at(TokenType.STATIC)) return
+        error(
+            "a 'static' block takes no modifier; write the visibility on the members inside it, " +
+                "as in 'private val count: int = 0'",
+            current().span,
+        )
+    }
+
+    /**
+     * `static { private val field1: int = 123 \n fun main(args: string[]) { ... } }`
+     *
+     * The block is a grouping, not a construct of its own: every member inside it is parsed exactly
+     * as it would be outside and then handed the `static` modifier the block supplies. Nothing
+     * downstream therefore has to know a block was written — the analyzer and the emitter keep
+     * asking each member whether it is static, and the answer is already in its modifiers.
+     *
+     * A block cannot nest and cannot hold a constructor. Nesting would only repeat what the outer
+     * block already says, and a constructor builds an instance, so `static` is not a property it
+     * could have.
+     */
+    private fun parseStaticMemberBlock(
+        isInterface: Boolean,
+        classToken: Token,
+        fields: MutableList<FieldDeclaration>,
+        functions: MutableList<FunctionDeclaration>,
+    ) {
+        // A modifier before `static` has already been reported; skipping it here keeps the block
+        // parsing, so the reader sees one error about the spelling rather than a lost declaration.
+        while (!at(TokenType.STATIC) && isModifier(current().type)) advance()
+
+        val keyword = advance() // `static`
+        val staticModifier = Modifier(ModifierKind.STATIC, keyword.span)
+
+        if (!expectLeftBrace("static block")) {
+            synchronizeToMember()
+            return
+        }
+
+        skipNewlines()
+        while (!at(TokenType.RIGHT_BRACE) && !at(TokenType.END_OF_FILE)) {
+            val before = index
+            when (memberKindAhead()) {
+                MemberKind.FUNCTION ->
+                    parseFunctionDeclaration(staticModifier)?.let { functions += it }
+
+                MemberKind.FIELD ->
+                    parseFieldDeclaration(isInterface, classToken, staticModifier)?.let { fields += it }
+
+                MemberKind.CONSTRUCTOR -> {
+                    error(
+                        "a 'static' block cannot declare a constructor: a constructor builds an " +
+                            "instance, so it is never static",
+                        current().span,
+                    )
+                    synchronizeToMember()
+                }
+
+                MemberKind.STATIC_BLOCK -> {
+                    error(
+                        "this 'static' block is already inside a 'static' block; every member here " +
+                            "is static already",
+                        current().span,
+                    )
+                    // Parsed anyway, with the same modifier, so the members inside are still
+                    // declarations rather than a second cascade of errors.
+                    parseStaticMemberBlock(isInterface, classToken, fields, functions)
+                }
+
+                MemberKind.UNKNOWN -> {
+                    error(
+                        "expected a field or function declaration in this 'static' block but found " +
+                            current().describe(),
+                        current().span,
+                    )
+                    synchronizeToMember()
+                }
+            }
+            if (index == before) advance()
+            skipNewlines()
+        }
+
+        expectRightBrace("static block")
     }
 
     /**
@@ -431,12 +643,19 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
     /**
      * `private val field1: int = 123`
      *
-     * An interface may not declare instance fields — only `static` constants — which is checked here
+     * An interface may not declare instance fields — only static ones — which is checked here
      * rather than in the analyzer so the error points at the field itself.
+     *
+     * [staticFromBlock] is the modifier an enclosing `static { ... }` supplies, or `null` when the
+     * field stands directly in the class body.
      */
-    private fun parseFieldDeclaration(isInterface: Boolean, classToken: Token): FieldDeclaration? {
+    private fun parseFieldDeclaration(
+        isInterface: Boolean,
+        classToken: Token,
+        staticFromBlock: Modifier? = null,
+    ): FieldDeclaration? {
         val start = current()
-        val modifiers = parseModifiers()
+        val modifiers = parseModifiers() + listOfNotNull(staticFromBlock)
 
         val kindToken = current()
         val kind = when (kindToken.type) {
@@ -479,7 +698,8 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         if (isInterface && !modifiers.any { it.kind == ModifierKind.STATIC }) {
             error(
                 "interface '${classToken.text}' cannot declare the instance field " +
-                    "'${nameToken.text}': an interface has no state, so a field must be 'static'",
+                    "'${nameToken.text}': an interface has no state, so a field belongs in a " +
+                    "'static { ... }' block",
                 nameToken.span,
             )
         }
@@ -496,10 +716,129 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         )
     }
 
-    /** `fun main(args: string[]) { ... }` */
-    private fun parseFunctionDeclaration(): FunctionDeclaration? {
+    /**
+     * One entry of a `meow class` header: `[private|protected|public] val|var name: Type`.
+     *
+     * The entry is *only* a declaration. The value it names arrives as a constructor parameter, so no
+     * initializer is read here and an `= value` written in the header is left for the caller's
+     * comma/`)` check to report rather than being given a second meaning.
+     *
+     * Returns `null` after reporting, having consumed to the next entry's boundary, so the rest of
+     * the list still becomes the declarations it looks like.
+     */
+    private fun parseMeowField(): FieldDeclaration? {
         val start = current()
         val modifiers = parseModifiers()
+
+        val kindToken = current()
+        val kind = when (kindToken.type) {
+            TokenType.VAL -> VariableKind.VAL
+            TokenType.VAR -> VariableKind.VAR
+            else -> {
+                error(
+                    "expected 'val' or 'var' to say what this 'meow' field is but found " +
+                        kindToken.describe(),
+                    kindToken.span,
+                )
+                synchronizeToMeowField()
+                return null
+            }
+        }
+        advance()
+
+        val nameToken = expect(
+            TokenType.IDENTIFIER,
+            "expected a 'meow' field name but found ${current().describe()}",
+        ) ?: run {
+            synchronizeToMeowField()
+            return null
+        }
+
+        if (!expectColon("'meow' field '${nameToken.text}'")) {
+            synchronizeToMeowField()
+            return null
+        }
+
+        val type = parseType() ?: run {
+            synchronizeToMeowField()
+            return null
+        }
+
+        return FieldDeclaration(
+            kind = kind,
+            kindSpan = kindToken.span,
+            name = nameToken.text,
+            nameSpan = nameToken.span,
+            declaredType = type,
+            // A header field is never initialized where it is declared: the constructor that takes
+            // it as a parameter is the only thing that writes it.
+            initializer = null,
+            modifiers = modifiers,
+            span = Span(source, start.span.start, type.span.end),
+        )
+    }
+
+    /**
+     * The constructor a `meow class` header implies: one parameter per field, each stored into it.
+     *
+     * The body is written here as the source `this.name = name` rather than lowered later, so the
+     * analyzer and the code generator handle a meow constructor with the code they already have —
+     * the standard library's `EarlyEmitException` stores its array with exactly that statement.
+     * Nothing downstream therefore needs to know where the body came from.
+     *
+     * The parameter list is the fields in order, so the values land in the fields the header named.
+     */
+    private fun buildMeowConstructor(
+        fields: List<FieldDeclaration>,
+        openOffset: Int,
+        closeOffset: Int,
+    ): ConstructorDeclaration {
+        val assignments = fields.map { field ->
+            // The statement is not in the source, so it is anchored at the field it stores: a
+            // diagnostic about this class' `val` fields should point at `val x: int`, not at the
+            // `(` that happens to be where the constructor was inferred from.
+            val assignmentSpan = field.span
+            AssignmentStatement(
+                target = MemberAccessExpression(
+                    receiver = ThisExpression(assignmentSpan, assignmentSpan),
+                    memberName = field.name,
+                    memberSpan = field.nameSpan,
+                    span = assignmentSpan,
+                ),
+                value = NameExpression(field.name, field.nameSpan, assignmentSpan),
+                span = assignmentSpan,
+            )
+        }
+
+        val body = BlockStatement(statements = assignments, span = Span(source, openOffset, closeOffset))
+
+        return ConstructorDeclaration(
+            parameters = fields.map { field ->
+                Parameter(
+                    name = field.name,
+                    nameSpan = field.nameSpan,
+                    declaredType = field.declaredType,
+                    span = field.span,
+                )
+            },
+            body = body,
+            // A meow constructor is the class' own and is written nowhere in the source: it takes no
+            // visibility of its own, so the header's modifiers stay on the fields they were written
+            // in front of.
+            modifiers = emptyList(),
+            span = body.span,
+        )
+    }
+
+    /**
+     * `fun main(args: string[]) { ... }`
+     *
+     * [staticFromBlock] is the modifier an enclosing `static { ... }` supplies, or `null` when the
+     * function stands directly in the class body.
+     */
+    private fun parseFunctionDeclaration(staticFromBlock: Modifier? = null): FunctionDeclaration? {
+        val start = current()
+        val modifiers = parseModifiers() + listOfNotNull(staticFromBlock)
 
         if (!at(TokenType.FUN)) {
             error("expected 'fun' but found ${current().describe()}", current().span)
@@ -1890,10 +2229,12 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             if (at(TokenType.NEWLINE)) {
                 advance()
                 skipNewlines()
-                if (at(TokenType.CLASS) || isModifier(current().type)) return
+                // `meow` belongs here as much as `class` does: it opens a declaration, so stopping
+                // only at `class` would report the *next* one as malformed too.
+                if (at(TokenType.MEOW) || at(TokenType.CLASS) || isModifier(current().type)) return
                 continue
             }
-            if (at(TokenType.CLASS)) return
+            if (at(TokenType.MEOW) || at(TokenType.CLASS)) return
             advance()
         }
     }
@@ -1908,6 +2249,35 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
                 TokenType.NEWLINE -> if (depth == 0) {
                     advance()
                     skipNewlines()
+                    return
+                }
+
+                else -> Unit
+            }
+            advance()
+        }
+    }
+
+    /**
+     * Skips to the next entry of a `meow class` header, i.e. past a comma or up to the `)`.
+     *
+     * A header list is not a statement sequence, so the statement and member boundaries would both
+     * run past the end of the list and swallow the class body with it. Stopping at the comma or the
+     * closing parenthesis is what keeps one malformed entry to one diagnostic.
+     */
+    private fun synchronizeToMeowField() {
+        var depth = 0
+        while (!at(TokenType.END_OF_FILE)) {
+            when (current().type) {
+                TokenType.LEFT_PAREN, TokenType.LEFT_BRACKET -> depth++
+                TokenType.RIGHT_PAREN, TokenType.RIGHT_BRACKET -> {
+                    if (depth == 0) return
+                    depth--
+                }
+
+                TokenType.COMMA -> if (depth == 0) {
+                    advance()
+                    skipNestedNewlines()
                     return
                 }
 

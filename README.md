@@ -93,10 +93,29 @@ There is no second grammar to drift out of step with the real one.
 The result is `plugin/idea/build/distributions/NekoJ-1.0.0.zip`. Install it with
 **Settings → Plugins → ⚙ → Install Plugin from Disk…**, then restart the IDE.
 
-The plugin is built against the IDE installed at `D:/IntelliJ IDEA 2026.1.4` rather than against a
-downloaded copy of the platform, so no IDE is fetched during a build, and the API it compiles against
-is exactly the API it loads into. Both modules target Java 21, because that is what the 2026.1
-platform requires.
+The first build downloads IntelliJ IDEA 2026.1.4 from JetBrains' Maven repository (roughly 1.6 GB,
+cached afterwards) and compiles the plugin against it. It is pinned to an exact release rather than
+to the newest available, because three things have to agree: the API the plugin compiles against,
+the `sinceBuild` it advertises, and the IDE its tests run inside. A floating version would let them
+drift apart with nothing failing. Since `sinceBuild` is `261`, building and testing against the last
+patch release of the 2026.1 line is what makes that claim mean something.
+
+Because the platform comes from the repository rather than from an installation, the build needs
+network access on its first run, and it no longer depends on any particular IDE being installed on
+the machine — a CI runner builds the same plugin.
+
+Note that this is the **unified** IntelliJ IDEA, not Community Edition. Since 2025.3 JetBrains
+merged Community and Ultimate into a single product, so `ideaIC` is no longer published for 2026.1
+and the plugin's `intellijIdeaCommunity()` helper does not resolve; `intellijIdea()` is that merged
+product, and at this version it is the only IntelliJ IDEA there is.
+
+One consequence is worth stating plainly, because it is a real loss: compiling against the merged
+product no longer *proves* the plugin avoids paid-only APIs, the way building against Community did.
+What keeps the plugin honest instead is `depends` in `plugin.xml`, which names exactly two modules —
+`com.intellij.modules.platform` and `com.intellij.modules.lang`. An IDE missing either will refuse
+to load the plugin rather than fail in some subtler way at run time.
+
+Both modules target Java 21, because that is what the 2026.1 platform requires.
 
 ```bash
 # Checks the plugin against a real IDE: extension points, API usage, compatibility.
@@ -142,15 +161,90 @@ class Neko() {
 }
 ```
 
-Static function:
+Static members:
 ```neko
 class Neko() {
   static {
+    private val counter: int = 0
+
     fun testStatic() {
+      counter = counter + 1
     }
   }
 }
 ```
+
+A `static { ... }` block holds fields and functions alike, and every member inside it is static —
+that is what the block says, so writing `static` again on a member is an error:
+
+```neko
+class Neko() {
+  static fun testStatic() { }   // Error: a static member belongs in a 'static { ... }' block
+}
+```
+
+Visibility is written on the member (`private val`, `public fun`), not on the block. A block cannot
+nest, and cannot hold a `constructor`: a constructor builds an instance, so it is never static.
+Members declared outside the block are instance members.
+
+### Value class (`meow`)
+
+`meow` before `class` declares the fields in the header and derives `equals` and `hashCode` from them:
+
+```neko
+meow class Point(val x: int, private val y: int) {
+}
+```
+
+- The header list is the field list. Each entry is `[private|protected|public] val|var name: Type`,
+  comma-separated, and there may be none: `meow class Unit()`.
+- Two instances are equal when they are the same class and every field is equal. **Private fields
+  take part**, as they do in a Kotlin data class.
+- `==` and `!=` between two meow values use the derived `equals`. So do `a.equals(b)` and
+  `a.hashCode()`: both are ordinary methods you can call.
+- Writing your own `equals` or `hashCode` replaces the derived one.
+
+The header is desugared into what the language already had — a field, a constructor parameter and a
+`this.x = x` — so only the two derived methods are new. They are emitted as bytecode, because Neko
+has no `is` operator and no cast, so neither could be written in Neko.
+
+`meow` cannot be applied to an `interface` (an interface has no fields to derive from), and a meow
+class must write its field list.
+
+### Local variables
+
+A local's type is inferred from its initializer when you leave it out:
+
+```neko
+instance = Instance()   // instance is an Instance
+count = 1               // count is an int
+```
+
+Writing the type is still allowed and still checked. A bare `name = value` is a *declaration* when
+nothing is in scope under that name, and an *assignment* when something is — so `str = "new value"`
+still writes to the `str` declared above it, exactly as `Sample.neko` shows. The two are told apart
+by the scope alone, which is why the compiler decides it rather than the parser: a bare name may
+also be a field declared further down the same class.
+
+The inferred local is mutable, and its name is registered only *after* its value is analysed, so
+`count = count + 1` with no `count` in scope reports the reference rather than quietly declaring a
+variable that starts from itself.
+
+### The entry point
+
+```neko
+class Main {
+  static {
+    fun main() {
+      println("no arguments needed")
+    }
+  }
+}
+```
+
+A `static` `main` may take `string[]` or nothing at all. The JVM looks for exactly
+`main(String[])`, so when the argument list is omitted the compiler emits a bridge that calls the
+declared function.
 
 ### Error control
 

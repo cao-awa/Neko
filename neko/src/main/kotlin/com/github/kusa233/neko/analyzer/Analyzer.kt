@@ -149,6 +149,19 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
     private fun declareClasses() {
         for (declaration in program.classes) {
+            // `meow` derives a class' `equals` and `hashCode` from its fields, and an interface has
+            // neither state nor an implementation to derive them into. Reported here, before the
+            // symbol is built, because the declaration is not a class at all — nothing later could
+            // make sense of it, and a second error from a half-built symbol would only be noise.
+            if (declaration.isMeow && declaration.isInterface) {
+                diagnostics.error(
+                    "'meow' cannot declare an interface: an interface has no fields to derive " +
+                        "'equals' and 'hashCode' from, so write 'interface ${declaration.name} { }'",
+                    declaration.nameSpan,
+                )
+                continue
+            }
+
             val previous = classes[declaration.name]
             if (previous != null) {
                 diagnostics.error(
@@ -171,6 +184,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 jvmInternalName = packagePrefix + declaration.name,
                 packagePrefix = packagePrefix,
                 isInterface = declaration.isInterface,
+                isMeow = declaration.isMeow,
                 typeParameters = declaration.typeParameters,
             )
             classes[declaration.name] = symbol
@@ -383,6 +397,58 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                     isParameter = true,
                 )
             }
+        }
+
+        if (declaration.isMeow) declareDerivedFunctions(declaration, classSymbol)
+    }
+
+    /**
+     * Declares the `equals` and `hashCode` a `meow class` gets for free.
+     *
+     * Neko cannot express either method — `equals` has to compare a value whose type it does not
+     * know, and neither has a body the language could write — so the code generator emits them. What
+     * the analyzer contributes is the *signature*: without a symbol here, `a.equals(b)` would be
+     * "Neko has no member named 'equals'" even though the class file has the method, and the
+     * generated pair would be unreachable from source.
+     *
+     * A hand-written `equals` or `hashCode` wins. This runs after every declared member is in place,
+     * so a body the author wrote is already known and the derived one is simply not added; the
+     * functions are keyed by name and parameter types, so "the same signature" means a real override
+     * rather than a second overload.
+     */
+    private fun declareDerivedFunctions(declaration: ClassDeclaration, classSymbol: ClassSymbol) {
+        // A `meow interface` has already been reported and has no symbol to attach functions to: the
+        // declaration is not a class, so there is nothing to derive from and nowhere to put it.
+        if (declaration.isInterface) return
+
+        val derived = listOf(
+            FunctionSymbol(
+                name = "equals",
+                span = declaration.nameSpan,
+                parameterTypes = listOf(ObjectType),
+                returnType = BoolType,
+                enclosingClass = classSymbol,
+                // `declaration = null` is how a function with no Neko body is modelled; a
+                // constructor has none either, and for the same reason — there is nothing to emit
+                // from, so the body lives in the class file rather than in the tree.
+                declaration = null,
+                isStatic = false,
+            ),
+            FunctionSymbol(
+                name = "hashCode",
+                span = declaration.nameSpan,
+                parameterTypes = emptyList(),
+                returnType = IntType,
+                enclosingClass = classSymbol,
+                declaration = null,
+                isStatic = false,
+            ),
+        ).filterNot { symbol ->
+            classSymbol.functions[symbol.name].orEmpty().any { it.parameterTypes == symbol.parameterTypes }
+        }
+
+        for (symbol in derived) {
+            classSymbol.functions.getOrPut(symbol.name) { mutableListOf() } += symbol
         }
     }
 
@@ -945,10 +1011,14 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     /**
      * Rejects a call to a function that may `raise` when nothing catches it.
      *
-     * A function with an `emit` clause does not return a value: it leaves through `raise`, and the
-     * only thing that receives those values is a `try … { … -> }` extractor. Called anywhere else
-     * the values would have nowhere to go, so the call is an error rather than a value that is
-     * silently always null.
+     * A function with an `emit` clause may leave through `raise` rather than by returning, and the
+     * only thing that receives the raised values is a `try … { … -> }` extractor. Called anywhere
+     * else those values would have nowhere to go, so the call is an error rather than a value that
+     * is silently always null.
+     *
+     * Note what is *not* claimed: the function still returns normally on the paths that do not
+     * raise, and its declared return type still describes those. The clause is about a second way
+     * out, not about the absence of the first.
      *
      * There is one exception, and it is the reason [forwardsRaiseUnchanged] exists: a caller that
      * declares the *same* `emit` clause is not trying to receive the values, it is handing them on.
@@ -960,7 +1030,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         if (!symbol.canRaise) return
         if (forwardsRaiseUnchanged(symbol)) return
         diagnostics.error(
-            "'${symbol.name}' declares an 'emit' clause, so it never returns a value; call it as " +
+            "'${symbol.name}' declares an 'emit' clause, so it may raise an effect, call it as " +
                 "'try ${symbol.name}(...) { ... -> }' to receive the values it 'raise's",
             span,
         )
@@ -1141,6 +1211,17 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             )
             return
         }
+
+        // Nothing is in scope under this name, so the statement declares it and its type comes from
+        // the value: `instance = Instance()`. Neko spells assignment the same way -- the sample's
+        // `str = "new value"` is valid because `str` *is* in scope by then -- and only the scope
+        // separates the two. This is checked before resolving so that a name being declared is not
+        // first reported as unresolved.
+        if (lookup(target.name) == null) {
+            declareWithInferredType(statement, target)
+            return
+        }
+
         val resolved = resolveName(target) ?: return
 
         if (resolved !is LocalSymbol && resolved !is FieldSymbol) {
@@ -1181,6 +1262,37 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 statement.value.span,
             )
         }
+    }
+
+    /**
+     * `instance = Instance()`, where nothing was in scope under that name — a declaration whose type
+     * is inferred from the value.
+     *
+     * This is what lets a reader write the name once instead of twice. The type is the value's own
+     * type rather than anything inferred from later use, which is the simple and predictable rule:
+     * Neko's analyzer works in one pass, so at this point there is nothing later to consult.
+     *
+     * The local is mutable. A bare assignment is the spelling for writing to a name, so a reader
+     * who wants a `val` still says so, and the desugaring cannot silently take that choice away.
+     *
+     * The name is deliberately *not* registered before the value is analysed: `count = count + 1`
+     * with no `count` in scope yet is a mistake, and reporting the reference inside the value is a
+     * better answer than quietly declaring a variable that starts from itself.
+     */
+    private fun declareWithInferredType(statement: AssignmentStatement, target: NameExpression) {
+        val valueType = analyzeExpression(statement.value)
+
+        val symbol = LocalSymbol(
+            name = target.name,
+            type = valueType,
+            span = target.span,
+            kind = VariableKind.VAR,
+            enclosingLambda = currentLambda?.identity,
+        )
+        statement.declaredLocal = symbol
+        target.resolution = symbol
+        target.resolvedType = valueType
+        scopes.last().symbols[target.name] = symbol
     }
 
     /**
@@ -2490,11 +2602,14 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      */
     private fun resolveType(reference: TypeReference): NekoType = when (reference) {
         is NamedTypeReference -> when (reference.name) {
-            "int" -> IntType
-            "string" -> StringType
-            "bool" -> BoolType
-            "Object" -> ObjectType
-            "Throwable" -> ThrowableType
+            // The built-in types, by either spelling: `Integer` is another way to write `int`, so a
+            // program may use whichever name matches the Java type it is thinking of, and the two
+            // are one type rather than two that would fail to be assignable to each other. This is
+            // checked before any class lookup, because every one of these names is also a real JDK
+            // class -- without it, `x: String = "hi"` would resolve `String` to `java.lang.String`
+            // and then reject the string.
+            in BuiltinTypes.byName -> BuiltinTypes.byName.getValue(reference.name)
+
             else -> {
                 // A type parameter of the class being analysed stands for "whatever the caller
                 // passes", which is exactly `Object` once the JVM erases it. That is all the
@@ -2532,16 +2647,20 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         declaredClass(name)?.let { return ClassType(it.jvmInternalName, name) }
 
         // A class the program does not declare but the JVM provides — `RuntimeException`,
-        // `ArithmeticException`, `String` — is one a program has to be able to name in order to
-        // extend or catch it. Whether it exists is answered by the platform rather than by a list, so
-        // every `java.lang` class works, including ones added later.
+        // `ArithmeticException` — is one a program has to be able to name in order to extend or
+        // catch it. Whether it exists is answered by the platform rather than by a list, so every
+        // `java.lang` class works, including ones added later.
+        //
+        // `Integer`, `Boolean` and `String` are not reached here: they name built-in types, and
+        // [resolveType] resolves them before this point so that the two spellings are one type.
         if (isPlatformClass(name)) return ClassType("java/lang/$name", name)
 
         if (!name.first().isUpperCase()) {
             diagnostics.error(
                 "unknown type '$name': Neko has 'int', 'string', 'bool', 'Object' and " +
-                    "'Throwable', array types such as 'string[]', function types such as " +
-                    "'[int] -> int', and class types, whose names start with a capital letter",
+                    "'Throwable', or the Java spellings 'Integer', 'String' and 'Boolean'; array " +
+                    "types such as 'string[]', function types such as '[int] -> int'; and class " +
+                    "types, whose names start with a capital letter",
                 span,
             )
             return ErrorType

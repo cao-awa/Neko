@@ -1,25 +1,30 @@
 locate com.github.kusa233.neko.sample
 
 class ExceptionSample() {
-    static fun main(args: string[]) {
-        result: int = try invoker() { emit1, emit2 ->
-            println(emit1)
-            println(emit2)
-            yield 1
+    static {
+        fun main(args: string[]) {
+            result: int = try invoker() { emit1, emit2 ->
+                println(emit1)
+                println(emit2)
+                yield 1
+            }
+            println(result)
+            // Error to compile: 'invoker' has an 'emit' clause, so it may raise an effect.
+            // Call it with 'try invoker() { emit1, emit2 -> ... }' to receive what it 'raise's.
+            // result = invoker()
         }
-        println(result)
+
+        fun invoker(): int {
+            return emitTest(true)
+        } emit [int, int]
+
+        fun emitTest(flag: bool): int {
+            if (flag) {
+                raise 123, 456
+                // Unreachable, notice as error level.
+            } else {
+                return 789
+            }
+        } emit [int, int]
     }
-
-    static fun invoker(): int {
-        return emitTest(true)
-    } emit [int, int]
-
-    static fun emitTest(flag: bool): int {
-        if (flag) {
-            raise 123, 456
-            // Unreachable, notice as error level.
-        } else {
-            return 789
-        }
-    } emit [int, int]
 }

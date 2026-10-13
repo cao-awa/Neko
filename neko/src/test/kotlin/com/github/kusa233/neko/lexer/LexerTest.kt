@@ -37,8 +37,8 @@ class LexerTest {
     @Test
     fun `scans every keyword`() {
         val keywords = listOf(
-            "locate", "import", "class", "interface", "constructor", "fun", "val", "var", "private",
-            "public", "protected", "static", "return", "yield", "if", "else", "while",
+            "locate", "import", "meow", "class", "interface", "constructor", "fun", "val", "var",
+            "private", "public", "protected", "static", "return", "yield", "if", "else", "while",
             "when", "try", "catch", "finally", "raise", "emit", "this", "true", "false",
         )
         for (keyword in keywords) {

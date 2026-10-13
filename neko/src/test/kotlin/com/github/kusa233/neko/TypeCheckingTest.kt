@@ -27,10 +27,12 @@ class TypeCheckingTest {
     fun `println accepts int, string and bool`() {
         val program = TestSupport.load(
             TestSupport.program(
-                "static fun main() {",
-                "    println(1)",
-                "    println(\"text\")",
-                "    println(true)",
+                "static {",
+                "    fun main() {",
+                "        println(1)",
+                "        println(\"text\")",
+                "        println(true)",
+                "    }",
                 "}",
             ),
         )
@@ -42,8 +44,10 @@ class TypeCheckingTest {
     fun `println rejects a value it has no overload for`() {
         messageFor(
             TestSupport.program(
-                "static fun main() {",
-                "    println(1, 2)",
+                "static {",
+                "    fun main() {",
+                "        println(1, 2)",
+                "    }",
                 "}",
             ),
             "println",
@@ -53,8 +57,10 @@ class TypeCheckingTest {
     @Test
     fun `a call to an unknown function is reported at the name`() {
         val source = TestSupport.program(
-            "static fun main() {",
-            "    missing()",
+            "static {",
+            "    fun main() {",
+            "        missing()",
+            "    }",
             "}",
         )
         val error = TestSupport.errors(TestSupport.compile(source)).single()
@@ -68,8 +74,10 @@ class TypeCheckingTest {
     @Test
     fun `an unknown type is reported where the type is written`() {
         val source = TestSupport.program(
-            "static fun main() {",
-            "    value: number = 1",
+            "static {",
+            "    fun main() {",
+            "        value: number = 1",
+            "    }",
             "}",
         )
         val error = TestSupport.errors(TestSupport.compile(source)).single()
@@ -86,9 +94,11 @@ class TypeCheckingTest {
     @Test
     fun `assigning a string to an int is rejected at the value`() {
         val source = TestSupport.program(
-            "static fun main() {",
-            "    value: int = 1",
-            "    value = \"text\"",
+            "static {",
+            "    fun main() {",
+            "        value: int = 1",
+            "        value = \"text\"",
+            "    }",
             "}",
         )
         val error = TestSupport.errors(TestSupport.compile(source)).single()
@@ -107,8 +117,10 @@ class TypeCheckingTest {
     fun `a declaration whose initializer has the wrong type is rejected`() {
         messageFor(
             TestSupport.program(
-                "static fun main() {",
-                "    value: int = \"text\"",
+                "static {",
+                "    fun main() {",
+                "        value: int = \"text\"",
+                "    }",
                 "}",
             ),
             "string",
@@ -118,9 +130,11 @@ class TypeCheckingTest {
     @Test
     fun `an if condition must be bool`() {
         val source = TestSupport.program(
-            "static fun main() {",
-            "    if (1) {",
-            "        println(\"no\")",
+            "static {",
+            "    fun main() {",
+            "        if (1) {",
+            "            println(\"no\")",
+            "        }",
             "    }",
             "}",
         )
@@ -135,9 +149,11 @@ class TypeCheckingTest {
     fun `a while condition must be bool`() {
         messageFor(
             TestSupport.program(
-                "static fun main() {",
-                "    while (\"text\") {",
-                "        println(\"no\")",
+                "static {",
+                "    fun main() {",
+                "        while (\"text\") {",
+                "            println(\"no\")",
+                "        }",
                 "    }",
                 "}",
             ),
@@ -148,8 +164,10 @@ class TypeCheckingTest {
     @Test
     fun `arithmetic requires int operands`() {
         val source = TestSupport.program(
-            "static fun main() {",
-            "    value: int = 1 + \"text\"",
+            "static {",
+            "    fun main() {",
+            "        value: int = 1 + \"text\"",
+            "    }",
             "}",
         )
         val error = TestSupport.errors(TestSupport.compile(source)).single()
@@ -168,11 +186,13 @@ class TypeCheckingTest {
     fun `calling a function with too few arguments is rejected`() {
         messageFor(
             TestSupport.program(
-                "static fun add(a: int, b: int): int {",
-                "    return a + b",
-                "}",
-                "static fun main() {",
-                "    println(add(1))",
+                "static {",
+                "    fun add(a: int, b: int): int {",
+                "        return a + b",
+                "    }",
+                "    fun main() {",
+                "        println(add(1))",
+                "    }",
                 "}",
             ),
             "argument",
@@ -182,11 +202,13 @@ class TypeCheckingTest {
     @Test
     fun `an argument of the wrong type is reported at that argument`() {
         val source = TestSupport.program(
-            "static fun twice(value: int): int {",
-            "    return value + value",
-            "}",
-            "static fun main() {",
-            "    println(twice(\"text\"))",
+            "static {",
+            "    fun twice(value: int): int {",
+            "        return value + value",
+            "    }",
+            "    fun main() {",
+            "        println(twice(\"text\"))",
+            "    }",
             "}",
         )
         val error = TestSupport.errors(TestSupport.compile(source)).single()
@@ -200,8 +222,10 @@ class TypeCheckingTest {
     fun `returning the wrong type from a function is rejected`() {
         messageFor(
             TestSupport.program(
-                "static fun value(): int {",
-                "    return \"text\"",
+                "static {",
+                "    fun value(): int {",
+                "        return \"text\"",
+                "    }",
                 "}",
             ),
             "string",
@@ -212,11 +236,13 @@ class TypeCheckingTest {
     fun `calling a lambda with the wrong arity is rejected`() {
         messageFor(
             TestSupport.program(
-                "static fun main() {",
-                "    f: [int, int] -> int = { a, b ->",
-                "        yield a + b",
+                "static {",
+                "    fun main() {",
+                "        f: [int, int] -> int = { a, b ->",
+                "            yield a + b",
+                "        }",
+                "        println(f(1))",
                 "    }",
-                "    println(f(1))",
                 "}",
             ),
             "argument",
@@ -227,9 +253,11 @@ class TypeCheckingTest {
     fun `a lambda must yield a value matching its declared return type`() {
         messageFor(
             TestSupport.program(
-                "static fun main() {",
-                "    f: [int] -> string = { a ->",
-                "        yield a + 1",
+                "static {",
+                "    fun main() {",
+                "        f: [int] -> string = { a ->",
+                "            yield a + 1",
+                "        }",
                 "    }",
                 "}",
             ),
@@ -242,11 +270,13 @@ class TypeCheckingTest {
         // Capture is by value, so this would silently not affect the enclosing variable.
         messageFor(
             TestSupport.program(
-                "static fun main() {",
-                "    counter: int = 0",
-                "    bump: [] -> int = { ->",
-                "        counter = counter + 1",
-                "        yield counter",
+                "static {",
+                "    fun main() {",
+                "        counter: int = 0",
+                "        bump: [] -> int = { ->",
+                "            counter = counter + 1",
+                "            yield counter",
+                "        }",
                 "    }",
                 "}",
             ),
@@ -258,10 +288,12 @@ class TypeCheckingTest {
     fun `a lambda may read a captured variable`() {
         val result = TestSupport.compile(
             TestSupport.program(
-                "static fun main() {",
-                "    base: int = 10",
-                "    add: [int] -> int = { a ->",
-                "        yield a + base",
+                "static {",
+                "    fun main() {",
+                "        base: int = 10",
+                "        add: [int] -> int = { a ->",
+                "            yield a + base",
+                "        }",
                 "    }",
                 "}",
             ),
@@ -281,11 +313,13 @@ class TypeCheckingTest {
         // verifier — a wrong program that compiled cleanly.
         val program = TestSupport.load(
             TestSupport.program(
-                "static fun main() {",
-                "    read: [int] -> int = { extra ->",
-                "        yield extra + 1",
+                "static {",
+                "    fun main() {",
+                "        read: [int] -> int = { extra ->",
+                "            yield extra + 1",
+                "        }",
+                "        println(read(1))",
                 "    }",
-                "    println(read(1))",
                 "}",
             ),
         )
@@ -298,13 +332,15 @@ class TypeCheckingTest {
         // The same rule one step further out: the callee is itself a call's result.
         val program = TestSupport.load(
             TestSupport.program(
-                "static fun make(): [int] -> int {",
-                "    return { extra ->",
-                "        yield extra * 3",
+                "static {",
+                "    fun make(): [int] -> int {",
+                "        return { extra ->",
+                "            yield extra * 3",
+                "        }",
                 "    }",
-                "}",
-                "static fun main() {",
-                "    println(make()(5))",
+                "    fun main() {",
+                "        println(make()(5))",
+                "    }",
                 "}",
             ),
         )
@@ -316,16 +352,18 @@ class TypeCheckingTest {
     fun `a field is visible from every function`() {
         val program = TestSupport.load(
             TestSupport.program(
-                "static val answer: int = 42",
-                "static fun first(): int {",
-                "    return answer",
-                "}",
-                "static fun second(): int {",
-                "    return answer + 1",
-                "}",
-                "static fun main() {",
-                "    println(first())",
-                "    println(second())",
+                "static {",
+                "    val answer: int = 42",
+                "    fun first(): int {",
+                "        return answer",
+                "    }",
+                "    fun second(): int {",
+                "        return answer + 1",
+                "    }",
+                "    fun main() {",
+                "        println(first())",
+                "        println(second())",
+                "    }",
                 "}",
             ),
         )
@@ -339,8 +377,10 @@ class TypeCheckingTest {
         // read the field's default value rather than the value written later in the file.
         messageFor(
             TestSupport.program(
-                "static val first: int = 1",
-                "static val second: int = first + 1",
+                "static {",
+                "    val first: int = 1",
+                "    val second: int = first + 1",
+                "}",
             ),
             "unresolved reference 'first'",
         )
@@ -350,11 +390,13 @@ class TypeCheckingTest {
     fun `a variable is visible only inside its block`() {
         messageFor(
             TestSupport.program(
-                "static fun main() {",
-                "    if (true) {",
-                "        inner: int = 1",
+                "static {",
+                "    fun main() {",
+                "        if (true) {",
+                "            inner: int = 1",
+                "        }",
+                "        println(inner)",
                 "    }",
-                "    println(inner)",
                 "}",
             ),
             "inner",
@@ -365,9 +407,11 @@ class TypeCheckingTest {
     fun `a parameter may be reassigned`() {
         val result = TestSupport.compile(
             TestSupport.program(
-                "static fun bump(value: int): int {",
-                "    value = value + 1",
-                "    return value",
+                "static {",
+                "    fun bump(value: int): int {",
+                "        value = value + 1",
+                "        return value",
+                "    }",
                 "}",
             ),
         )
@@ -385,10 +429,12 @@ class TypeCheckingTest {
         // proof that `string[]` became a genuine array type rather than a name that merely parsed.
         val program = TestSupport.load(
             TestSupport.program(
-                "static fun count(values: int[], names: string[]) {",
-                "}",
-                "static fun main(args: string[]) {",
-                "    println(\"entry point\")",
+                "static {",
+                "    fun count(values: int[], names: string[]) {",
+                "    }",
+                "    fun main(args: string[]) {",
+                "        println(\"entry point\")",
+                "    }",
                 "}",
             ),
         )
@@ -409,8 +455,10 @@ class TypeCheckingTest {
     @Test
     fun `an unresolved name inside a function is reported at that name`() {
         val source = TestSupport.program(
-            "static fun main() {",
-            "    println(unknown)",
+            "static {",
+            "    fun main() {",
+            "        println(unknown)",
+            "    }",
             "}",
         )
         val error = TestSupport.errors(TestSupport.compile(source)).single()
@@ -434,11 +482,13 @@ class TypeCheckingTest {
     fun `a function may be declared before or after its use`() {
         val result = TestSupport.compile(
             TestSupport.program(
-                "static fun main() {",
-                "    println(later())",
-                "}",
-                "static fun later(): int {",
-                "    return 7",
+                "static {",
+                "    fun main() {",
+                "        println(later())",
+                "    }",
+                "    fun later(): int {",
+                "        return 7",
+                "    }",
                 "}",
             ),
         )
@@ -453,8 +503,10 @@ class TypeCheckingTest {
     fun `a capitalized name used as a value is a construction`() {
         val program = TestSupport.load(
             TestSupport.program(
-                "static fun main() {",
-                "    value: CustomException = CustomException()",
+                "static {",
+                "    fun main() {",
+                "        value: CustomException = CustomException()",
+                "    }",
                 "}",
             ),
         )
@@ -469,11 +521,17 @@ class TypeCheckingTest {
 
     @Test
     fun `two errors in one function are both reported`() {
+        // The second problem used to be `other = 1`, which no longer fails: a name nothing declares
+        // is now a declaration whose type is inferred from the value. Writing to a `val` is the
+        // independent mistake that replaces it here.
         val result = TestSupport.compile(
             TestSupport.program(
-                "static fun main() {",
-                "    println(unknown)",
-                "    other = 1",
+                "static {",
+                "    fun main() {",
+                "        println(unknown)",
+                "        val fixed: int = 1",
+                "        fixed = 2",
+                "    }",
                 "}",
             ),
         )
@@ -482,6 +540,289 @@ class TypeCheckingTest {
             TestSupport.errors(result).size,
             "independent problems should both be reported:\n" +
                 TestSupport.errorLocations(result).joinToString("\n"),
+        )
+    }
+
+    // ------------------------------------------------------------------ inferred declarations
+
+    @Test
+    fun `a bare assignment declares a local whose type comes from the value`() {
+        val program = TestSupport.load(
+            TestSupport.file(
+                "class Test {",
+                "    static {",
+                "        fun main() {",
+                "            instance = Instance()",
+                "            println(instance.who())",
+                "        }",
+                "    }",
+                "}",
+                "",
+                "class Instance {",
+                "    fun who(): string {",
+                "        return \"inferred\"",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput {
+            program.invoke("com.github.kusa233.test.Test", "main")
+        }
+        assertEquals("inferred\n", output, "the inferred type must be the value's own type")
+    }
+
+    @Test
+    fun `an inferred local is assignable again afterwards`() {
+        // The whole point of telling a declaration from an assignment: the second `count = ...`
+        // must reach the same variable rather than declare a second one.
+        val program = TestSupport.load(
+            TestSupport.file(
+                "class Test {",
+                "    static {",
+                "        fun main() {",
+                "            count = 1",
+                "            count = count + 41",
+                "            println(count)",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput {
+            program.invoke("com.github.kusa233.test.Test", "main")
+        }
+        assertEquals("42\n", output)
+    }
+
+    @Test
+    fun `an inferred local is mutable`() {
+        // `x = value` is the spelling for writing to a name, so inferring the type must not also
+        // take away the ability to write to it again -- a reader who wants a `val` still says so.
+        val result = TestSupport.compile(
+            TestSupport.program(
+                "static {",
+                "    fun main() {",
+                "        count = 1",
+                "        count = 2",
+                "    }",
+                "}",
+            ),
+        )
+        assertTrue(
+            TestSupport.errors(result).isEmpty(),
+            "unexpected messages: ${TestSupport.messages(result)}",
+        )
+    }
+
+    @Test
+    fun `an inferred local cannot start from itself`() {
+        // The name is registered only after the value is analysed, so a self-reference is reported
+        // rather than quietly declaring a variable initialised from itself.
+        val result = TestSupport.compile(
+            TestSupport.program(
+                "static {",
+                "    fun main() {",
+                "        count = count + 1",
+                "    }",
+                "}",
+            ),
+        )
+        assertTrue(
+            TestSupport.errors(result).any { it.message.contains("unresolved reference 'count'") },
+            "unexpected messages: ${TestSupport.messages(result)}",
+        )
+    }
+
+    @Test
+    fun `an explicit type is still honoured and still checked`() {
+        // Inference is an alternative to writing the type, not a replacement for checking it.
+        val result = TestSupport.compile(
+            TestSupport.program(
+                "static {",
+                "    fun main() {",
+                "        value: string = 1",
+                "    }",
+                "}",
+            ),
+        )
+        assertTrue(
+            TestSupport.errors(result).any { it.message.contains("but its initializer has type int") },
+            "unexpected messages: ${TestSupport.messages(result)}",
+        )
+    }
+
+    @Test
+    fun `an inferred local is visible from an inner block`() {
+        val program = TestSupport.load(
+            TestSupport.file(
+                "class Test {",
+                "    static {",
+                "        fun main() {",
+                "            total = 1",
+                "            if (total == 1) {",
+                "                println(\"seen\")",
+                "            }",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput {
+            program.invoke("com.github.kusa233.test.Test", "main")
+        }
+        assertEquals("seen\n", output)
+    }
+
+    @Test
+    fun `two objects of a plain class can be compared without breaking the class file`() {
+        // The class is *loaded and run* deliberately. Comparing objects once emitted a call to
+        // `String.equals` on whatever the operand happened to be, so this program compiled cleanly
+        // and then failed to load with a VerifyError -- a failure that no assertion on the
+        // diagnostics could have caught.
+        val program = TestSupport.load(
+            TestSupport.file(
+                "class Plain {",
+                "    static {",
+                "        fun make(): Plain {",
+                "            return Plain()",
+                "        }",
+                "",
+                "        fun main() {",
+                "            a = make()",
+                "            b = make()",
+                "            if (a == b) {",
+                "                println(\"same\")",
+                "            } else {",
+                "                println(\"different\")",
+                "            }",
+                "            if (a == a) {",
+                "                println(\"itself\")",
+                "            }",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput {
+            program.invoke("com.github.kusa233.test.Plain", "main")
+        }
+        // A plain class has no derived `equals`, so this is identity -- which is the honest answer
+        // for a class that declares no equality of its own.
+        assertEquals("different\nitself\n", output)
+    }
+
+    // ------------------------------------------------------------- built-in type aliases
+
+    @Test
+    fun `a built-in type may be written with its Java spelling`() {
+        // `Integer` and `int` are one type, not two: a value of one has to be usable as the other,
+        // which is the whole point of the alias. Each is declared with one spelling and read with
+        // the other so that a mismatch could not hide behind a single consistent choice.
+        val program = TestSupport.load(
+            TestSupport.file(
+                "class Test {",
+                "    static {",
+                "        fun main() {",
+                "            count: Integer = 1",
+                "            flag: Boolean = true",
+                "            label: String = \"neko\"",
+                "            sum: int = count + 41",
+                "            println(sum)",
+                "            println(label)",
+                "            if (flag) {",
+                "                println(\"flag\")",
+                "            }",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput {
+            program.invoke("com.github.kusa233.test.Test", "main")
+        }
+        assertEquals("42\nneko\nflag\n", output)
+    }
+
+    @Test
+    fun `a Java spelling works in every position a type may be written`() {
+        // A parameter, a return type and a field, so the alias is not only understood where a local
+        // is declared.
+        val program = TestSupport.load(
+            TestSupport.file(
+                "class Test {",
+                "    static {",
+                "        val limit: Integer = 7",
+                "",
+                "        fun twice(n: Integer): Integer {",
+                "            return n * 2",
+                "        }",
+                "",
+                "        fun main() {",
+                "            println(twice(limit))",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput {
+            program.invoke("com.github.kusa233.test.Test", "main")
+        }
+        assertEquals("14\n", output)
+    }
+
+    @Test
+    fun `a Java spelling is still an array element type`() {
+        val result = TestSupport.compile(
+            TestSupport.program(
+                "static {",
+                "    fun main(values: Integer[]) {",
+                "        first: int = values[0]",
+                "        println(first)",
+                "    }",
+                "}",
+            ),
+        )
+        assertTrue(
+            TestSupport.errors(result).isEmpty(),
+            "unexpected messages: ${TestSupport.messages(result)}",
+        )
+    }
+
+    @Test
+    fun `the alias is the same type, not a convertible one`() {
+        // If the two names were distinct types that merely happened to be compatible, this would be
+        // the place it showed: a `string` and a `String` are one type, so redeclaring is a clash.
+        val result = TestSupport.compile(
+            TestSupport.program(
+                "static {",
+                "    fun main() {",
+                "        value: string = \"a\"",
+                "        value: String = \"b\"",
+                "    }",
+                "}",
+            ),
+        )
+        assertTrue(
+            TestSupport.errors(result).any { it.message.contains("already declared") },
+            "unexpected messages: ${TestSupport.messages(result)}",
+        )
+    }
+
+    @Test
+    fun `an unknown type still names the alternatives`() {
+        val result = TestSupport.compile(
+            TestSupport.program(
+                "static {",
+                "    fun main() {",
+                "        value: strng = 1",
+                "    }",
+                "}",
+            ),
+        )
+        val message = TestSupport.messages(result).single { it.contains("unknown type") }
+        assertTrue(
+            message.contains("Integer") && message.contains("String") && message.contains("Boolean"),
+            "the message should name the Java spellings too, but was: $message",
         )
     }
 }

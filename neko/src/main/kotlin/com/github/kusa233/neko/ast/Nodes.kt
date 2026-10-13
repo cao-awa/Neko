@@ -146,6 +146,8 @@ enum class VariableKind(val display: String) {
  * declare instance fields and its functions may be abstract (no body) or default (a body), while a
  * class may extend exactly one class and implement any number of interfaces. Keeping one node means
  * name resolution, member lookup and code generation handle both without parallel paths.
+ *
+ * A `meow class` is the same node again, for the same reason: see [isMeow].
  */
 class ClassDeclaration(
     val name: String,
@@ -168,6 +170,15 @@ class ClassDeclaration(
     val functions: List<FunctionDeclaration>,
     /** `true` when this was written `interface`, which changes what the class file may declare. */
     val isInterface: Boolean = false,
+    /**
+     * `true` when the declaration was written `meow class`, i.e. its fields were named in its header.
+     *
+     * The header is desugared in the parser — `meow class Point(val x: int)` becomes a field, a
+     * constructor parameter and a `this.x = x` assignment — so nothing downstream needs a second path
+     * for meow fields or constructors. What is left is the one thing Neko cannot express: this class'
+     * `equals` and `hashCode` are derived from its fields and emitted as bytecode.
+     */
+    val isMeow: Boolean = false,
     override val span: Span,
 ) : Node {
     /** Filled in by the analyzer. */
@@ -251,9 +262,11 @@ class FunctionDeclaration(
      * The result types named by a trailing `emit [int, int]` clause, always empty when the clause is
      * absent.
      *
-     * A function with an `emit` clause does not return a value normally: a `raise a, b` statement
-     * inside it transfers control to the caller's `try` extractor instead, carrying one value per
-     * listed type. The clause is written after the body.
+     * A function with an `emit` clause gains a second way out: a `raise a, b` statement inside it
+     * transfers control to the caller's `try` extractor, carrying one value per listed type,
+     * instead of returning normally. The paths that do not raise still return a value of the
+     * declared return type, so the clause says "may raise", not "never returns". The clause is
+     * written after the body.
      */
     val emitTypes: List<TypeReference> = emptyList(),
     /**
@@ -354,7 +367,23 @@ class AssignmentStatement(
     val target: Expression,
     val value: Expression,
     override val span: Span,
-) : Statement
+) : Statement {
+
+    /**
+     * Filled in by the analyzer: the local this statement *declares*, when no name was in scope.
+     *
+     * `instance = Instance()` and `str = "new value"` are spelled identically, and only the scope
+     * tells them apart: a name that is already declared is assigned to, and a name that is not is
+     * declared with its type inferred from the value.
+     *
+     * The parser cannot make that call — a bare name may also be a field declared further down the
+     * same class, which is why the decision is not simply "declared earlier in the body". So the
+     * statement is always parsed as an assignment, and the analyzer records here that it turned out
+     * to be a declaration. That record is what tells the code generator to give the name a fresh
+     * slot, rather than store into the slot of a local that already has one.
+     */
+    var declaredLocal: LocalSymbol? = null
+}
 
 /** A statement whose value is discarded, such as `println(field1)`. */
 class ExpressionStatement(val expression: Expression, override val span: Span) : Statement

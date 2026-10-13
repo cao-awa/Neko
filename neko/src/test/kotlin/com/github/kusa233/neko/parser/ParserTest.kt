@@ -7,6 +7,7 @@ import com.github.kusa233.neko.ast.LambdaExpression
 import com.github.kusa233.neko.ast.ReturnStatement
 import com.github.kusa233.neko.ast.WhenStatement
 import com.github.kusa233.neko.diagnostics.DiagnosticBag
+import com.github.kusa233.neko.diagnostics.Severity
 import com.github.kusa233.neko.source.SourceFile
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -498,5 +499,145 @@ class ParserTest {
         val enclosing = classOf("class Sample {\n    fun method() {\n    }\n}\n")
         val function = enclosing.functions.single()
         assertEquals(2, function.nameSpan.line, "the name span should point at the declaration")
+    }
+
+    // ------------------------------------------------------------- static member blocks
+
+    /** The messages of the errors [parse] reported, in source order. */
+    private fun DiagnosticBag.errorMessages(): List<String> =
+        diagnostics.filter { it.severity == Severity.ERROR }.map { it.message }
+
+    @Test
+    fun `parses a static block into static fields and functions`() {
+        val enclosing = classOf(
+            """
+            class Sample {
+                static {
+                    private val field: int = 1
+
+                    fun method() {
+                    }
+                }
+            }
+            """.trimIndent() + "\n",
+        )
+
+        // A block is a grouping rather than a node of its own, so what reaches the tree is the
+        // members it held -- each already marked static, which is what the rest of the compiler
+        // reads. Nothing downstream has to know a block was written.
+        assertEquals(listOf("field"), enclosing.fields.map { it.name })
+        assertEquals(listOf("method"), enclosing.functions.map { it.name })
+        assertTrue(enclosing.fields.single().isStatic, "a field inside a static block is static")
+        assertTrue(enclosing.functions.single().isStatic, "a function inside a static block is static")
+    }
+
+    @Test
+    fun `a static block does not make the rest of the class static`() {
+        val enclosing = classOf(
+            """
+            class Sample {
+                static {
+                    fun total(): int {
+                        return 0
+                    }
+                }
+
+                fun instance() {
+                }
+            }
+            """.trimIndent() + "\n",
+        )
+
+        assertTrue(
+            enclosing.functions.single { it.name == "total" }.isStatic,
+            "the member inside the block is static",
+        )
+        assertTrue(
+            !enclosing.functions.single { it.name == "instance" }.isStatic,
+            "a member after the block is an instance member",
+        )
+    }
+
+    @Test
+    fun `rejects static written on a single function`() {
+        val (_, diagnostics) = parse("class Sample {\n    static fun method() {\n    }\n}\n")
+
+        // One error about the spelling, and no cascade: the member is still parsed as static, so
+        // nothing downstream has to report a second problem about what it meant.
+        assertEquals(
+            listOf(
+                "a member cannot be marked 'static' on its own; a static member is written inside " +
+                    "a 'static { ... }' block, where every member is static",
+            ),
+            diagnostics.errorMessages(),
+        )
+    }
+
+    @Test
+    fun `rejects static written on a single field`() {
+        val (_, diagnostics) = parse("class Sample {\n    private static val x: int = 1\n}\n")
+        assertEquals(1, diagnostics.errorMessages().size, "expected exactly one error about the spelling")
+    }
+
+    @Test
+    fun `rejects a modifier on the static block itself`() {
+        val (_, diagnostics) = parse(
+            """
+            class Sample {
+                private static {
+                    fun method() {
+                    }
+                }
+            }
+            """.trimIndent() + "\n",
+        )
+
+        // Visibility belongs on the members; a block that carried it would be a second way to say
+        // what each member can already say, and the two could disagree.
+        assertEquals(1, diagnostics.errorMessages().size)
+        assertTrue(
+            diagnostics.errorMessages().single().contains("takes no modifier"),
+            "got: ${diagnostics.errorMessages()}",
+        )
+    }
+
+    @Test
+    fun `rejects a static block inside a static block`() {
+        val (_, diagnostics) = parse(
+            """
+            class Sample {
+                static {
+                    static {
+                        fun method() {
+                        }
+                    }
+                }
+            }
+            """.trimIndent() + "\n",
+        )
+        assertEquals(1, diagnostics.errorMessages().size)
+        assertTrue(
+            diagnostics.errorMessages().single().contains("already inside"),
+            "got: ${diagnostics.errorMessages()}",
+        )
+    }
+
+    @Test
+    fun `rejects a constructor inside a static block`() {
+        val (_, diagnostics) = parse(
+            """
+            class Sample {
+                static {
+                    constructor() {
+                    }
+                }
+            }
+            """.trimIndent() + "\n",
+        )
+        assertEquals(1, diagnostics.errorMessages().size)
+        assertTrue(
+            diagnostics.errorMessages().single().contains("cannot declare a constructor"),
+            "got: ${diagnostics.errorMessages()}",
+        )
     }
 }

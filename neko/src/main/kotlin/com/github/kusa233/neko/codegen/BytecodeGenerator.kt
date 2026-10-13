@@ -20,12 +20,12 @@ import org.objectweb.asm.Opcodes.*
  *
  *  * **A class has static and instance members.** A member written `static` is emitted `static` and
  *    reached by class name; a member written without it belongs to an instance, so it is emitted as
- *    an ordinary instance field or method and reached through an object — `obj.f`, or an implicit
+ *    an ordinary instance field or method and reached through an object —`obj.f`, or an implicit
  *    `this` from inside another instance member of the same class. Instance field initializers run
  *    in `<init>`, static ones in `<clinit>`. `fun main(args: string[])` is a JVM entry point only
  *    when the source declares it `static`, exactly as the source reads.
- *  * **Values.** `int` → `I`, `bool` → `Z`, `string` → `Ljava/lang/String;`, `T[]` → `[<T>`, and a
- *    function type → a generated interface (see below).
+ *  * **Values.** `int` →`I`, `bool` →`Z`, `string` →`Ljava/lang/String;`, `T[]` →`[<T>`, and a
+ *    function type →a generated interface (see below).
  *  * **A function type becomes an interface, and a lambda becomes a class.** For every distinct
  *    function type used, one interface `Neko$Function$n` is emitted with a single method
  *    `invoke`. Each lambda literal becomes a `final` class implementing that interface, with its
@@ -42,7 +42,7 @@ import org.objectweb.asm.Opcodes.*
  *  * **A `try` may be worth a value.** Its two forms differ only in whether the extractor's `invoke`
  *    answers something: the statement form implements `EmitExtractorN` and discards what it finds,
  *    while `r: int = try f() { a -> yield 1 }` implements `EmitExtractorWithResultN`, whose `invoke`
- *    answers the `yield` — boxed, since the interface erases `R` to `Object`. Both forms then fill one
+ *    answers the `yield` —boxed, since the interface erases `R` to `Object`. Both forms then fill one
  *    slot from whichever path ran: the call's own return value when it returned, or `doEmit`'s answer
  *    when it raised.
  *
@@ -103,7 +103,7 @@ class BytecodeGenerator(
      * Static builder methods to emit, grouped by the class that declares them.
      *
      * A `raise` needs a method that boxes its values into an `Object[]`, and that method belongs to
-     * whichever class the `raise` was compiled into — the enclosing Neko class, or a generated
+     * whichever class the `raise` was compiled into —the enclosing Neko class, or a generated
      * extractor class when the `raise` appears inside an extractor body. Registration is keyed by
      * owner so each writer gets exactly the builders it must declare, drained just before that
      * writer is finished.
@@ -134,7 +134,7 @@ class BytecodeGenerator(
      * The internal name of a standard library class, looked up in the program.
      *
      * The library is written in Neko and compiled alongside the program, so `EarlyEmitException`
-     * is a class this very run will emit — its internal name comes from the declaration rather than
+     * is a class this very run will emit —its internal name comes from the declaration rather than
      * from an assumption about the package. The fallback keeps code generation working when the
      * library is absent, so the reader sees the analyzer's "the library is missing" diagnostic
      * rather than a crash here.
@@ -154,8 +154,8 @@ class BytecodeGenerator(
     /**
      * The `EmitExtractorWithResultN` interface for [arity], used when the extractor writes `yield`.
      *
-     * The two families differ only in what `invoke` answers — nothing, or the value the `try`
-     * produces — so which one a `try` implements is decided by whether its body yields.
+     * The two families differ only in what `invoke` answers —nothing, or the value the `try`
+     * produces —so which one a `try` implements is decided by whether its body yields.
      */
     private fun emitExtractorWithResultInterface(arity: Int): String =
         standardLibraryClass("$EMIT_EXTRACTOR_WITH_RESULT_PREFIX$arity")
@@ -171,7 +171,7 @@ class BytecodeGenerator(
      * A class nothing extends is emitted `final`, which is the accurate access flag and lets the JVM
      * optimize calls into it. A class that *is* extended must not be: `final` on a superclass is an
      * `IncompatibleClassChangeError` the moment the subclass is loaded, and it is not something the
-     * source can be blamed for — the program never said `final`.
+     * source can be blamed for —the program never said `final`.
      */
     private fun isExtended(symbol: ClassSymbol): Boolean =
         classes.values.any { it.superclassSymbol === symbol }
@@ -189,7 +189,7 @@ class BytecodeGenerator(
 
         val writer = NekoClassWriter(ClassWriter.COMPUTE_FRAMES or ClassWriter.COMPUTE_MAXS)
 
-        // An interface is `abstract interface`, never `final`, and extends `Object` implicitly — it
+        // An interface is `abstract interface`, never `final`, and extends `Object` implicitly —it
         // must not name a superclass. A class is `super`, and extends whatever the source named,
         // defaulting to `Object`. It is `final` only when nothing extends it, because the JVM
         // refuses to load a subclass of a final class.
@@ -242,7 +242,7 @@ class BytecodeGenerator(
         emitStaticInitializer(writer, staticFields, symbol)
         // Every class gets a constructor, because an instance member is only reachable through an
         // object, and this is where that object's own field initializers run. An interface is never
-        // instantiated, so it gets none — the JVM rejects one that has a constructor.
+        // instantiated, so it gets none —the JVM rejects one that has a constructor.
         if (!declaration.isInterface) {
             emitConstructors(writer, declaration, instanceFields, symbol)
         }
@@ -251,6 +251,14 @@ class BytecodeGenerator(
             val functionSymbol = function.symbol ?: continue
             emitFunction(writer, function, functionSymbol, internalName)
         }
+
+        // A `meow class` derives `equals` and `hashCode` from its fields. They are emitted as raw
+        // bytecode rather than lowered from a Neko body because the language cannot express either
+        // one: `equals` has to compare a value whose class it only learns at run time, and it has no
+        // body to write that in.
+        if (declaration.isMeow) emitDerivedObjectMethods(writer, declaration, symbol)
+
+        emitMainBridge(writer, declaration, symbol)
 
         // A `raise` needs a builder in whichever class it was compiled into, so any that this class
         // owns are written now, while the writer is still open.
@@ -378,6 +386,196 @@ class BytecodeGenerator(
         return visibility
     }
 
+    // ------------------------------------------------- a meow class' derived methods
+
+    /**
+     * The `equals` and `hashCode` a `meow class` gets from its fields.
+     *
+     * Both are JDK 8 APIs —[java.lang.Object]'s own `equals`/`hashCode`, `getClass`, and
+     * `java.util.Objects` —which is what `V1_8` program classes are written against.
+     *
+     * A body the author wrote wins: the analyzer left the class' own `equals`/`hashCode` in
+     * [ClassSymbol.functions], so emitting a derived one beside it would produce a duplicate method
+     * and the JVM would reject the class file.
+     */
+    private fun emitDerivedObjectMethods(
+        writer: ClassWriter,
+        declaration: ClassDeclaration,
+        symbol: ClassSymbol,
+    ) {
+        if (!declaresOwnMethod(symbol, "equals", listOf(ObjectType))) {
+            emitDerivedEquals(writer, symbol)
+        }
+        if (!declaresOwnMethod(symbol, "hashCode", emptyList())) {
+            emitDerivedHashCode(writer, symbol)
+        }
+    }
+
+    /**
+     * Whether the *author* declared [name] with exactly [parameterTypes] on this class.
+     *
+     * `declaration != null` is what makes this the author's method rather than the analyzer's own
+     * record of a derived one: the derived `equals`/`hashCode` are registered as functions too, so
+     * that Neko source can call them, and a test that did not tell the two apart would find every
+     * derived method already "declared" and emit nothing at all.
+     *
+     * Only the class' *own* functions are consulted: an inherited `equals` is overridden here by the
+     * fields of this class, which is what writing `meow` asks for.
+     */
+    private fun declaresOwnMethod(symbol: ClassSymbol, name: String, parameterTypes: List<NekoType>): Boolean =
+        symbol.functions[name].orEmpty().any {
+            it.declaration != null && it.parameterTypes == parameterTypes
+        }
+
+    /**
+     * `public boolean equals(java.lang.Object other)`, comparing every field.
+     *
+     * The three tests before the fields are the same ones every hand-written `equals` starts with,
+     * and each has to be there for a reason:
+     *
+     *  * `this == other` answers `true` without reading a field. That is what makes `x == x` true
+     *    even for a class whose fields do not satisfy `equals` themselves, and it is what makes the
+     *    comparison safe when `other` is the very object being asked.
+     *  * `other == null` answers `false`. `equals(null)` is a legal call, and it is the one argument
+     *    for which the receiver's own fields cannot be compared with anything.
+     *  * `other.getClass() != this.getClass()` answers `false`. The parameter's static type is
+     *    `Object`, so `other` may be any object at all; comparing field for field would need the
+     *    cast first, and a cast from an unrelated class would throw. Requiring the *exact* class also
+     *    makes `equals` symmetric between a class and a subclass, which is the property the contract
+     *    actually demands.
+     *
+     * Only then is `other` cast, which the class test has made safe, and the fields compared: two
+     * `int`/`bool` fields with `IF_ICMPEQ`, and two references with `java.util.Objects.equals`, which
+     * is the null-safe comparison a field holding `null` needs —Neko has no null test to write it
+     * with.
+     */
+    private fun emitDerivedEquals(writer: ClassWriter, symbol: ClassSymbol) {
+        val internalName = symbol.jvmInternalName
+        val fields = instanceFieldsOf(symbol)
+        val mv = writer.visitMethod(ACC_PUBLIC, "equals", "(Ljava/lang/Object;)Z", null, null)
+        mv.visitCode()
+
+        // Named for the test each one follows, so a reader can see the chain of reasons: same
+        // reference, then non-null, then the same class, then the fields.
+        val otherIsNotNull = Label()
+        val sameClass = Label()
+        val cast = Label()
+        val notEqual = Label()
+
+        // `this == other`: the two references, compared as references.
+        mv.visitVarInsn(ALOAD, 0)
+        mv.visitVarInsn(ALOAD, 1)
+        mv.visitJumpInsn(IF_ACMPNE, otherIsNotNull)
+        mv.visitInsn(ICONST_1)
+        mv.visitInsn(IRETURN)
+
+        // `other == null`.
+        mv.visitLabel(otherIsNotNull)
+        mv.visitVarInsn(ALOAD, 1)
+        mv.visitJumpInsn(IFNONNULL, sameClass)
+        mv.visitInsn(ICONST_0)
+        mv.visitInsn(IRETURN)
+
+        // The classes have to match exactly; `getClass` is final, so this compares the two classes
+        // rather than whatever `getClass` a subclass might have written.
+        mv.visitLabel(sameClass)
+        mv.visitVarInsn(ALOAD, 0)
+        mv.visitMethodInsn(INVOKEVIRTUAL, "java/lang/Object", "getClass", "()Ljava/lang/Class;", false)
+        mv.visitVarInsn(ALOAD, 1)
+        mv.visitMethodInsn(INVOKEVIRTUAL, "java/lang/Object", "getClass", "()Ljava/lang/Class;", false)
+        mv.visitJumpInsn(IF_ACMPEQ, cast)
+        mv.visitInsn(ICONST_0)
+        mv.visitInsn(IRETURN)
+
+        // `((Cls) other).field == field` for each field, jumping out of the whole method as soon as
+        // one pair differs.
+        mv.visitLabel(cast)
+        mv.visitVarInsn(ALOAD, 1)
+        mv.visitTypeInsn(CHECKCAST, internalName)
+        mv.visitVarInsn(ASTORE, 2)
+
+        for (field in fields) {
+            mv.visitVarInsn(ALOAD, 0)
+            mv.visitFieldInsn(GETFIELD, internalName, field.name, descriptorOf(field.type))
+            mv.visitVarInsn(ALOAD, 2)
+            mv.visitFieldInsn(GETFIELD, internalName, field.name, descriptorOf(field.type))
+            if (field.type == IntType || field.type == BoolType) {
+                mv.visitJumpInsn(IF_ICMPNE, notEqual)
+            } else {
+                mv.visitMethodInsn(
+                    INVOKESTATIC,
+                    "java/util/Objects",
+                    "equals",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+                    false,
+                )
+                mv.visitJumpInsn(IFEQ, notEqual)
+            }
+        }
+
+        mv.visitInsn(ICONST_1)
+        mv.visitInsn(IRETURN)
+
+        mv.visitLabel(notEqual)
+        mv.visitInsn(ICONST_0)
+        mv.visitInsn(IRETURN)
+
+        mv.visitMaxs(0, 0)
+        mv.visitEnd()
+    }
+
+    /**
+     * `public int hashCode()`, folding every field into one number.
+     *
+     * `result = 31 * result + hash` is the shape Java's own generated hash codes use, and 31 is
+     * chosen for the same reason it is there: it is an odd prime, so the fields are spread across the
+     * `int` range rather than clustering, and `31 * x` is a shift and a subtract on any JVM.
+     *
+     * A field's own hash is the field for `int`/`bool` and `java.util.Objects.hashCode` otherwise —
+     * the same split `equals` makes, which is what keeps the two consistent: instances that compare
+     * equal fold equal field values and so produce equal numbers.
+     *
+     * This is deliberately *not* `java.util.Objects.hash(...)`, which takes the fields as an `Object`
+     * array: boxing every `int` field to hand it over would make a derived hash code allocate.
+     */
+    private fun emitDerivedHashCode(writer: ClassWriter, symbol: ClassSymbol) {
+        val internalName = symbol.jvmInternalName
+        val mv = writer.visitMethod(ACC_PUBLIC, "hashCode", "()I", null, null)
+        mv.visitCode()
+
+        mv.visitInsn(ICONST_1)
+        mv.visitVarInsn(ISTORE, 1)
+
+        for (field in instanceFieldsOf(symbol)) {
+            mv.visitIntInsn(BIPUSH, 31)
+            mv.visitVarInsn(ILOAD, 1)
+            mv.visitInsn(IMUL)
+            mv.visitVarInsn(ALOAD, 0)
+            mv.visitFieldInsn(GETFIELD, internalName, field.name, descriptorOf(field.type))
+            if (field.type != IntType && field.type != BoolType) {
+                mv.visitMethodInsn(
+                    INVOKESTATIC,
+                    "java/util/Objects",
+                    "hashCode",
+                    "(Ljava/lang/Object;)I",
+                    false,
+                )
+            }
+            mv.visitInsn(IADD)
+            mv.visitVarInsn(ISTORE, 1)
+        }
+
+        mv.visitVarInsn(ILOAD, 1)
+        mv.visitInsn(IRETURN)
+
+        mv.visitMaxs(0, 0)
+        mv.visitEnd()
+    }
+
+    /** The declared instance fields of [symbol], in declaration order, skipping any unanalyzed one. */
+    private fun instanceFieldsOf(symbol: ClassSymbol): List<FieldSymbol> =
+        symbol.fields.values.filterNot { it.isStatic }
+
     /** `<init>`'s middle step: every non-static field's initializer, in declaration order. */
     private fun emitFieldInitializers(
         mv: MethodVisitor,
@@ -409,6 +607,57 @@ class BytecodeGenerator(
 
     // --------------------------------------------------------------- a method
 
+    /**
+     * `public static void main(String[])`, for a program whose `main` takes no arguments.
+     *
+     * The JVM launches a class by looking for exactly `main(String[])`, so a program that writes
+     * `fun main()` —the common case, since the arguments are rarely read and this language has no
+     * array literal to build them with —would otherwise compile and then have no entry point at
+     * all. Rather than insist on a parameter nobody uses, a bridge is emitted that calls the
+     * declared function.
+     *
+     * The bridge is only for a `static`, argument-less, value-less `main`, which is the shape that
+     * means "start here". A non-static `main` is an ordinary instance member and cannot be an entry
+     * point, and one that returns a value is not the shape the launcher calls. A `main` that already
+     * takes `string[]` is the entry point itself and needs no bridge —emitting one would collide
+     * with it.
+     */
+    private fun emitMainBridge(
+        writer: ClassWriter,
+        declaration: ClassDeclaration,
+        symbol: ClassSymbol,
+    ) {
+        if (declaration.isInterface) return
+
+        val alreadyAnEntryPoint = declaration.functions.any { function ->
+            function.name == "main" &&
+                function.parameters.size == 1 &&
+                function.symbol?.isStatic == true
+        }
+        if (alreadyAnEntryPoint) return
+
+        val bridged = declaration.functions.firstOrNull { function ->
+            val functionSymbol = function.symbol ?: return@firstOrNull false
+            function.name == "main" &&
+                function.parameters.isEmpty() &&
+                functionSymbol.isStatic &&
+                functionSymbol.returnType == VoidType
+        } ?: return
+
+        val mv = writer.visitMethod(
+            ACC_PUBLIC or ACC_STATIC,
+            "main",
+            "([Ljava/lang/String;)V",
+            null,
+            null,
+        )
+        mv.visitCode()
+        mv.visitMethodInsn(INVOKESTATIC, symbol.jvmInternalName, "main", "()V", false)
+        mv.visitInsn(RETURN)
+        mv.visitMaxs(0, 0)
+        mv.visitEnd()
+    }
+
     private fun emitFunction(
         writer: ClassWriter,
         function: FunctionDeclaration,
@@ -422,7 +671,7 @@ class BytecodeGenerator(
         var access = ACC_PUBLIC or if (symbol.isStatic) ACC_STATIC else 0
         if (function.isPrivate) access = (access and ACC_PUBLIC.inv()) or ACC_PRIVATE
 
-        // An abstract function — one written in an interface with no body — is declared and never
+        // An abstract function —one written in an interface with no body —is declared and never
         // emitted, because there is nothing to emit after the signature.
         if (function.isAbstract) {
             access = access or ACC_ABSTRACT
@@ -431,7 +680,7 @@ class BytecodeGenerator(
         }
 
         // A function that declares `emit` also declares that it may `raise`, and a `raise` is
-        // lowered to throwing `EarlyEmitException` — so that exception is what the class file's
+        // lowered to throwing `EarlyEmitException` —so that exception is what the class file's
         // `Exceptions` attribute records. A body in an interface is a default method, which the JVM
         // permits from Java 8 on.
         val declaredExceptions = if (symbol.canRaise) {
@@ -550,7 +799,15 @@ class BytecodeGenerator(
 
         when (symbol) {
             is LocalSymbol -> {
-                val slot = scope.slotOf(symbol)
+                // A statement that introduces the name -- `instance = Instance()`, where nothing was
+                // in scope before -- needs a slot of its own. One that writes to a local which
+                // already exists stores into the slot that local already has, which is what makes a
+                // second assignment to the same name reach the same variable.
+                val slot = if (statement.declaredLocal === symbol) {
+                    scope.allocate(symbol)
+                } else {
+                    scope.slotOf(symbol)
+                }
                 if (slot != null) {
                     scope.mv.visitVarInsn(storeOpcode(symbol.type), slot)
                 } else {
@@ -595,8 +852,8 @@ class BytecodeGenerator(
     }
 
     /**
-     * `yield x + y` produces the value of the construct it appears in — the lambda's, or the `try`
-     * expression's whose extractor it is written in — i.e. it returns from the generated `invoke`.
+     * `yield x + y` produces the value of the construct it appears in —the lambda's, or the `try`
+     * expression's whose extractor it is written in —i.e. it returns from the generated `invoke`.
      *
      * An extractor's `invoke` answers the interface's erased `R`, which is `Object`, so the value is
      * boxed on the way out; a lambda's answers its own return type and needs no boxing.
@@ -694,22 +951,22 @@ class BytecodeGenerator(
     }
 
     /**
-     * `try { ... } catch (e: T) { ... } finally { ... }` — lowered to the JVM's exception table.
+     * `try { ... } catch (e: T) { ... } finally { ... }` —lowered to the JVM's exception table.
      *
      * The layout is the one `javac` produces for the same source, and the two protected ranges are
      * what make it correct:
      *
      * ```
-     *   start:         body                 │ explicit `catch` ranges
+     *   start:         body                 │explicit `catch` ranges
      *   endBody:       handler_i:  astore e; catchBody
-     *   endAll:                              │ catch-all range, so an exception thrown *inside* a
+     *   endAll:                              │catch-all range, so an exception thrown *inside* a
      *   finallyNormal: finallyBody; goto after   catch body still reaches the `finally`
      *   catchAll:      astore pending; finallyBody; aload pending; athrow
      *   after:
      * ```
      *
-     * The explicit entries are added first and cover only the body, so the JVM — which tests the
-     * table in order — matches them exactly as the source reads, and never re-enters a handler that
+     * The explicit entries are added first and cover only the body, so the JVM —which tests the
+     * table in order —matches them exactly as the source reads, and never re-enters a handler that
      * threw. The `finally` body is emitted once per path out of the region, which is the duplication
      * `javac` performs and what makes it run on normal completion, on a caught exception and on an
      * uncaught one alike.
@@ -777,7 +1034,7 @@ class BytecodeGenerator(
         for (statement in block.statements) emitStatement(statement, scope)
     }
 
-    /** `array[index]` — an `*aload` after the array and the index are on the stack. */
+    /** `array[index]` —an `*aload` after the array and the index are on the stack. */
     private fun emitIndex(expression: IndexExpression, scope: MethodScope) {
         val mv = scope.mv
         emitExpression(expression.array, scope)
@@ -786,7 +1043,7 @@ class BytecodeGenerator(
         mv.visitInsn(arrayLoadOpcode(element ?: ErrorType))
     }
 
-    /** `array[index] = value` — an `*astore` with array, index and value in that order. */
+    /** `array[index] = value` —an `*astore` with array, index and value in that order. */
     private fun emitIndexAssignment(statement: IndexAssignmentStatement, scope: MethodScope) {
         val mv = scope.mv
         emitExpression(statement.array, scope)
@@ -801,7 +1058,7 @@ class BytecodeGenerator(
      * caller's extractor.
      *
      * The lowering is the one the sample spells out: the values are boxed into an `Object[]` by a
-     * generated static builder — `test$emit$0()` in the sample — then wrapped in the standard
+     * generated static builder —`test$emit$0()` in the sample —then wrapped in the standard
      * library's `EarlyEmitException` and thrown. Boxing is what lets one carrier type serve any
      * number of raised values, and throwing is what lets the caller's `try` catch the hand-off
      * without the callee returning.
@@ -809,7 +1066,7 @@ class BytecodeGenerator(
     private fun emitRaise(statement: RaiseStatement, scope: MethodScope) {
         val mv = scope.mv
 
-        // The values are boxed by a generated static builder — the sample's `test$emit$0()` — rather
+        // The values are boxed by a generated static builder —the sample's `test$emit$0()` —rather
         // than assembled here, because each value has its own descriptor and the array must hold all
         // of them. The builder is emitted once its owner's writer is complete.
         val builder = registerBuilder(statement, scope.owner, scope.builderPrefix)
@@ -849,7 +1106,7 @@ class BytecodeGenerator(
      * Emits the static builder a `raise` needs: it boxes the values into an `Object[]` and returns
      * it.
      *
-     * This exists because the values have different descriptors — one `int`, one `String` — so no
+     * This exists because the values have different descriptors —one `int`, one `String` —so no
      * single constructor call could assemble the array. The method is `private static` and named
      * after its function, matching the sample's `test$emit$0()`.
      */
@@ -886,7 +1143,7 @@ class BytecodeGenerator(
     }
 
     /**
-     * `try test(10) { emit1, emit2 -> ... }` — calls the function and runs the extractor if it
+     * `try test(10) { emit1, emit2 -> ... }` —calls the function and runs the extractor if it
      * raises, discarding whatever the extractor produced.
      *
      * The lowering is a `try`/`catch` around the call, exactly as the sample describes: the call sits
@@ -898,10 +1155,10 @@ class BytecodeGenerator(
     }
 
     /**
-     * `r: int = try f() { a -> yield 1 }` — the same catching construct, but worth a value.
+     * `r: int = try f() { a -> yield 1 }` —the same catching construct, but worth a value.
      *
      * Both paths meet at one slot: the call's own return value when it returns, and `doEmit`'s answer
-     * — the value the extractor's `yield` produced — when it `raise`s instead. Which is why the
+     * —the value the extractor's `yield` produced —when it `raise`s instead. Which is why the
      * extractor has to yield for this form to mean anything: without one, `doEmit` could only answer
      * `null`, and the reader would silently get nothing. The analyzer requires the yield; here the
      * slot is simply filled from whichever path was taken and unboxed into the `try`'s type.
@@ -925,8 +1182,8 @@ class BytecodeGenerator(
     /**
      * The `try`/`catch` both forms share.
      *
-     * [resultSlot] is the local that collects the construct's value — the call's return value on the
-     * normal path, `doEmit`'s answer on the `raise` path — or `null` when the value is discarded.
+     * [resultSlot] is the local that collects the construct's value —the call's return value on the
+     * normal path, `doEmit`'s answer on the `raise` path —or `null` when the value is discarded.
      */
     private fun emitExtractorTry(construct: ExtractorTry, scope: MethodScope, resultSlot: Int?) {
         val mv = scope.mv
@@ -981,7 +1238,7 @@ class BytecodeGenerator(
      * Pushes a fresh instance of the extractor literal's class.
      *
      * Like a lambda, the literal becomes a `final` class implementing the standard library's
-     * `EmitExtractorN` for its arity — or `EmitExtractorWithResultN` when the body yields — with
+     * `EmitExtractorN` for its arity —or `EmitExtractorWithResultN` when the body yields —with
      * whatever it reads from the enclosing scope copied in through the constructor.
      */
     private fun emitExtractorInstance(construct: ExtractorTry, scope: MethodScope) {
@@ -1019,8 +1276,8 @@ class BytecodeGenerator(
      * Which family the class implements is decided here, by whether the body yields: a body that
      * produces a value implements `EmitExtractorWithResultN`, whose `invoke` answers it, and one that
      * does not implements `EmitExtractorN`, whose `invoke` answers nothing. Either way the standard
-     * library supplies `extract(Object[])` as a default method — it unpacks the array and calls
-     * `invoke` — so only `invoke` is generated here. Since the interface erases its type parameters
+     * library supplies `extract(Object[])` as a default method —it unpacks the array and calls
+     * `invoke` —so only `invoke` is generated here. Since the interface erases its type parameters
      * to `Object`, `invoke` receives `Object`s and unboxes each into the typed local the body reads.
      */
     private fun emitExtractorClass(
@@ -1078,7 +1335,7 @@ class BytecodeGenerator(
         val mv = writer.visitMethod(
             ACC_PUBLIC,
             "invoke",
-            // The interface erases its type parameters, so every value arrives as an `Object` — and a
+            // The interface erases its type parameters, so every value arrives as an `Object` —and a
             // yielding one answers an `Object` too.
             "(" + "Ljava/lang/Object;".repeat(arity) + ")" +
                 if (yields) "Ljava/lang/Object;" else "V",
@@ -1190,7 +1447,7 @@ class BytecodeGenerator(
     }
 
     /**
-     * `obj.field` — reads a field through its receiver, or reads a `static` field by class name.
+     * `obj.field` —reads a field through its receiver, or reads a `static` field by class name.
      *
      * An instance field is read with `getfield`, so the receiver must be on the stack first; a static
      * one is read with `getstatic` and the receiver is evaluated only for its side effects.
@@ -1208,7 +1465,7 @@ class BytecodeGenerator(
         }
 
         if (field.isStatic) {
-            // The receiver of a static field — the class name — is not a value, so nothing is pushed
+            // The receiver of a static field —the class name —is not a value, so nothing is pushed
             // for it; `getstatic` alone is the whole read.
             mv.visitFieldInsn(
                 GETSTATIC,
@@ -1326,7 +1583,18 @@ class BytecodeGenerator(
         }
     }
 
-    /** `==` on primitives is a numeric compare; on strings it is [String.equals], as in Kotlin. */
+    /**
+     * `==` on primitives is a numeric compare; on everything else it is `equals`, dispatched
+     * virtually on the left operand.
+     *
+     * The owner is `java/lang/Object` rather than the operand's own class. `invokevirtual` picks the
+     * method from the receiver's run-time class, so naming the top of the hierarchy is enough and is
+     * always verifiable: the receiver is by definition assignable to `Object`. Naming a narrower
+     * owner is not — a `String` receiver was assumed for every reference type here once, which made
+     * `a == b` on two plain objects emit a call to `String.equals` on a `Plain`, and the class failed
+     * to load with a `VerifyError` instead of comparing anything. Strings still reach
+     * `String.equals` through this call; they simply are not the only thing that can.
+     */
     private fun emitEquality(expression: BinaryExpression, scope: MethodScope) {
         val mv = scope.mv
         val operandType = expression.left.type
@@ -1337,13 +1605,20 @@ class BytecodeGenerator(
             return
         }
 
+        // A `meow class` compares through the `equals` derived from its fields. This dispatch is
+        // essential rather than convenient: Neko has no `is` operator and no cast, so without it
+        // `a == b` would fall through to the call below and the generated method would be
+        // unreachable from any program.
+        val meowClass = meowClassOf(operandType)
+        val owner = meowClass?.jvmInternalName ?: "java/lang/Object"
         mv.visitMethodInsn(
             INVOKEVIRTUAL,
-            "java/lang/String",
+            owner,
             "equals",
             "(Ljava/lang/Object;)Z",
             false,
         )
+
         if (!wantsEqual) {
             val trueLabel = Label()
             val endLabel = Label()
@@ -1355,6 +1630,21 @@ class BytecodeGenerator(
             mv.visitLabel(endLabel)
         }
     }
+
+    /**
+     * The symbol [type] names when it is a `meow class`, or `null` for everything else.
+     *
+     * The test is on the class *symbol* rather than on the name: a class that merely happens to be
+     * called `Point` has whatever `equals` its author wrote, and dispatching `==` to a derived one
+     * would call a method that class file does not have.
+     *
+     * A meow class held as an `Object` — the one type through which the JVM erases a type parameter —
+     * is not recognised here and falls back to `String.equals`. That is unreachable from Neko: a
+     * value's type is what its expression resolved to, and nothing in the language can name a class
+     * it declares as an `Object`.
+     */
+    private fun meowClassOf(type: NekoType): ClassSymbol? =
+        ((type as? ClassType)?.let { classes[it.simpleName] })?.takeIf { it.isMeow }
 
     /** Emits `a op b` for the two int operands already on the stack, leaving a boolean. */
     private fun emitComparison(scope: MethodScope, opcode: Int) {
@@ -1438,11 +1728,11 @@ class BytecodeGenerator(
      *
      * Four cases, matching the analyzer's resolution:
      *
-     *  1. a construction, e.g. `CustomException()` → `new` plus `<init>`;
-     *  2. a member call, e.g. `obj.f(1)` → `invokevirtual` with the receiver first, or
-     *     `Cls.f(1)` → `invokestatic`;
-     *  3. a named function → `invokestatic` (a built-in such as `println` first loads its receiver);
-     *  4. a function *value*, e.g. the second call in `lambda()(1, 2)` → `invokeinterface`.
+     *  1. a construction, e.g. `CustomException()` →`new` plus `<init>`;
+     *  2. a member call, e.g. `obj.f(1)` →`invokevirtual` with the receiver first, or
+     *     `Cls.f(1)` →`invokestatic`;
+     *  3. a named function →`invokestatic` (a built-in such as `println` first loads its receiver);
+     *  4. a function *value*, e.g. the second call in `lambda()(1, 2)` →`invokeinterface`.
      */
     private fun emitCall(expression: CallExpression, scope: MethodScope) {
         val mv = scope.mv
@@ -1518,8 +1808,8 @@ class BytecodeGenerator(
      *
      * The descriptor is the one the resolved constructor declared, not the one the argument types
      * happen to imply: a constructor parameter declared `Object` accepts an `int` argument, which
-     * has to be boxed on the way in. A class with no declared constructor — one from outside the
-     * program, say — falls back to the arguments' own types, which is what the JVM will require.
+     * has to be boxed on the way in. A class with no declared constructor —one from outside the
+     * program, say —falls back to the arguments' own types, which is what the JVM will require.
      */
     private fun emitConstruction(
         expression: CallExpression,
@@ -1555,7 +1845,7 @@ class BytecodeGenerator(
      * Converts the value on the stack from [from] to [to].
      *
      * Two conversions are possible in Neko: boxing a primitive into the `Object` a type parameter
-     * erased to, and boxing it for an `Object` parameter. The reverse — unboxing — is the extractor's
+     * erased to, and boxing it for an `Object` parameter. The reverse —unboxing —is the extractor's
      * job at run time, because only then is the concrete type known.
      */
     private fun emitCoerce(from: NekoType, to: NekoType?, scope: MethodScope) {
@@ -2002,7 +2292,7 @@ class BytecodeGenerator(
             is MemberAccessExpression -> collectLocalReferences(node.receiver, into)
 
             // A `try` extractor becomes a class of its own, emitted inside whichever method it
-            // appears in — so if that method is a lambda, whatever the extractor reads from the
+            // appears in —so if that method is a lambda, whatever the extractor reads from the
             // enclosing scope has to be forwarded by the lambda first, exactly as a nested lambda's
             // reads are. Its own parameters are locals of the generated `invoke`; they are never
             // allocated in this scope, so the caller's filter drops them.
@@ -2040,7 +2330,7 @@ class BytecodeGenerator(
          * `true` when this method is the `invoke` of a value-returning `try` extractor.
          *
          * A `yield` in such a body produces that `invoke`'s value, i.e. it returns a *boxed* `Object`
-         * rather than a value of the enclosing language's type — the interface erases its `R` to
+         * rather than a value of the enclosing language's type —the interface erases its `R` to
          * `Object`, so the `int` a `yield` names has to be boxed on the way out.
          */
         val extractorResult: Boolean = false,

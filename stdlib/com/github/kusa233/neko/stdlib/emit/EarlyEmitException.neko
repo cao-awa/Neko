@@ -3,9 +3,11 @@ locate com.github.kusa233.neko.stdlib.emit
 /**
  * The standard library's exception, written in Neko.
  *
- * A function that declares an `emit` clause does not return: a `raise` boxes its values into an
- * `Object[]`, wraps them in this exception, and throws it. The `try` that called the function
- * catches this and calls [doEmit], which hands the array to the caller's extractor.
+ * A function that declares an `emit` clause may leave through `raise` instead of returning: a
+ * `raise` boxes its values into an `Object[]`, wraps them in this exception, and throws it. The
+ * paths that do not raise return normally, which is why the clause is about a second way out rather
+ * than about the absence of an ordinary return. The `try` that called the function catches this and
+ * calls [doEmit], which hands the array to the caller's extractor.
  *
  * [doEmit] answers whatever the extractor answered, which is how a `try` *expression* gets its
  * value: `r: int = try f() { a -> yield 1 }` compiles to a `try`/`catch` whose handler stores

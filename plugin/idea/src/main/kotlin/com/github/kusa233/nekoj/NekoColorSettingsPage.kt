@@ -53,28 +53,30 @@ private val DEMO_TEXT: String = """
     locate com.github.kusa233.neko.sample
 
     class Sample {
-        private static val field1: int = 123
+        static {
+            private val field1: int = 123
 
-        static fun main(args: string[]) {
-            // A line comment
-            /* and a
-               block comment */
-            variable()
-            lambda: int = lambda()(1, 2)
-            if (field1 > 100) {
-                println("large")
+            fun main(args: string[]) {
+                // A line comment
+                /* and a
+                   block comment */
+                variable()
+                lambda: int = lambda()(1, 2)
+                if (field1 > 100) {
+                    println("large")
+                }
             }
-        }
 
-        static fun variable() {
-            str: string = "Hell world!"
-            str = "new value"
-            println(str)
-        }
+            fun variable() {
+                str: string = "Hell world!"
+                str = "new value"
+                println(str)
+            }
 
-        static fun lambda(): [int, int] -> int {
-            return { x, y ->
-                yield x + y
+            fun lambda(): [int, int] -> int {
+                return { x, y ->
+                    yield x + y
+                }
             }
         }
     }

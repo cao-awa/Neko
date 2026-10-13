@@ -157,11 +157,13 @@ class NekoPluginTest : BasePlatformTestCase() {
             "Sample.neko",
             """
             class Sample {
-                private static val field1: int = 123
+                static {
+                    private val field1: int = 123
 
-                static fun main(args: string[]) {
-                    // a comment
-                    println(field1)
+                    fun main(args: string[]) {
+                        // a comment
+                        println(field1)
+                    }
                 }
             }
             """.trimIndent(),
@@ -205,9 +207,11 @@ class NekoPluginTest : BasePlatformTestCase() {
             "Sample.neko",
             """
             class Sample {
-                static fun main(args: string[]) {
-                    str: string = "Hell world!"
-                    str: string = "new value"
+                static {
+                    fun main(args: string[]) {
+                        str: string = "Hell world!"
+                        str: string = "new value"
+                    }
                 }
             }
             """.trimIndent(),
@@ -225,10 +229,12 @@ class NekoPluginTest : BasePlatformTestCase() {
             "Sample.neko",
             """
             class Sample {
-                private static val field1: int = 123
+                static {
+                    private val field1: int = 123
 
-                static fun main(args: string[]) {
-                    println(field1)
+                    fun main(args: string[]) {
+                        println(field1)
+                    }
                 }
             }
             """.trimIndent(),
@@ -253,8 +259,10 @@ class NekoPluginTest : BasePlatformTestCase() {
             "Sample.neko",
             """
             class Sample {
-                static fun main(args: string[]) {
-                    print("hi")
+                static {
+                    fun main(args: string[]) {
+                        print("hi")
+                    }
                 }
             }
             """.trimIndent(),
@@ -275,8 +283,10 @@ class NekoPluginTest : BasePlatformTestCase() {
             "Sample.neko",
             """
             class Sample {
-                static fun main(args: string[]) {
-                    print("hi")
+                static {
+                    fun main(args: string[]) {
+                        print("hi")
+                    }
                 }
             }
             """.trimIndent(),
@@ -298,8 +308,10 @@ class NekoPluginTest : BasePlatformTestCase() {
             "Sample.neko",
             """
             class Sample {
-                static fun main(args: string[]) {
-                    p<caret>
+                static {
+                    fun main(args: string[]) {
+                        p<caret>
+                    }
                 }
             }
             """.trimIndent(),
@@ -320,16 +332,22 @@ class NekoPluginTest : BasePlatformTestCase() {
             "Sample.neko",
             """
             class Helper {
-                static val value: int = 1
+                static {
+                    val value: int = 1
+                }
             }
 
             class Handler {
-                static val other: int = 2
+                static {
+                    val other: int = 2
+                }
             }
 
             class Sample {
-                static fun main(args: string[]) {
-                    H<caret>
+                static {
+                    fun main(args: string[]) {
+                        H<caret>
+                    }
                 }
             }
             """.trimIndent(),
@@ -340,6 +358,275 @@ class NekoPluginTest : BasePlatformTestCase() {
         // Both come from analysing the project's own sources, so this proves the analyzer's symbol
         // table reaches completion -- not just a fixed list of built-ins.
         assertContainsElements(suggestions, "Helper", "Handler")
+    }
+
+    // ------------------------------------------------------------------------------ in scope
+
+    fun testCompletionOffersALocalVariableDeclaredAboveTheCaret() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main() {
+                        counter: int = 1
+                        <caret>
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // This is the completion that a flat list of the program's classes cannot give: the name
+        // exists only because of where the caret is.
+        assertContainsElements(completeAtCaret(), "counter")
+    }
+
+    fun testCompletionOffersAFunctionParameter() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun greet(who: string) {
+                        <caret>
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completeAtCaret(), "who")
+    }
+
+    fun testCompletionDoesNotOfferALocalDeclaredBelowTheCaret() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main() {
+                        <caret>
+                        later: int = 1
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // Suggesting it would propose a name the analyzer rejects, which is the one thing a
+        // completion list must not do.
+        assertFalse(
+            "a variable declared below the caret is not in scope yet",
+            completeAtCaret().contains("later"),
+        )
+    }
+
+    fun testCompletionDoesNotOfferALocalFromAnotherFunction() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun other() {
+                        elsewhere: int = 1
+                    }
+
+                    fun main() {
+                        <caret>
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        assertFalse(
+            "a local belongs to the function that declares it",
+            completeAtCaret().contains("elsewhere"),
+        )
+    }
+
+    fun testCompletionOffersAStaticMemberOfTheEnclosingClass() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    val limit: int = 9
+
+                    fun helper(): int {
+                        return 1
+                    }
+
+                    fun main() {
+                        <caret>
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // A member of the class being edited is reachable by its bare name from a static body, so
+        // it belongs in the list -- and unlike a local, nothing about the caret position says so.
+        assertContainsElements(completeAtCaret(), "helper", "limit")
+    }
+
+    fun testCompletionLeavesOutAnInstanceMemberInAStaticBody() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main() {
+                        <caret>
+                    }
+                }
+
+                fun instanceOnly(): int {
+                    return 1
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // There is no object to call it on, so the analyzer would reject the bare name.
+        assertFalse(
+            "an instance member is not reachable from a static body",
+            completeAtCaret().contains("instanceOnly"),
+        )
+    }
+
+    // ---------------------------------------------------------------------------- type names
+
+    fun testCompletionOffersBuiltinTypesInATypePosition() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main() {
+                        value: <caret>
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // `int`, `string` and `bool` are not classes, so nothing else in the list could supply them.
+        assertContainsElements(completeAtCaret(), "int", "bool", "string", "Object")
+    }
+
+    fun testCompletionOffersTheJavaSpellingOfABuiltinType() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main() {
+                        value: <caret>
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // These are the names the analyzer accepts as aliases, so offering them is the point: they
+        // are what a reader reaches for when thinking in Java types.
+        assertContainsElements(completeAtCaret(), "Integer", "Boolean", "String")
+    }
+
+    fun testCompletionOffersTypesAfterAPartlyTypedName() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main() {
+                        value: In<caret>
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // The name being typed must not hide the type position it sits in.
+        assertContainsElements(completeAtCaret(), "Integer")
+    }
+
+    fun testCompletionOffersTypesForAParameter() {
+        // After the colon, where the type is written. Right after `(` would be the parameter's
+        // *name*, which is a different position and deliberately not this list.
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main(value: <caret>) {
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completeAtCaret(), "int")
+    }
+
+    fun testCompletionOffersTypesForAReturnType() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun value(): <caret> {
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completeAtCaret(), "int")
+    }
+
+    fun testCompletionDoesNotOfferLocalsWhereATypeIsExpected() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main() {
+                        counter: int = 1
+                        value: <caret>
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // A type position is its own vocabulary: a variable is not a type, and offering it would
+        // suggest something the analyzer rejects.
+        assertFalse(
+            "a local is not a type",
+            completeAtCaret().contains("counter"),
+        )
+    }
+
+    fun testCompletionStillOffersLocalsWhereAValueIsExpected() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main() {
+                        counter: int = 1
+                        <caret>
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // The counterpart of the test above: outside a type position, nothing has been taken away.
+        assertContainsElements(completeAtCaret(), "counter")
     }
 
     // -------------------------------------------------------------------------------- helpers

@@ -1,0 +1,16 @@
+locate com.github.kusa233.neko.sample
+
+class InstanceSample {
+    static {
+        fun main() {
+            instance: Instance = Instance(123)
+            instance.test()
+        }
+    }
+}
+
+meow class Instance(val data: int) {
+    fun test() {
+        println(this.data)
+    }
+}

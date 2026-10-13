@@ -1,44 +1,46 @@
 locate com.github.kusa233.neko.sample
 
 class Sample {
-    private static val field1: int = 123
+    static {
+        private val field1: int = 123
 
-    static fun main(args: string[]) {
-        println(field1) // Should print '123'
-        variable()
-        lambda: int = lambda()(1,2) // Result should be 3.
-        controlFlow()
-    }
-
-    static fun variable() {
-        str: string = "Hell world!"
-        println(str)
-        // Error to compile:
-        // str: string = "new value"
-
-        // Successes to compile:
-        str = "new value"
-        println(str)
-    }
-
-    static fun lambda(): [int, int] -> int {
-        return { x, y ->
-            yield x + y
-        }
-    }
-
-    static fun controlFlow() {
-        a: int = 3
-        b: int = 2
-        c: int = 1
-        if (a > b > c) {
-            println("a more than b and more than c")
+        fun main(args: string[]) {
+            println(field1) // Should print '123'
+            variable()
+            lambda: int = lambda()(1,2) // Result should be 3.
+            controlFlow()
         }
 
-        when (a) {
-            3 -> println("Correct a")
-            2 -> {
-                println("Wrong a")
+        fun variable() {
+            str: string = "Hell world!"
+            println(str)
+            // Error to compile:
+            // str: string = "new value"
+
+            // Successes to compile:
+            str = "new value"
+            println(str)
+        }
+
+        fun lambda(): [int, int] -> int {
+            return { x, y ->
+                yield x + y
+            }
+        }
+
+        fun controlFlow() {
+            a: int = 3
+            b: int = 2
+            c: int = 1
+            if (a > b > c) {
+                println("a more than b and more than c")
+            }
+
+            when (a) {
+                3 -> println("Correct a")
+                2 -> {
+                    println("Wrong a")
+                }
             }
         }
     }

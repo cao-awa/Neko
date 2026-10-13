@@ -24,9 +24,11 @@ class SampleRulesTest {
         // Sample line 12 (`str: string = "Hell world!"`) has no `val`, and line 18's
         // `str = "new value"` sits under "Successes to compile" — so a bare declaration is mutable.
         val source = TestSupport.program(
-            "static fun variable() {",
-            "    str: string = \"Hell world!\"",
-            "    str = \"new value\"",
+            "static {",
+            "    fun variable() {",
+            "        str: string = \"Hell world!\"",
+            "        str = \"new value\"",
+            "    }",
             "}",
         )
         val result = TestSupport.compile(source)
@@ -42,9 +44,11 @@ class SampleRulesTest {
         // Sample line 15 is commented out under "Error to compile:" because line 12 already
         // declared `str` in the same scope.
         val source = TestSupport.program(
-            "static fun variable() {",
-            "    str: string = \"Hell world!\"",
-            "    str: string = \"new value\"",
+            "static {",
+            "    fun variable() {",
+            "        str: string = \"Hell world!\"",
+            "        str: string = \"new value\"",
+            "    }",
             "}",
         )
         val result = TestSupport.compile(source)
@@ -72,9 +76,11 @@ class SampleRulesTest {
     @Test
     fun `a 'val' local cannot be reassigned`() {
         val source = TestSupport.program(
-            "static fun variable() {",
-            "    val str: string = \"fixed\"",
-            "    str = \"new value\"",
+            "static {",
+            "    fun variable() {",
+            "        val str: string = \"fixed\"",
+            "        str = \"new value\"",
+            "    }",
             "}",
         )
         val result = TestSupport.compile(source)
@@ -95,13 +101,15 @@ class SampleRulesTest {
         // Sample line 8: `lambda: int = lambda()(1,2)` resolves `lambda()` to the *function*
         // `lambda`, not to the variable being declared.
         val source = TestSupport.program(
-            "static fun lambda(): [int, int] -> int {",
-            "    return { x, y ->",
-            "        yield x + y",
+            "static {",
+            "    fun lambda(): [int, int] -> int {",
+            "        return { x, y ->",
+            "            yield x + y",
+            "        }",
             "    }",
-            "}",
-            "static fun main() {",
-            "    lambda: int = lambda()(1, 2)",
+            "    fun main() {",
+            "        lambda: int = lambda()(1, 2)",
+            "    }",
             "}",
         )
         val result = TestSupport.compile(source)
@@ -117,12 +125,14 @@ class SampleRulesTest {
         // Sample line 30: `if (a > b > c)` with a=3, b=2, c=1 holds, and the sample prints.
         val program = TestSupport.load(
             TestSupport.program(
-                "static fun check(a: int, b: int, c: int): bool {",
-                "    return a > b > c",
-                "}",
-                "static fun main() {",
-                "    println(check(3, 2, 1))",
-                "    println(check(1, 2, 3))",
+                "static {",
+                "    fun check(a: int, b: int, c: int): bool {",
+                "        return a > b > c",
+                "    }",
+                "    fun main() {",
+                "        println(check(3, 2, 1))",
+                "        println(check(1, 2, 3))",
+                "    }",
                 "}",
             ),
         )
@@ -135,17 +145,19 @@ class SampleRulesTest {
         // Desugaring `a > middle() > c` into `(a > middle()) && (middle() > c)` would call it twice.
         val program = TestSupport.load(
             TestSupport.program(
-                "static var calls: int = 0",
-                "static fun middle(): int {",
-                "    calls = calls + 1",
-                "    return 2",
-                "}",
-                "static fun check(a: int, c: int): bool {",
-                "    return a > middle() > c",
-                "}",
-                "static fun main() {",
-                "    check(3, 1)",
-                "    println(calls)",
+                "static {",
+                "    var calls: int = 0",
+                "    fun middle(): int {",
+                "        calls = calls + 1",
+                "        return 2",
+                "    }",
+                "    fun check(a: int, c: int): bool {",
+                "        return a > middle() > c",
+                "    }",
+                "    fun main() {",
+                "        check(3, 1)",
+                "        println(calls)",
+                "    }",
                 "}",
             ),
         )
@@ -157,8 +169,10 @@ class SampleRulesTest {
     fun `a chained comparison of non-ints is rejected`() {
         val result = TestSupport.compile(
             TestSupport.program(
-                "static fun check(a: bool, b: bool): bool {",
-                "    return a > b",
+                "static {",
+                "    fun check(a: bool, b: bool): bool {",
+                "        return a > b",
+                "    }",
                 "}",
             ),
         )
@@ -174,18 +188,20 @@ class SampleRulesTest {
         // Sample lines 34-39: `when (a)` with a=3 prints "Correct a" and never "Wrong a".
         val program = TestSupport.load(
             TestSupport.program(
-                "static fun describe(a: int) {",
-                "    when (a) {",
-                "        3 -> println(\"Correct a\")",
-                "        2 -> {",
-                "            println(\"Wrong a\")",
+                "static {",
+                "    fun describe(a: int) {",
+                "        when (a) {",
+                "            3 -> println(\"Correct a\")",
+                "            2 -> {",
+                "                println(\"Wrong a\")",
+                "            }",
                 "        }",
                 "    }",
-                "}",
-                "static fun main() {",
-                "    describe(3)",
-                "    describe(2)",
-                "    describe(9)",
+                "    fun main() {",
+                "        describe(3)",
+                "        describe(2)",
+                "        describe(9)",
+                "    }",
                 "}",
             ),
         )
@@ -197,18 +213,20 @@ class SampleRulesTest {
     fun `when evaluates its subject once`() {
         val program = TestSupport.load(
             TestSupport.program(
-                "static var calls: int = 0",
-                "static fun subject(): int {",
-                "    calls = calls + 1",
-                "    return 2",
-                "}",
-                "static fun main() {",
-                "    when (subject()) {",
-                "        1 -> println(\"one\")",
-                "        2 -> println(\"two\")",
-                "        3 -> println(\"three\")",
+                "static {",
+                "    var calls: int = 0",
+                "    fun subject(): int {",
+                "        calls = calls + 1",
+                "        return 2",
                 "    }",
-                "    println(calls)",
+                "    fun main() {",
+                "        when (subject()) {",
+                "            1 -> println(\"one\")",
+                "            2 -> println(\"two\")",
+                "            3 -> println(\"three\")",
+                "        }",
+                "        println(calls)",
+                "    }",
                 "}",
             ),
         )
@@ -220,15 +238,17 @@ class SampleRulesTest {
     fun `when with else runs the else branch when nothing matches`() {
         val program = TestSupport.load(
             TestSupport.program(
-                "static fun describe(a: int) {",
-                "    when (a) {",
-                "        1 -> println(\"one\")",
-                "        else -> println(\"other\")",
+                "static {",
+                "    fun describe(a: int) {",
+                "        when (a) {",
+                "            1 -> println(\"one\")",
+                "            else -> println(\"other\")",
+                "        }",
                 "    }",
-                "}",
-                "static fun main() {",
-                "    describe(1)",
-                "    describe(7)",
+                "    fun main() {",
+                "        describe(1)",
+                "        describe(7)",
+                "    }",
                 "}",
             ),
         )
@@ -239,9 +259,11 @@ class SampleRulesTest {
     @Test
     fun `a branch testing the wrong type is rejected at the branch value`() {
         val source = TestSupport.program(
-            "static fun describe(a: int) {",
-            "    when (a) {",
-            "        \"three\" -> println(\"no\")",
+            "static {",
+            "    fun describe(a: int) {",
+            "        when (a) {",
+            "            \"three\" -> println(\"no\")",
+            "        }",
             "    }",
             "}",
         )
@@ -262,10 +284,12 @@ class SampleRulesTest {
     fun `a duplicate else branch is rejected`() {
         val result = TestSupport.compile(
             TestSupport.program(
-                "static fun describe(a: int) {",
-                "    when (a) {",
-                "        else -> println(\"first\")",
-                "        else -> println(\"second\")",
+                "static {",
+                "    fun describe(a: int) {",
+                "        when (a) {",
+                "            else -> println(\"first\")",
+                "            else -> println(\"second\")",
+                "        }",
                 "    }",
                 "}",
             ),
@@ -281,8 +305,10 @@ class SampleRulesTest {
         // `throw` and `throws` were removed. A reader who writes one gets a diagnostic that says so
         // and points at where the replacement is documented, rather than a syntax error.
         val source = TestSupport.program(
-            "static fun fails() {",
-            "    throw CustomException()",
+            "static {",
+            "    fun fails() {",
+            "        throw CustomException()",
+            "    }",
             "}",
         )
         val result = TestSupport.compile(source)
@@ -305,11 +331,13 @@ class SampleRulesTest {
     @Test
     fun `a catch clause must name a throwable type`() {
         val source = TestSupport.program(
-            "static fun fails() {",
-            "    try {",
-            "        println(\"body\")",
-            "    } catch (e: int) {",
-            "        println(\"never\")",
+            "static {",
+            "    fun fails() {",
+            "        try {",
+            "            println(\"body\")",
+            "        } catch (e: int) {",
+            "            println(\"never\")",
+            "        }",
             "    }",
             "}",
         )
@@ -334,11 +362,13 @@ class SampleRulesTest {
                 "}",
                 "",
                 "class Test {",
-                "    static fun fails() {",
-                "        try {",
-                "            println(\"body\")",
-                "        } catch (e: NotAnException) {",
-                "            println(\"never\")",
+                "    static {",
+                "        fun fails() {",
+                "            try {",
+                "                println(\"body\")",
+                "            } catch (e: NotAnException) {",
+                "                println(\"never\")",
+                "            }",
                 "        }",
                 "    }",
                 "}",
@@ -359,20 +389,22 @@ class SampleRulesTest {
         val program = TestSupport.load(
             TestSupport.file(
                 "class Test {",
-                "    static fun main() {",
-                "        try {",
-                "            println(\"body\")",
-                "            println(1 / zero())",
-                "        } catch (e: ArithmeticException) {",
-                "            println(\"caught\")",
-                "        } finally {",
-                "            println(\"finally\")",
+                "    static {",
+                "        fun main() {",
+                "            try {",
+                "                println(\"body\")",
+                "                println(1 / zero())",
+                "            } catch (e: ArithmeticException) {",
+                "                println(\"caught\")",
+                "            } finally {",
+                "                println(\"finally\")",
+                "            }",
+                "            println(\"after\")",
                 "        }",
-                "        println(\"after\")",
-                "    }",
                 "",
-                "    static fun zero(): int {",
-                "        return 0",
+                "        fun zero(): int {",
+                "            return 0",
+                "        }",
                 "    }",
                 "}",
             ),
@@ -390,9 +422,11 @@ class SampleRulesTest {
         val result = TestSupport.compileWithLibrary(
             TestSupport.file(
                 "class Test {",
-                "    static fun value() {",
-                "        raise 1",
-                "    } emit [int]",
+                "    static {",
+                "        fun value() {",
+                "            raise 1",
+                "        } emit [int]",
+                "    }",
                 "}",
             ),
         )
@@ -407,8 +441,10 @@ class SampleRulesTest {
     fun `a function returning a value must not fall off its end`() {
         val result = TestSupport.compile(
             TestSupport.program(
-                "static fun value(): int {",
-                "    println(\"no return\")",
+                "static {",
+                "    fun value(): int {",
+                "        println(\"no return\")",
+                "    }",
                 "}",
             ),
         )
@@ -422,10 +458,12 @@ class SampleRulesTest {
     fun `a when whose every branch returns satisfies the requirement to return`() {
         val result = TestSupport.compile(
             TestSupport.program(
-                "static fun value(a: int): int {",
-                "    when (a) {",
-                "        1 -> return 1",
-                "        else -> return 2",
+                "static {",
+                "    fun value(a: int): int {",
+                "        when (a) {",
+                "            1 -> return 1",
+                "            else -> return 2",
+                "        }",
                 "    }",
                 "}",
             ),
