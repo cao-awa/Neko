@@ -3,14 +3,16 @@ locate com.github.kusa233.neko.sample
 class InstanceSample {
     static {
         fun main() {
-            instance: Instance = Instance(123)
-            instance.test()
+            var1: Instance = Instance(123)
+            var2: Instance = Instance(123)
+            var3: Instance = Instance(456)
+            println(var1 == var2)
+            println(var2 == var3)
+            println(var1)
         }
     }
 }
 
 meow class Instance(val data: int) {
-    fun test() {
-        println(this.data)
-    }
+
 }

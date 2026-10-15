@@ -1,0 +1,80 @@
+locate com.github.kusa233.neko.sample
+
+/**
+ * `nya <condition>` — checks what the program believes, and stops when it is wrong.
+ *
+ * The statement exists because some facts are true of the program rather than of its input: a value
+ * that must have been set up, a result that must obey the comment above it, an invariant that holds
+ * when a loop ends. A `nya` writes that down where it is relied on, so a run that breaks the
+ * assumption ends at the line that made it instead of somewhere later where the damage shows up.
+ *
+ * Every check below holds, so the program runs to the end. The cases that must not compile are
+ * commented out, as the other samples do.
+ */
+class NyaSample() {
+    static {
+        fun main(args: string[]) {
+            comparisons()
+            functionCalls()
+            narrowing()
+            caught()
+            // Error to compile: only a 'bool' can be checked, because nothing else could fail.
+            // nya 1 + 1
+        }
+
+        // The condition is an ordinary expression, so a comparison is written the way it is written
+        // anywhere else — there is no separate spelling for 'nya'.
+        fun comparisons() {
+            count: int = 3
+            nya count > 0                    // Carries on: 3 is positive
+            nya count == 3                   // Carries on
+            println(count)                   // Should print '3'
+
+            // A check on a value the program computed rather than one it was handed.
+            total: int = count * 2
+            nya total == 6
+            println(total)                   // Should print '6'
+        }
+
+        // Anything that answers a 'bool' is a condition: a call, a variable, a chained comparison.
+        fun functionCalls() {
+            nya ready()
+            println("ready")                 // Should print 'ready'
+
+            flag: bool = true
+            nya flag
+            println("flag")                  // Should print 'flag'
+        }
+
+        // A check that holds proves its condition for everything after it, so it doubles as a guard
+        // — the same narrowing 'if (h == null) { return }' gives, said in one line.
+        fun narrowing() {
+            box: Box? = Box(4)
+            nya box != null
+            println(box.value)               // Should print '4', with no '?.' needed
+        }
+
+        // A failed check throws a real 'java.lang.AssertionError', so 'try' can catch it. That is
+        // what makes a check usable where a failure should become a value.
+        fun caught() {
+            try {
+                nya 1 == 2                   // Fails, and says which condition failed
+            } catch (e: AssertionError) {
+                println(e)                   // Should print 'java.lang.AssertionError: 1 == 2'
+            }
+            println("caught")                // Should print 'caught'
+        }
+
+        fun ready(): bool {
+            return true
+        }
+    }
+}
+
+class Box {
+    val value: int
+
+    constructor(value: int) {
+        this.value = value
+    }
+}

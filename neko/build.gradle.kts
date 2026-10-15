@@ -96,6 +96,8 @@ val nekoLibraryPaths: List<String> = existingDirectories(nekoLibraryDirectories)
 val nekoPrograms: Map<String, String> = mapOf(
     "Sample" to "com.github.kusa233.neko.sample.Sample",
     "ExceptionSample" to "com.github.kusa233.neko.sample.ExceptionSample",
+    "NullableSample" to "com.github.kusa233.neko.sample.NullableSample",
+    "NyaSample" to "com.github.kusa233.neko.sample.NyaSample",
 )
 
 /**

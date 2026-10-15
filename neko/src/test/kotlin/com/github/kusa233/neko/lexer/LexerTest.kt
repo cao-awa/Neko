@@ -39,7 +39,7 @@ class LexerTest {
         val keywords = listOf(
             "locate", "import", "meow", "class", "interface", "constructor", "fun", "val", "var",
             "private", "public", "protected", "static", "return", "yield", "if", "else", "while",
-            "when", "try", "catch", "finally", "raise", "emit", "this", "true", "false",
+            "when", "nya", "try", "catch", "finally", "raise", "emit", "this", "true", "false",
         )
         for (keyword in keywords) {
             val scanned = types(keyword).single()
@@ -135,6 +135,58 @@ class LexerTest {
     fun `reports an integer literal that does not fit in an int`() {
         val diagnostics = lex("a: int = 99999999999999999999").second
         assertTrue(diagnostics.hasErrors)
+    }
+
+    @Test
+    fun `scans a long suffix as part of the literal`() {
+        // The suffix is not a separate token and not an identifier: `1L` is one whole-number literal
+        // whose text says it asked for 64 bits, which is how the parser knows to type it as a `long`.
+        val literal = lex("a: long = 1L").first.first { it.type == TokenType.INTEGER_LITERAL }
+        assertEquals("1L", literal.text)
+        assertEquals(1L, literal.literalValue)
+    }
+
+    @Test
+    fun `scans fractional literals and their type suffix`() {
+        val tokens = lex("a: float = 1.5f\nb: double = 1.5\nc: float = 2F").first
+            .filter { it.type == TokenType.FLOAT_LITERAL }
+        assertEquals(listOf("1.5f", "1.5", "2F"), tokens.map { it.text })
+        assertEquals(listOf(true, false, true), tokens.map { it.isFloatSuffixed })
+        assertEquals(listOf(1.5, 1.5, 2.0), tokens.map { it.floatValue })
+    }
+
+    @Test
+    fun `an integer literal may be as wide as a long but no wider`() {
+        val literal = lex("a: long = 4000000000").first.first { it.type == TokenType.INTEGER_LITERAL }
+        assertEquals(4000000000L, literal.literalValue)
+        assertTrue(
+            !lex("a: long = 4000000000").second.hasErrors,
+            "4000000000 fits in a long and must not be rejected by the lexer",
+        )
+        assertTrue(
+            lex("a: long = 99999999999999999999").second.hasErrors,
+            "a value beyond a long must be reported",
+        )
+    }
+
+    @Test
+    fun `scans a character literal and decodes its escapes`() {
+        val plain = lex("c: char = 'a'").first.first { it.type == TokenType.CHAR_LITERAL }
+        assertEquals("'a'", plain.text)
+        assertEquals('a'.code.toLong(), plain.literalValue)
+
+        val escaped = lex("""c: char = '\n'""").first.first { it.type == TokenType.CHAR_LITERAL }
+        assertEquals('\n'.code.toLong(), escaped.literalValue, "an escape is one character")
+
+        val quote = lex("""c: char = '\''""").first.first { it.type == TokenType.CHAR_LITERAL }
+        assertEquals('\''.code.toLong(), quote.literalValue)
+    }
+
+    @Test
+    fun `reports a character literal that is not one character`() {
+        assertTrue(lex("c: char = 'ab'").second.hasErrors, "'ab' is two characters")
+        assertTrue(lex("c: char = ''").second.hasErrors, "'' is none")
+        assertTrue(lex("c: char = 'a").second.hasErrors, "an unclosed literal must be reported")
     }
 
     @Test

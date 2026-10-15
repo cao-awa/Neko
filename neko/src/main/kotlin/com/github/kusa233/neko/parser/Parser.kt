@@ -1048,6 +1048,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         TokenType.IF -> parseIfStatement()
         TokenType.WHILE -> parseWhileStatement()
         TokenType.WHEN -> parseWhenStatement()
+        TokenType.NYA -> parseNyaStatement()
         TokenType.RAISE -> parseRaiseStatement()
         TokenType.TRY -> parseTryStatement()
         TokenType.SEMICOLON -> {
@@ -1357,6 +1358,32 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             branches = branches,
             hasElseBranch = hasElseBranch,
             span = Span(source, keyword.span.start, end),
+        )
+    }
+
+    /**
+     * `nya condition` — checks the condition and stops the program when it does not hold.
+     *
+     * The condition is a whole expression rather than a comparison: `nya isReady()` and `nya a == b`
+     * are both checks, and the second needs no special reading because `==` is already an operator.
+     * That also means a comma here is not a message — there is no second operand — so the statement
+     * ends after the expression and anything else is reported against what it wrote.
+     */
+    private fun parseNyaStatement(): NyaStatement? {
+        val keyword = advance()
+        if (atStatementEnd()) {
+            error("'nya' requires a condition to check", keyword.span)
+            return null
+        }
+        val condition = parseExpression() ?: run {
+            synchronizeToStatement()
+            return null
+        }
+        expectStatementEnd("nya statement")
+        return NyaStatement(
+            keywordSpan = keyword.span,
+            condition = condition,
+            span = Span(source, keyword.span.start, condition.span.end),
         )
     }
 
@@ -1814,34 +1841,16 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         while (true) {
             skipNestedNewlines()
             when {
+                // `callee?(arguments)` — a call that is skipped when the function value is absent.
+                // The `?` belongs to the *call*, not to the callee: `f?(x)` calls the value `f` only
+                // if it is there, so the flag is recorded on the call the `(` is about to build.
+                at(TokenType.QUESTION) && peek(1).type == TokenType.LEFT_PAREN -> {
+                    advance() // `?`
+                    expression = parseArgumentList(expression, safeCall = true)
+                }
+
                 at(TokenType.LEFT_PAREN) -> {
-                    val open = advance()
-                    newlineInsensitiveDepth++
-                    skipNestedNewlines()
-                    val arguments = mutableListOf<Expression>()
-                    if (!at(TokenType.RIGHT_PAREN)) {
-                        while (true) {
-                            val argument = parseExpression() ?: break
-                            arguments += argument
-                            skipNestedNewlines()
-                            if (at(TokenType.COMMA)) {
-                                advance()
-                                skipNestedNewlines()
-                                continue
-                            }
-                            break
-                        }
-                    }
-                    skipNestedNewlines()
-                    val close = expectRightParen("argument list")
-                    newlineInsensitiveDepth--
-                    val end = close?.span?.end ?: current().span.end
-                    expression = CallExpression(
-                        callee = expression,
-                        arguments = arguments,
-                        argumentListSpan = Span(source, open.span.start, end),
-                        span = Span(source, expression.span.start, end),
-                    )
+                    expression = parseArgumentList(expression, safeCall = false)
                 }
 
                 at(TokenType.DOT) -> {
@@ -1855,6 +1864,26 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
                         memberName = member.text,
                         memberSpan = member.span,
                         span = Span(source, expression.span.start, member.span.end),
+                    )
+                }
+
+                // `receiver?.member` — the safe call, which reads the member only when the receiver
+                // is not null. The `?.` is two tokens, and the `?` is only a safe call when a `.`
+                // follows it: anywhere else a `?` is the type suffix, which never reaches an
+                // expression context.
+                at(TokenType.QUESTION) && peek(1).type == TokenType.DOT -> {
+                    advance() // `?`
+                    advance() // `.`
+                    val member = expect(
+                        TokenType.IDENTIFIER,
+                        "expected a member name after '?.' but found ${current().describe()}",
+                    ) ?: return expression
+                    expression = MemberAccessExpression(
+                        receiver = expression,
+                        memberName = member.text,
+                        memberSpan = member.span,
+                        span = Span(source, expression.span.start, member.span.end),
+                        isSafeCall = true,
                     )
                 }
 
@@ -1884,12 +1913,70 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         }
     }
 
+    /**
+     * Parses `(arguments)` and builds the call it belongs to.
+     *
+     * [safeCall] is what `callee?(...)` sets: the call is skipped when the function value being called
+     * is absent. The two spellings share everything but that flag, so they share this method rather
+     * than duplicating an argument list that has to stay in step with itself.
+     */
+    private fun parseArgumentList(callee: Expression, safeCall: Boolean): Expression {
+        val open = advance() // `(`
+        newlineInsensitiveDepth++
+        skipNestedNewlines()
+        val arguments = mutableListOf<Expression>()
+        if (!at(TokenType.RIGHT_PAREN)) {
+            while (true) {
+                val argument = parseExpression() ?: break
+                arguments += argument
+                skipNestedNewlines()
+                if (at(TokenType.COMMA)) {
+                    advance()
+                    skipNestedNewlines()
+                    continue
+                }
+                break
+            }
+        }
+        skipNestedNewlines()
+        val close = expectRightParen("argument list")
+        newlineInsensitiveDepth--
+        val end = close?.span?.end ?: current().span.end
+        return CallExpression(
+            callee = callee,
+            arguments = arguments,
+            argumentListSpan = Span(source, open.span.start, end),
+            span = Span(source, callee.span.start, end),
+            isSafeCall = safeCall,
+        )
+    }
+
     private fun parsePrimary(): Expression? {
         val token = current()
         return when (token.type) {
             TokenType.INTEGER_LITERAL -> {
                 advance()
-                IntegerLiteral(token.integerValue, token.span)
+                // The suffix is part of the token's text: it is what distinguishes "a whole number"
+                // from "a whole number that is a long", and the analyzer needs to know which was
+                // written so it can refuse to narrow `1L` into an `int`.
+                IntegerLiteral(
+                    value = token.literalValue,
+                    isLong = token.text.endsWith("L") || token.text.endsWith("l"),
+                    span = token.span,
+                )
+            }
+
+            TokenType.FLOAT_LITERAL -> {
+                advance()
+                DoubleLiteral(token.floatValue, token.isFloatSuffixed, token.span)
+            }
+
+            TokenType.CHAR_LITERAL -> {
+                advance()
+                // The lexer stores a character's value as a number, exactly as it stores a whole
+                // number, so the two cannot drift apart; the parser is where it becomes a character
+                // again. A literal the lexer rejected still carries a value, so this cannot throw.
+                CharLiteral(token.literalValue.toInt().toChar(), token.span)
             }
 
             TokenType.STRING_LITERAL -> {
@@ -1900,6 +1987,11 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             TokenType.TRUE, TokenType.FALSE -> {
                 advance()
                 BoolLiteral(token.type == TokenType.TRUE, token.span)
+            }
+
+            TokenType.NULL -> {
+                advance()
+                NullLiteral(token.span)
             }
 
             TokenType.IDENTIFIER -> {
@@ -2042,20 +2134,83 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
                 NamedTypeReference(start.text, start.span, start.span)
             }
 
+            // `([int] -> int)?` — parentheses, so that a `?` can apply to the function type as a
+            // whole. Without them there is no way to say "a function that may be absent": a function
+            // type ends in its return type, so `[int] -> int?` already means "returns an `int?`" and
+            // the `?` has to attach to the return type.
+            TokenType.LEFT_PAREN -> parseParenthesizedType() ?: return null
+
             else -> {
                 error("expected a type but found ${start.describe()}", start.span)
                 return null
             }
         }
 
-        // Trailing `[]` suffixes, e.g. `string[]`.
-        while (at(TokenType.LEFT_BRACKET) && peek(1).type == TokenType.RIGHT_BRACKET) {
-            advance()
-            val close = advance()
-            result = ArrayTypeReference(result, Span(source, result.span.start, close.span.end))
-        }
+        // Trailing `[]` and `?` suffixes, e.g. `string[]`, `string?`, `string?[]`.
+        //
+        // Either may be written, in either order, because they answer different questions: `string?[]`
+        // is an array of strings that may be absent, and `string[]?` is an array that may itself be
+        // absent. `?` therefore applies to whatever has been built so far.
+        while (true) {
+            when {
+                at(TokenType.LEFT_BRACKET) && peek(1).type == TokenType.RIGHT_BRACKET -> {
+                    advance()
+                    val close = advance()
+                    result = ArrayTypeReference(result, Span(source, result.span.start, close.span.end))
+                }
 
-        return result
+                at(TokenType.QUESTION) -> {
+                    val question = advance()
+                    if (result is NullableTypeReference) {
+                        // `string??` is not a stronger promise than `string?`: nullability is a
+                        // property a type either has or lacks, so the second `?` says nothing.
+                        error(
+                            "a type may be nullable only once: write '${result.span.text}' and drop " +
+                                "the extra '?'",
+                            question.span,
+                        )
+                    } else {
+                        result = NullableTypeReference(
+                            inner = result,
+                            questionSpan = question.span,
+                            span = Span(source, result.span.start, question.span.end),
+                        )
+                    }
+                }
+
+                else -> return result
+            }
+        }
+    }
+
+    /**
+     * Parses `(Type)` and returns the inner type, spans widened to include the parentheses.
+     *
+     * The parentheses are not a type of their own — they only group, so that a trailing `?` or `[]`
+     * can apply to what is inside them rather than to the last part of it. That is what makes
+     * `([int] -> int)?` say "a function value that may be absent" where `[int] -> int?` says "a
+     * function returning an absent int".
+     *
+     * The result is the inner reference with a *widened span*, and that is what the error messages
+     * quote back: reporting a `([int] -> int)?` as `(int -> int` or as a bare `int` would describe a
+     * type the reader did not write.
+     */
+    private fun parseParenthesizedType(): TypeReference? {
+        val open = advance() // `(`
+        skipNestedNewlines()
+        val inner = parseType() ?: return null
+        skipNestedNewlines()
+        val close = expectRightParen("type") ?: return null
+        val span = Span(source, open.span.start, close.span.end)
+        return withSpan(inner, span)
+    }
+
+    /** [reference] with its span replaced by [span], keeping its structure. */
+    private fun withSpan(reference: TypeReference, span: Span): TypeReference = when (reference) {
+        is NamedTypeReference -> NamedTypeReference(reference.name, reference.nameSpan, span)
+        is ArrayTypeReference -> ArrayTypeReference(reference.element, span)
+        is FunctionTypeReference -> FunctionTypeReference(reference.parameters, reference.returnType, span)
+        is NullableTypeReference -> NullableTypeReference(reference.inner, reference.questionSpan, span)
     }
 
     /** Parses the `[int, int]` part of a function type together with its mandatory `-> return`. */
@@ -2347,6 +2502,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
          */
         val NAME_SEGMENT_KEYWORDS: Set<TokenType> = setOf(
             TokenType.EMIT,
+            TokenType.NYA,
             TokenType.RAISE,
             TokenType.YIELD,
             TokenType.ELSE,

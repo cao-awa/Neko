@@ -37,7 +37,8 @@ class Lexer(private val source: SourceFile, private val diagnostics: DiagnosticB
             '\r', '\n' -> lexNewline()
             '/' -> lexSlashOrComment()
             '"' -> lexStringLiteral()
-            in '0'..'9' -> lexIntegerLiteral()
+            '\'' -> lexCharacterLiteral()
+            in '0'..'9' -> lexNumberLiteral()
             else -> when {
                 isIdentifierStart(current) -> lexIdentifierOrKeyword()
                 else -> lexSymbol()
@@ -88,27 +89,169 @@ class Lexer(private val source: SourceFile, private val diagnostics: DiagnosticB
 
     // ------------------------------------------------------------ literals
 
-    private fun lexIntegerLiteral() {
+    /**
+     * Scans a whole or fractional number literal.
+     *
+     * The shape decides the token's *kind*, and the kind decides the default type the parser records:
+     * digits alone are an integer literal — `1L` an integer that may only be a `long` — while a
+     * fraction, an exponent, or an `f`/`F` suffix makes it a `float` or a `double`. Nothing here
+     * consults a context, because the lexer has none: `1` is typed by the analyzer, which is the pass
+     * that can see what the literal was written into.
+     *
+     * A number that does not fit the widest type the language has is reported here rather than
+     * silently clamped, because no context could rescue it: the value the author wrote is not a value
+     * the JVM can hold.
+     */
+    private fun lexNumberLiteral() {
         val start = position
         while (!isAtEnd && peek() in '0'..'9') advance()
+
+        // A fraction turns an integer into a decimal. A `.` that is *not* followed by a digit is a
+        // member access — `1.foo` — so it is left for the symbol lexer to pick up.
+        var fractional = false
+        if (peek() == '.' && peek(1) in '0'..'9') {
+            fractional = true
+            advance()
+            while (!isAtEnd && peek() in '0'..'9') advance()
+        }
+
+        // `1e3` and `1.5e-3` are decimals too, and an exponent is written without a dot. The whole
+        // exponent — sign included — stays part of the literal's text so that the string handed to
+        // `toDouble` is one it can read; `toDouble` accepts `e` and `E` as written.
+        if (peek() == 'e' || peek() == 'E') {
+            val afterExponent = peek(1)
+            val signed = afterExponent == '+' || afterExponent == '-'
+            val digitAfter = if (signed) peek(2) else afterExponent
+            if (digitAfter in '0'..'9') {
+                fractional = true
+                advance()
+                if (signed) advance()
+                while (!isAtEnd && peek() in '0'..'9') advance()
+            }
+        }
+
+        // The suffix names the type the author asked for. Only `f`/`F` also changes the *kind*: a
+        // decimal is a `double` unless it says otherwise, and `L` on a whole number is a request for
+        // the 64-bit range without changing the token's shape.
+        var suffixedFloat = false
+        var longSuffixed = false
+        when {
+            peek() == 'f' || peek() == 'F' -> {
+                suffixedFloat = true
+                fractional = true
+                advance()
+            }
+
+            !fractional && (peek() == 'l' || peek() == 'L') -> {
+                longSuffixed = true
+                advance()
+            }
+        }
+
         val literalText = text.substring(start, position)
-        val value = literalText.toLongOrNull()
-        if (value == null) {
-            diagnostics.error(
-                "integer literal '$literalText' does not fit in a 32-bit signed integer",
-                spanFrom(start),
-            )
-            tokens += Token(TokenType.INTEGER_LITERAL, literalText, spanFrom(start), integerValue = 0L)
+        if (fractional) {
+            lexFloatingLiteral(start, literalText, suffixedFloat)
             return
         }
-        if (value > Int.MAX_VALUE) {
+
+        // A whole number: the digits alone, or the digits with the `L` that asked for 64 bits. The
+        // `L` is stripped before parsing, so `parseNumberMagnitude` sees only what it can decode.
+        val digits = if (longSuffixed) literalText.dropLast(1) else literalText
+        val magnitude = parseNumberMagnitude(digits)
+        if (magnitude == null) {
             diagnostics.error(
-                "integer literal '$literalText' does not fit in a 32-bit signed integer " +
-                    "(maximum is ${Int.MAX_VALUE})",
+                "integer literal '$literalText' does not fit in a 64-bit signed integer " +
+                    "(maximum is ${Long.MAX_VALUE}); a Neko program has no wider whole number",
                 spanFrom(start),
             )
         }
-        tokens += Token(TokenType.INTEGER_LITERAL, literalText, spanFrom(start), integerValue = value)
+        tokens += Token(
+            TokenType.INTEGER_LITERAL,
+            literalText,
+            spanFrom(start),
+            // A literal that overflowed is still handed on as the largest value there is, so the
+            // parser has a node to build and the reader gets the one diagnostic above rather than a
+            // cascade of follow-on type errors.
+            literalValue = magnitude ?: Long.MAX_VALUE,
+        )
+    }
+
+    /**
+     * Scans the fractional part of a decimal literal.
+     *
+     * The digits are collected into a `String` and read by `toDouble` rather than accumulated as a
+     * number, because `toDouble` is the correctly-rounded conversion — accumulating `1/10` in a loop
+     * would produce a different value from the one the source names.
+     */
+    private fun lexFloatingLiteral(start: Int, literalText: String, isFloatSuffixed: Boolean) {
+        val digits = if (isFloatSuffixed) literalText.dropLast(1) else literalText
+        val value = digits.toDoubleOrNull()
+        if (value == null || value.isInfinite() || value.isNaN()) {
+            diagnostics.error(
+                "floating-point literal '$literalText' does not fit in a 64-bit double",
+                spanFrom(start),
+            )
+        }
+        tokens += Token(
+            TokenType.FLOAT_LITERAL,
+            literalText,
+            spanFrom(start),
+            floatValue = value ?: 0.0,
+            isFloatSuffixed = isFloatSuffixed,
+        )
+    }
+
+    /**
+     * Scans `'a'`, including the same backslash escapes a string literal accepts.
+     *
+     * Exactly one character is allowed between the quotes, which is what makes the token's value a
+     * `Char` rather than a string the analyzer would have to re-check. An escape is still one
+     * character even though it is written as two, so `'\n'` is legal and `'ab'` is not.
+     */
+    private fun lexCharacterLiteral() {
+        val start = position
+        advance() // opening quote
+
+        if (isAtEnd || peek() == '\n' || peek() == '\r') {
+            // Point at the opening quote: that is where the author has to look to close it.
+            diagnostics.error("unterminated character literal", spanFrom(start, minOf(position, start + 1)))
+            tokens += Token(TokenType.CHAR_LITERAL, text.substring(start, position), spanFrom(start))
+            return
+        }
+
+        val decoded = StringBuilder()
+        if (peek() == '\\') {
+            lexEscapeInto(decoded)
+        } else {
+            decoded.append(peek())
+            advance()
+        }
+        val value = decoded.singleOrNull()
+
+        if (peek() != '\'') {
+            // Consume whatever else was written before reporting, so the message can name it and the
+            // next token starts after the whole literal rather than in its middle.
+            val remainderStart = position
+            while (!isAtEnd && peek() != '\'' && peek() != '\n' && peek() != '\r') advance()
+            val remainder = text.substring(remainderStart, position)
+            if (peek() == '\'') advance()
+            diagnostics.error(
+                "a character literal holds exactly one character, but '${text.substring(start, position)}' " +
+                    "holds ${if (value == null) "none" else "more than one"}" +
+                    (if (remainder.isEmpty()) "" else "; write \"$remainder\" for a string"),
+                spanFrom(start),
+            )
+            tokens += Token(TokenType.CHAR_LITERAL, text.substring(start, position), spanFrom(start))
+            return
+        }
+        advance() // closing quote
+
+        tokens += Token(
+            TokenType.CHAR_LITERAL,
+            text.substring(start, position),
+            spanFrom(start),
+            literalValue = (value ?: '?').code.toLong(),
+        )
     }
 
     private fun lexStringLiteral() {
@@ -147,7 +290,13 @@ class Lexer(private val source: SourceFile, private val diagnostics: DiagnosticB
         )
     }
 
-    /** Consumes one backslash escape, appending its decoded character to [value]. */
+    /**
+     * Consumes one backslash escape, appending its decoded character to [value].
+     *
+     * The same escapes serve string literals and character literals: a character literal whose
+     * content is an escape is one character, so `'\n'` needs no separate path, and rejecting the
+     * escapes here rather than in each caller keeps the two from drifting apart.
+     */
     private fun lexEscapeInto(value: StringBuilder) {
         val escapeStart = position
         advance() // backslash
@@ -198,6 +347,7 @@ class Lexer(private val source: SourceFile, private val diagnostics: DiagnosticB
             ':' -> emit(TokenType.COLON, start)
             ';' -> emit(TokenType.SEMICOLON, start)
             '.' -> emit(TokenType.DOT, start)
+            '?' -> emit(TokenType.QUESTION, start)
             '+' -> emit(TokenType.PLUS, start)
             '*' -> emit(TokenType.STAR, start)
             '/' -> emit(TokenType.SLASH, start)
@@ -253,6 +403,28 @@ class Lexer(private val source: SourceFile, private val diagnostics: DiagnosticB
     }
 
     private fun spanFrom(start: Int, end: Int = position): Span = Span(source, start, end)
+}
+
+/**
+ * Reads the digits of a whole-number literal, or `null` when the value does not fit a signed 64-bit
+ * integer.
+ *
+ * Accumulated by hand rather than through `toLongOrNull` so that an overflow is *detected* rather
+ * than thrown: the caller has a span and a diagnostic to produce, and the value is still wanted as a
+ * node so the rest of the file can be analysed.
+ *
+ * The guard is the usual one — reject before multiplying when the result would pass `Long.MAX_VALUE`
+ * — and it works on the magnitude only, because the sign of a literal is a `-` operator the parser
+ * sees and not part of this token.
+ */
+private fun parseNumberMagnitude(digits: String): Long? {
+    var accumulated = 0L
+    for (character in digits) {
+        val digit = character.digitToIntOrNull(10) ?: return null
+        if (accumulated > (Long.MAX_VALUE - digit) / 10) return null
+        accumulated = accumulated * 10 + digit
+    }
+    return accumulated
 }
 
 private fun isIdentifierStart(character: Char): Boolean =

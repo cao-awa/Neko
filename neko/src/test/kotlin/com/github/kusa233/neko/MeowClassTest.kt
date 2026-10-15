@@ -358,13 +358,160 @@ class MeowClassTest {
     @Test
     fun `the generated methods have the shapes Object declares`() {
         // The derived methods override `java.lang.Object`'s, and the JVM only accepts an override if
-        // the descriptor matches exactly — `(Ljava/lang/Object;)Z` and `()I`.
+        // the descriptor matches exactly — `(Ljava/lang/Object;)Z`, `()I` and `()Ljava/lang/String;`.
         val program = TestSupport.load(TestSupport.file("meow class Neko(val data: int) {", "}"))
         assertEquals(
             listOf("(Ljava/lang/Object;)Z"),
             methodDescriptors(program, "equals"),
         )
         assertEquals(listOf("()I"), methodDescriptors(program, "hashCode"))
+        assertEquals(listOf("()Ljava/lang/String;"), methodDescriptors(program, "toString"))
+    }
+
+    @Test
+    fun `toString prints the class name and every field in declaration order`() {
+        val program = TestSupport.load(
+            TestSupport.file(
+                "meow class Cat(val age: int, val name: string) {",
+                "}",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            println(Cat(1, \"cat-name\"))",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput { program.invoke("com.github.kusa233.test.Main", "main") }
+        assertEquals("Cat(age=1, name=\"cat-name\")\n", output)
+    }
+
+    @Test
+    fun `toString prints every primitive type the way its wrapper does`() {
+        // The `int`/`bool`/`char` and wide cases take different `append` overloads, and a `char` is
+        // the one where the wrong choice is invisible in the descriptor: `append(int)` would print
+        // `120` where `append(char)` prints `x`.
+        val program = TestSupport.load(
+            TestSupport.file(
+                "meow class All(",
+                "    val b: bool,",
+                "    val c: char,",
+                "    val y: byte,",
+                "    val s: short,",
+                "    val i: int,",
+                "    val l: long,",
+                "    val f: float,",
+                "    val d: double",
+                ") {",
+                "}",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            println(All(true, 'x', 1, 2, 3, 4L, 1.5f, 2.5))",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput { program.invoke("com.github.kusa233.test.Main", "main") }
+        assertEquals("All(b=true, c=x, y=1, s=2, i=3, l=4, f=1.5, d=2.5)\n", output)
+    }
+
+    @Test
+    fun `toString of a meow class holding no fields is just the class name`() {
+        val program = TestSupport.load(
+            TestSupport.file(
+                "meow class Empty() {",
+                "}",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            println(Empty())",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput { program.invoke("com.github.kusa233.test.Main", "main") }
+        assertEquals("Empty()\n", output)
+    }
+
+    @Test
+    fun `toString of a meow class holding another one nests`() {
+        val program = TestSupport.load(
+            TestSupport.file(
+                "meow class Owner(val name: string) {",
+                "}",
+                "",
+                "meow class Cat(val age: int, val owner: Owner) {",
+                "}",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            println(Cat(1, Owner(\"kusa\")))",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput { program.invoke("com.github.kusa233.test.Main", "main") }
+        assertEquals("Cat(age=1, owner=Owner(name=\"kusa\"))\n", output)
+    }
+
+    @Test
+    fun `toString is callable from Neko source`() {
+        // Reached through the language rather than through the JVM's own `println`, which is what
+        // proves the method is a member of the class as far as the analyzer is concerned.
+        val program = TestSupport.load(
+            TestSupport.file(
+                "meow class Cat(val age: int) {",
+                "}",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            c: Cat = Cat(3)",
+                "            println(c.toString())",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput { program.invoke("com.github.kusa233.test.Main", "main") }
+        assertEquals("Cat(age=3)\n", output)
+    }
+
+    @Test
+    fun `a hand-written toString is not replaced by the generated one`() {
+        val program = TestSupport.load(
+            TestSupport.file(
+                "meow class Neko(val data: int) {",
+                "    fun toString(): string {",
+                "        return \"mine\"",
+                "    }",
+                "}",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            println(Neko(1))",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput { program.invoke("com.github.kusa233.test.Main", "main") }
+        assertEquals("mine\n", output, "the hand-written 'toString' should be the one called")
+        assertEquals(
+            listOf("()Ljava/lang/String;"),
+            methodDescriptors(program, "toString"),
+            "only the author's 'toString' should be in the class file",
+        )
     }
 
     /** The descriptors of the methods of [className] named [name], in class-file order. */

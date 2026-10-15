@@ -66,6 +66,40 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private var currentExtractor: ExtractorTry? = null
 
     /**
+     * What the tests passed so far have proved, keyed by the declaration each fact is about.
+     *
+     * A `T?` is a value that may be absent, and every read of one has to be guarded. Writing the guard
+     * and then reading anyway is the most ordinary thing a reader does, so a test that settles the
+     * question for a region of code — `if (x != null) { x.f }` — is remembered here and the read
+     * inside that region is typed `T` rather than `T?`. This is a *narrowing*: it is a statement about
+     * this path through the program, not about the declaration, which is why the map is saved and
+     * restored around every construct that forks the flow, and why a write to the declaration drops
+     * its fact with [forgetNarrowingsOf]. Restoring is not simply putting the map back: a write inside
+     * an arm *may* have run, so [saveNarrowings] also records how many writes each key had seen and
+     * [restoreNarrowings] refuses to revive a fact that has been written since.
+     *
+     * A key is a declaration rather than a name, because a name can be shadowed and only the symbol
+     * says which value a test is about. That leaves three shapes, built by [narrowingKeyOf]: a
+     * [LocalSymbol], a [FieldSymbol] declared with `val`, and a [FieldFact] naming such a field *of*
+     * such a value — which is what lets `if (point.x != null) { point.x }` work without trusting
+     * `point` itself.
+     *
+     * A `var` *local* is a key even though it can be reassigned, because nothing outside its function
+     * can write it: dropping the fact at every write the analyzer reaches is enough on its own, and
+     * that is what lets a *parameter* be narrowed at all — every parameter reports itself mutable.
+     * A `var` *field* is not a key, because any other method could write it between the test and the
+     * read and the analyzer would never see the write.
+     *
+     * Facts are found by [factsTrue] and [factsFalse], which read a condition into what its two
+     * outcomes prove, and are consulted by the places that type a read of a stored value: the bare
+     * name in [computeType], the field read in [analyzeMemberAccess] and [staticMemberOf], and the
+     * callee of a call in [analyzeCall]. A fact about a local is about the value the lambda would
+     * capture, so a lambda body keeps the ones about *names* and drops the ones about fields, whose
+     * value it will read whenever it is called rather than when it is written.
+     */
+    private val narrowings = LinkedHashMap<Any, NekoType>()
+
+    /**
      * `true` while the callee of a `try … { … -> }` is being resolved.
      *
      * The call a `try` wraps is the one call to a raising function that is legal, so the check that
@@ -403,18 +437,18 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     }
 
     /**
-     * Declares the `equals` and `hashCode` a `meow class` gets for free.
+     * Declares the `equals`, `hashCode` and `toString` a `meow class` gets for free.
      *
-     * Neko cannot express either method — `equals` has to compare a value whose type it does not
-     * know, and neither has a body the language could write — so the code generator emits them. What
+     * Neko cannot express any of the three — `equals` has to compare a value whose type it does not
+     * know, and none has a body the language could write — so the code generator emits them. What
      * the analyzer contributes is the *signature*: without a symbol here, `a.equals(b)` would be
      * "Neko has no member named 'equals'" even though the class file has the method, and the
-     * generated pair would be unreachable from source.
+     * generated trio would be unreachable from source.
      *
-     * A hand-written `equals` or `hashCode` wins. This runs after every declared member is in place,
-     * so a body the author wrote is already known and the derived one is simply not added; the
-     * functions are keyed by name and parameter types, so "the same signature" means a real override
-     * rather than a second overload.
+     * A hand-written `equals`, `hashCode` or `toString` wins. This runs after every declared member
+     * is in place, so a body the author wrote is already known and the derived one is simply not
+     * added; the functions are keyed by name and parameter types, so "the same signature" means a
+     * real override rather than a second overload.
      */
     private fun declareDerivedFunctions(declaration: ClassDeclaration, classSymbol: ClassSymbol) {
         // A `meow interface` has already been reported and has no symbol to attach functions to: the
@@ -439,6 +473,15 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 span = declaration.nameSpan,
                 parameterTypes = emptyList(),
                 returnType = IntType,
+                enclosingClass = classSymbol,
+                declaration = null,
+                isStatic = false,
+            ),
+            FunctionSymbol(
+                name = "toString",
+                span = declaration.nameSpan,
+                parameterTypes = emptyList(),
+                returnType = StringType,
                 enclosingClass = classSymbol,
                 declaration = null,
                 isStatic = false,
@@ -583,6 +626,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
         currentFunction = symbol
         implicitThisClass = classSymbol
+        // A body starts from nothing known: facts about `val` fields do not carry in from whatever
+        // was analysed before this constructor.
+        resetNarrowings()
         pushScope(identifier = constructor)
 
         val parameterSymbols = mutableListOf<LocalSymbol>()
@@ -638,7 +684,10 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // choice, and it keeps the rule easy to state: a field initializer may only use parameters,
         // literals and calls.
         pushScope(identifier = null)
-        val valueType = analyzeExpression(initializer)
+        // The declared type is passed as the context for the same reason a variable declaration
+        // passes it: `val name: string? = null` is the whole point of the suffix, and a `null` with
+        // no context to read it in would have no type to be.
+        val valueType = analyzeExpression(initializer, declaredType)
         popScope()
 
         if (!isAssignable(valueType, declaredType)) {
@@ -666,6 +715,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // Only a non-static member has an instance to reach its instance members through.
         implicitThisClass = if (symbol.isStatic) null else classSymbol
         forwardsRaise = false
+        // A body starts from nothing known. Pending facts about `val` fields belong to whatever was
+        // analysed before this method, and none of them was proved here.
+        resetNarrowings()
         pushScope(identifier = function)
 
         for (parameter in parametersByFunction[function].orEmpty()) {
@@ -713,6 +765,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     /** Analyses a block in a fresh scope. */
     private fun analyzeBlock(block: BlockStatement) {
         pushScope(identifier = block)
+        val incoming = saveNarrowings()
         var terminated: Statement? = null
         for (statement in block.statements) {
             if (terminated != null) {
@@ -731,8 +784,35 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             }
             analyzeStatement(statement)
             if (statement.terminatesFlow()) terminated = statement
+            // A guard leaves a fact behind it: `if (x == null) { return }` is the ordinary way to
+            // say "from here on, `x` is there", and every later statement in this block is on the
+            // side of that test where it held.
+            applyFacts(factsAfterExit(statement))
         }
+        // A block is a scope for what is known as much as for what is named: a fact proved inside
+        // one is about *this* run through it, so it does not outlive the block.
+        restoreNarrowings(incoming)
         popScope()
+    }
+
+    /**
+     * The facts that hold for the code after [statement], on the readings where it did not leave.
+     *
+     * Only a guard says anything. An `if` with one arm that always returns proves the condition's
+     * opposite for whatever follows — which is the whole of what `if (x == null) { return }` is
+     * for — and an `if` whose two arms both leave is followed by nothing at all, so it says
+     * nothing. Anything else is not a guard and leaves the flow as it found it.
+     */
+    private fun factsAfterExit(statement: Statement): Map<Any, NekoType> {
+        if (statement !is IfStatement) return emptyMap()
+        val thenExits = statement.thenBranch.alwaysReturns()
+        val elseExits = statement.elseBranch?.alwaysReturns() == true
+        return when {
+            thenExits && elseExits -> emptyMap()
+            thenExits -> factsFalse(statement.condition)
+            elseExits -> factsTrue(statement.condition)
+            else -> emptyMap()
+        }
     }
 
     private fun analyzeStatement(statement: Statement) {
@@ -746,6 +826,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             is IfStatement -> analyzeIf(statement)
             is WhileStatement -> analyzeWhile(statement)
             is WhenStatement -> analyzeWhen(statement)
+            is NyaStatement -> analyzeNya(statement)
             is RaiseStatement -> analyzeRaise(statement)
             is TryStatement -> analyzeTry(statement)
             is TryCatchStatement -> analyzeTryCatch(statement)
@@ -755,7 +836,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
     /** `array[index] = value` */
     private fun analyzeIndexAssignment(statement: IndexAssignmentStatement) {
-        val arrayType = analyzeExpression(statement.array)
+        val arrayType = requireArray(analyzeExpression(statement.array), statement.array.span)
         val elementType = arrayElementType(arrayType, statement.array.span)
         analyzeIndex(statement.index, statement.indexSpan)
 
@@ -797,6 +878,26 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     }
 
     /**
+     * The array an index reads, refusing an array that may be absent.
+     *
+     * Indexing is the third way to dereference a value, and a nullable array has to be refused exactly
+     * as a nullable object is. There is no safe spelling to suggest — Neko has no `?[` form — so the
+     * reader is told what is possible instead: a nullable array has to be compared against `null`
+     * before it is indexed, or the value has to be given a non-nullable type.
+     */
+    private fun requireArray(arrayType: NekoType, span: Span): NekoType {
+        if (arrayType is NullableType) {
+            diagnostics.error(
+                "cannot index a value of type ${arrayType.displayName}, which may be null; test it " +
+                    "with '== null' before indexing it, or give the value a non-nullable type",
+                span,
+            )
+            return ErrorType
+        }
+        return arrayType
+    }
+
+    /**
      * Reports a use of `raise` in a program that does not include the standard library.
      *
      * `raise` is not a JVM operation: it lowers to throwing the library's `EarlyEmitException` and to
@@ -822,6 +923,23 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 "every directory in 'neko.libraryDirectories' to the compiler alongside the program",
             span,
         )
+    }
+
+    /**
+     * `nya condition` — checks the condition, and stops the program when it does not hold.
+     *
+     * The condition is an ordinary `bool` expression, so the only rule the analyzer adds is that it
+     * *is* one: a `nya` whose operand is not a `bool` could never fail, which means it is not a check
+     * at all and the reader wrote something other than what they meant.
+     *
+     * Everything after a `nya` runs only when its condition held, so the statement narrows exactly as
+     * a guard does — `nya h != null` makes the rest of the block a place where `h` is there. The fact
+     * is applied here rather than joined back at the end of the block because the statement cannot
+     * fail and continue: control reaches the next statement only on the reading where it held.
+     */
+    private fun analyzeNya(statement: NyaStatement) {
+        requireBool(analyzeExpression(statement.condition), statement.condition.span, "nya")
+        applyFacts(factsTrue(statement.condition))
     }
 
     /**
@@ -1255,6 +1373,10 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         }
 
         val valueType = analyzeExpression(statement.value, resolved.type)
+        // The write lands after the value is read, so the value may still lean on the old fact — but
+        // from here on the name holds something else, and what was proved about the old value says
+        // nothing about the new one.
+        forgetNarrowingsOf(resolved)
         if (!isAssignable(valueType, resolved.type)) {
             diagnostics.error(
                 "cannot assign a value of type ${valueType.displayName} to '${resolved.name}' of " +
@@ -1318,6 +1440,19 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
         if (receiverType.isError) {
             analyzeExpression(statement.value)
+            return
+        }
+        // Writing a field dereferences the receiver just as reading one does, and there is no safe
+        // spelling of it: `?.` guards a *read*, so it cannot be suggested here. A test is the one
+        // thing that does help, and narrowing is what makes it help.
+        if (receiverType is NullableType) {
+            analyzeExpression(statement.value)
+            diagnostics.error(
+                "cannot assign to member '${target.memberName}' on a value of type " +
+                    "${receiverType.displayName}, which may be null; there is no safe spelling of " +
+                    "a write, so test it with '!= null' first",
+                target.memberSpan,
+            )
             return
         }
         if (receiverType !is ClassType) {
@@ -1398,6 +1533,10 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         }
 
         val valueType = analyzeExpression(statement.value, field.type)
+        // The field holds something new from here on, so every fact about it — the one about the
+        // field itself and the ones about it reached through particular values — is now about a
+        // value that is gone.
+        forgetNarrowingsOfField(field)
         if (!isAssignable(valueType, field.type)) {
             diagnostics.error(
                 "cannot assign a value of type ${valueType.displayName} to '${field.name}' of " +
@@ -1531,9 +1670,17 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             if (expected == null) {
                 lambda.expectedReturnType = valueType // The first `yield` fixes the result type.
             } else if (!isAssignable(valueType, expected)) {
+                // The type being violated may come from an earlier `yield` or from the function type
+                // the lambda is being used as, and the two are worth telling apart: one is a
+                // disagreement inside this lambda, the other a disagreement with its destination.
                 diagnostics.error(
-                    "this 'yield' produces ${valueType.displayName} but an earlier 'yield' in the " +
-                        "same lambda produces ${expected.displayName}",
+                    if (lambda.returnTypeIsDeclared) {
+                        "this 'yield' produces ${valueType.displayName} but the function type this " +
+                            "lambda is used as returns ${expected.displayName}"
+                    } else {
+                        "this 'yield' produces ${valueType.displayName} but an earlier 'yield' in " +
+                            "the same lambda produces ${expected.displayName}"
+                    },
                     statement.value.span,
                 )
             }
@@ -1542,13 +1689,30 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
     private fun analyzeIf(statement: IfStatement) {
         requireBool(analyzeExpression(statement.condition), statement.condition.span, "if")
+        val incoming = saveNarrowings()
+        // Each arm is analysed with what the condition proves *for that arm*, and the facts are put
+        // back afterwards: an `if` may add to what is known inside its arms, never outside them, so
+        // nothing is known after the `if` unless an arm left the flow (see [factsAfterExit]).
+        applyFacts(factsTrue(statement.condition))
         analyzeStatement(statement.thenBranch)
-        statement.elseBranch?.let { analyzeStatement(it) }
+        restoreNarrowings(incoming)
+        statement.elseBranch?.let {
+            applyFacts(factsFalse(statement.condition))
+            analyzeStatement(it)
+            restoreNarrowings(incoming)
+        }
     }
 
     private fun analyzeWhile(statement: WhileStatement) {
         requireBool(analyzeExpression(statement.condition), statement.condition.span, "while")
+        // The body runs only while the condition holds, so it may lean on the test — but the loop
+        // may also leave through its own condition having failed, and a `var` written in the body
+        // must not keep a fact proved before the loop, so the facts are dropped at the end rather
+        // than joined back in.
+        val incoming = saveNarrowings()
+        applyFacts(factsTrue(statement.condition))
         analyzeStatement(statement.body)
+        restoreNarrowings(incoming)
     }
 
     /**
@@ -1745,8 +1909,19 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * that know nothing of each other. A class the analyzer cannot see — one from another file or
      * from the platform — falls back to the type-level rule.
      */
-    private fun isAssignable(actual: NekoType, expected: NekoType): Boolean =
-        actual.isAssignableTo(expected) || isSubtype(actual, expected)
+    private fun isAssignable(actual: NekoType, expected: NekoType): Boolean {
+        if (actual.isAssignableTo(expected)) return true
+        // A nullable value never fits a non-nullable type. That direction is the whole point of the
+        // suffix, so it is refused before the class hierarchy is consulted — otherwise a declared
+        // subtype would let `Cat?` through where a `Cat` is expected.
+        if (actual is NullableType && expected !is NullableType) return false
+        // Both sides non-nullable, or both nullable: the *inner* types decide, because a declared
+        // subtype fits its supertype for a reason that lives in the class symbols rather than in the
+        // two types. That is what makes `Square` assignable to `Shape?`.
+        val source = if (actual is NullableType) actual.inner else actual
+        val target = if (expected is NullableType) expected.inner else expected
+        return isSubtype(source, target)
+    }
 
     private fun requireBool(type: NekoType, span: Span, construct: String) {
         if (type.isError || type == BoolType) return
@@ -1772,19 +1947,247 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     }
 
     private fun computeType(expression: Expression, expectedType: NekoType?): NekoType = when (expression) {
-        is IntegerLiteral -> IntType
+        is IntegerLiteral -> analyzeIntegerLiteral(expression, expectedType)
+        is DoubleLiteral -> analyzeDoubleLiteral(expression, expectedType)
+        is CharLiteral -> analyzeCharLiteral(expression, expectedType)
         is StringLiteral -> StringType
         is BoolLiteral -> BoolType
-        is NameExpression -> resolveName(expression)?.type ?: ErrorType
+        is NullLiteral -> analyzeNullLiteral(expression, expectedType)
+        is NameExpression -> readTypeOf(resolveName(expression))
         is ThisExpression -> analyzeThis(expression)
-        is BinaryExpression -> analyzeBinary(expression)
+        is BinaryExpression -> analyzeBinary(expression, expectedType)
         is ChainedComparisonExpression -> analyzeChainedComparison(expression)
-        is UnaryExpression -> analyzeUnary(expression)
+        is UnaryExpression -> analyzeUnary(expression, expectedType)
         is CallExpression -> analyzeCall(expression, expectedType)
         is LambdaExpression -> analyzeLambda(expression, expectedType)
         is MemberAccessExpression -> analyzeMemberAccess(expression)
         is IndexExpression -> analyzeIndexRead(expression)
         is TryExpression -> analyzeTryExpression(expression)
+    }
+
+    // ------------------------------------------------------------------ literals
+
+    /**
+     * The type of `null`, which is whichever nullable type its context asks for.
+     *
+     * `null` is the one expression in the language that is not a value *of* a type: it is the absence
+     * of one, and the only thing that says which type it is absent *from* is the place it is written.
+     * So `x: string? = null` types the literal `string?`, `list.add(null)` types it by the parameter,
+     * and a `null` with no context — `println(null)`'s argument is a context, but a bare `null` in an
+     * arithmetic expression is not — has no type to be and is refused.
+     *
+     * Asking for a non-nullable type is refused too, and this is the check that carries the whole
+     * feature: `x: string = null` is an error at the assignment rather than a `NullPointerException`
+     * at the first use of `x`, which is the entire reason the `?` suffix exists.
+     */
+    private fun analyzeNullLiteral(expression: NullLiteral, expectedType: NekoType?): NekoType {
+        if (expectedType != null && !expectedType.isError && expectedType is NullableType) {
+            return expectedType
+        }
+        diagnostics.error(
+            "'null' may only be used where a nullable type is expected, but " +
+                if (expectedType == null || expectedType.isError) {
+                    "nothing here says what type it should be absent from; give the expression a " +
+                        "name of a nullable type, or compare it against a value that has one"
+                } else {
+                    "${expectedType.displayName} is not one; write ${expectedType.displayName}? to " +
+                        "allow the value to be absent, or assign a real value"
+                },
+            expression.span,
+        )
+        return ErrorType
+    }
+
+    /**
+     * The type of a whole-number literal: the one its context asks for, or `int`.
+     *
+     * This is the *whole* of Neko's implicit conversion, and it is deliberately confined to literals.
+     * A literal is the one expression that names a value without belonging to a type yet, so
+     * `x: byte = 1` and `x: long = 1` can both mean what they look like. A variable is not: its type
+     * is already decided, so `x: long = someInt` stays an error. Java would widen that `int` silently;
+     * Neko does not, because a rule that reads "a value keeps its type" is one a reader can apply
+     * without holding a table of which conversions are allowed in which direction.
+     *
+     * A literal that does not fit the type its context asks for is reported rather than narrowed:
+     * `x: byte = 300` is a mistake about the value, and saying so where the value is written is more
+     * use than saying the types disagree.
+     */
+    private fun analyzeIntegerLiteral(expression: IntegerLiteral, expectedType: NekoType?): NekoType {
+        if (expression.isLong) {
+            // `1L` names the 64-bit type outright, so a context cannot narrow it back: `x: int = 1L` is
+            // a disagreement about types rather than about a value that happens not to fit. Answering
+            // `ErrorType` is what keeps it to one diagnostic — the suffix is the whole story, and
+            // "cannot assign a long to an int" would only be the same sentence in other words.
+            // `long?` is a context a long literal fits: the suffix decides the *type*, and the
+            // wrapper only adds permission for the value to be absent, so the question is about the
+            // type underneath it.
+            val context = expectedType?.unwrapNullable()
+            if (context != null && !context.isError && context != LongType) {
+                reportOnce(expression) {
+                    "the 'L' suffix makes this literal a long, which cannot be used where " +
+                        "${context.displayName} is expected; write ${expression.signedText} " +
+                        "without the 'L' to make it a ${context.displayName}"
+                }
+                return ErrorType
+            }
+            return LongType
+        }
+        return expectedType.toLiteralIntType(expression)
+    }
+
+    /**
+     * How an untyped whole-number literal is read where [expected] is expected.
+     *
+     * The answer is always the requested type or `int`, and a literal that cannot be read as the
+     * requested type answers `int` — which is the type it has on its own — after its own diagnostic.
+     * That is deliberate: the mistake is that the *value* does not fit, and saying so once is more use
+     * than also claiming that an `int` cannot be stored in a `long`.
+     */
+    private fun NekoType?.toLiteralIntType(literal: IntegerLiteral): NekoType {
+        // What the context asks for is the type *underneath* any `?`: `x: byte? = 1` gives the
+        // literal the same byte it would have without the suffix, and only then has its value
+        // permission to be absent. Boxing it into the wrapper is code generation's business.
+        val target = this?.unwrapNullable()
+        if (target == null || target.isError || !target.isNumeric) return IntType
+
+        if (target == FloatType || target == DoubleType) {
+            // A whole number in a fractional context names a *different* value: `x: double = 1` would
+            // need `1.0`, because nothing here converts 1 to 1.0 on the author's behalf.
+            reportOnce(literal) {
+                "the whole-number literal ${literal.signedText} has type int, which cannot be used " +
+                    "where ${target.displayName} is expected; write ${literal.signedText}.0 to make " +
+                    "it a ${target.displayName}, or give the expression a name of the type you want"
+            }
+            return ErrorType
+        }
+
+        if (target.integralRange()?.contains(literal.signedValue) == true) return target
+        reportLiteralOutOfRange(literal, target)
+        return ErrorType
+    }
+
+    /**
+     * Says that a written number does not fit the type the surrounding context gives it.
+     *
+     * The message names the whole range rather than only the maximum, because half of these mistakes
+     * are about the *low* end — `x: char = -1`, or a `byte` below -128 — and a reader who is told only
+     * the maximum has to work out the rest.
+     */
+    private fun reportLiteralOutOfRange(literal: IntegerLiteral, target: NekoType) {
+        val range = target.integralRange() ?: return
+        reportOnce(literal) {
+            "integer literal ${literal.signedText} does not fit in '${target.displayName}', whose " +
+                "range is ${range.first}..${range.last}; ${widerTypeHint(target)}"
+        }
+    }
+
+    /**
+     * Reports [message] at [literal] the first time it is asked to, and silently after that.
+     *
+     * Analysis reaches one expression more than once — a field's initializer is analysed when its
+     * signature is resolved and again when its class' body is — and a diagnostic about a *literal* is
+     * a fact about that literal, not about the visit. Reporting it per visit would print the same
+     * sentence twice for one mistake, which reads as two mistakes.
+     */
+    private inline fun reportOnce(literal: IntegerLiteral, message: () -> String) {
+        if (literal.isOutOfRange) return
+        literal.isOutOfRange = true
+        diagnostics.error(message(), literal.span)
+    }
+
+    /** The second half of [reportLiteralOutOfRange]: what to write instead. */
+    private fun widerTypeHint(target: NekoType): String = when (target) {
+        ByteType -> "write 'short' or a wider type, or a value in range"
+        ShortType, CharType -> "write 'int' or a wider type, or a value in range"
+        IntType -> "write 'long' for a wider whole number, or a value in range"
+        else -> "write a value in range"
+    }
+
+    /**
+     * The type of a fractional literal: `float` when the source asked for one with `f`/`F`, and
+     * `double` otherwise.
+     *
+     * There is no contextual conversion for these beyond that suffix. `1.5` is a `double` and a
+     * `float` is a *narrower* type than it, so `x: float = 1.5` would need a narrowing conversion
+     * Java also refuses without a cast — and Neko has no cast. Writing `1.5f` says which one is meant
+     * and costs one character.
+     */
+    private fun analyzeDoubleLiteral(expression: DoubleLiteral, expectedType: NekoType?): NekoType {
+        val type = if (expression.isFloat) FloatType else DoubleType
+        // A `double?` is still a context where a `double` literal belongs; only the type underneath
+        // the `?` can disagree with the literal's own.
+        val context = expectedType?.unwrapNullable()
+        if (context != null && !context.isError && context != type &&
+            !expression.isTypeReported
+        ) {
+            expression.isTypeReported = true
+            val text = expression.span.text
+            diagnostics.error(
+                "the floating-point literal $text has type ${type.displayName}, which cannot be " +
+                    "used where ${context.displayName} is expected; write " +
+                    (if (context == FloatType) {
+                        "${text}f to make it a float"
+                    } else {
+                        "the literal without its 'f' suffix to make it a double"
+                    }) + ", or convert the value explicitly",
+                expression.span,
+            )
+            // `ErrorType` because the mistake has been named: the *suffix* is what is wrong, and
+            // following it with "cannot assign a double to a float" would describe the same one
+            // mistake twice, the second time less usefully.
+            return ErrorType
+        }
+        return type
+    }
+
+    /**
+     * The type of a character literal: `char`, or the integral type its context asks for when the
+     * character's code point fits.
+     *
+     * `x: int = 'a'` works for the same reason `x: byte = 1` does — `'a'` is a number written in
+     * quotes — and it is the spelling a program needs in order to compare a character against an
+     * arithmetic result.
+     */
+    private fun analyzeCharLiteral(expression: CharLiteral, expectedType: NekoType?): NekoType {
+        val code = expression.value.code.toLong()
+        // The `?` is not the question: `x: int? = 'a'` asks for an `int` that may be absent, and the
+        // character's code point fits one.
+        val context = expectedType?.unwrapNullable()
+        val requested = context.takeIf { it != null && !it.isError && it != CharType }
+        if (requested != null && requested.isNumeric && requested.integralRange()?.contains(code) == true) {
+            return requested
+        }
+        return CharType
+    }
+
+    /**
+     * How an untyped whole-number literal is read where [expected] is expected.
+     *
+     * The answer is always the expected type or `int`, and never a third thing: a literal that does
+     * not fit is still an `int` literal, and the fact that its *value* is out of range is recorded on
+     * the node so the single caller that reports it can name the type that was asked for. Returning a
+     * "narrowed but overflowing" type instead would make the diagnostic claim a `byte` literal exists
+     * that cannot be stored in a `byte`.
+     */
+    private fun NekoType?.toLiteralIntType(magnitude: Long, literal: IntegerLiteral): NekoType {
+        // As in the single-argument overload: the type underneath a `?` is what a literal is read as.
+        val target = this?.unwrapNullable()
+        if (target == null || target.isError || !target.isNumeric) return IntType
+        if (target == FloatType || target == DoubleType) {
+            // A whole number in a fractional context is a *different* value: `x: double = 1` would
+            // need `1.0`, because nothing here converts 1 to 1.0 on the author's behalf.
+            diagnostics.error(
+                "the whole-number literal ${literal.span.text} has type int, which cannot be used " +
+                    "where ${target.displayName} is expected; write ${literal.span.text}.0 to make " +
+                    "it a ${target.displayName}",
+                literal.span,
+            )
+            return IntType
+        }
+        if (target == CharType || target.integralRange()?.contains(magnitude) == true) return target
+        literal.isOutOfRange = true
+        literal.outOfRangeType = target
+        return IntType
     }
 
     /**
@@ -1826,7 +2229,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * contents, which is what the standard library's extractors need in order to unpack a `raise`.
      */
     private fun analyzeIndexRead(expression: IndexExpression): NekoType {
-        val arrayType = analyzeExpression(expression.array)
+        val arrayType = requireArray(analyzeExpression(expression.array), expression.array.span)
         val element = arrayElementType(arrayType, expression.array.span)
         analyzeIndex(expression.index, expression.indexSpan)
         return element ?: ErrorType
@@ -1836,10 +2239,19 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * `a > b > c`, which means `a > b && b > c`.
      *
      * Every operator in the chain is relational, so every operand between two operators participates
-     * in two comparisons and must be an int; only the result is a bool.
+     * in two comparisons and must have the same numeric type as its neighbour it shares with the next
+     * one; only the result is a bool.
+     *
+     * Each operand after the first is analysed in the type of the one before it, for the reason every
+     * other context does it: `b > 2 > 1` on a `byte` is a chain of `byte` comparisons, so both of
+     * those literals are `byte`s. A *value* of another type is not converted by that, which is what
+     * keeps `i > l > 1` an error.
      */
     private fun analyzeChainedComparison(expression: ChainedComparisonExpression): NekoType {
-        val operandTypes = expression.operands.map { analyzeExpression(it) }
+        val operandTypes = mutableListOf<NekoType>()
+        for ((index, operand) in expression.operands.withIndex()) {
+            operandTypes += analyzeExpression(operand, operandTypes.getOrNull(index - 1))
+        }
         var invalid = false
 
         for ((index, type) in operandTypes.withIndex()) {
@@ -1847,12 +2259,31 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 invalid = true
                 continue
             }
-            if (type != IntType) {
+            if (!type.isNumeric) {
                 invalid = true
                 diagnostics.error(
-                    "a chained comparison compares int values but operand ${index + 1} here has " +
+                    "a chained comparison compares numeric values but operand ${index + 1} here has " +
                         "type ${type.displayName}",
                     expression.operands[index].span,
+                )
+            }
+        }
+
+        // The neighbouring pairs, which the chain is built from: `a > b > c` is two comparisons and
+        // the operand in the middle takes part in both. A pair whose second operand was read as the
+        // first one's type cannot disagree, so anything reported here is a named type that the chain
+        // wanted to convert and will not.
+        for (index in expression.operators.indices) {
+            val left = operandTypes[index]
+            val right = operandTypes[index + 1]
+            if (left.isError || right.isError) continue
+            if (!left.isNumeric || !right.isNumeric) continue
+            if (left != right) {
+                invalid = true
+                diagnostics.error(
+                    "a chained comparison compares values of one type, but operand ${index + 1} has " +
+                        "type ${left.displayName} and operand ${index + 2} has type ${right.displayName}",
+                    expression.operands[index + 1].span,
                 )
             }
         }
@@ -1860,18 +2291,32 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         return if (invalid) ErrorType else BoolType
     }
 
-    private fun analyzeUnary(expression: UnaryExpression): NekoType {
-        val operand = analyzeExpression(expression.operand)
+    private fun analyzeUnary(expression: UnaryExpression, expectedType: NekoType?): NekoType {
+        val operandExpression = expression.operand
+        // `-128` is a single value, not a negation applied to 128, and the difference is visible: 128
+        // does not fit in a `byte` and -128 does. A whole-number literal that a `-` precedes is
+        // therefore checked against the *negated* value, which is the one the reader wrote.
+        val negatedLiteral = operandExpression as? IntegerLiteral
+        val literalUnderMinus = if (expression.operator == UnaryOperator.NEGATE) negatedLiteral else null
+        val operand = if (literalUnderMinus != null) {
+            analyseLiteralWithSign(literalUnderMinus, expectedType)
+        } else {
+            analyzeExpression(operandExpression, expectedType)
+        }
+
         return when (expression.operator) {
             UnaryOperator.NEGATE -> {
-                if (!operand.isError && operand != IntType) {
+                if (!operand.isError && !operand.isNumeric) {
                     diagnostics.error(
-                        "unary '-' requires an int operand but this expression has type " +
+                        "unary '-' requires a numeric operand but this expression has type " +
                             operand.displayName,
-                        expression.operand.span,
+                        operandExpression.span,
                     )
+                    return ErrorType
                 }
-                IntType
+                // The result keeps the operand's own type: `-1L` is a long and `-1.5f` a float, so a
+                // negated value can be used wherever an unnegated one could.
+                operand
             }
 
             UnaryOperator.NOT -> {
@@ -1879,80 +2324,201 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                     diagnostics.error(
                         "unary '!' requires a bool operand but this expression has type " +
                             operand.displayName,
-                        expression.operand.span,
+                        operandExpression.span,
                     )
                 }
-                BoolType
-            }
-        }
-    }
-
-    private fun analyzeBinary(expression: BinaryExpression): NekoType {
-        val left = analyzeExpression(expression.left)
-        val right = analyzeExpression(expression.right)
-        val operator = expression.operator
-
-        if (left.isError || right.isError) return ErrorType
-
-        return when (operator) {
-            BinaryOperator.SUBTRACT, BinaryOperator.MULTIPLY,
-            BinaryOperator.DIVIDE, BinaryOperator.REMAINDER,
-            -> {
-                requireInt(left, expression.left, operator)
-                requireInt(right, expression.right, operator)
-                IntType
-            }
-
-            BinaryOperator.ADD -> when {
-                left == StringType && right == StringType -> StringType
-                else -> {
-                    requireInt(left, expression.left, operator)
-                    requireInt(right, expression.right, operator)
-                    IntType
-                }
-            }
-            BinaryOperator.EQUAL, BinaryOperator.NOT_EQUAL -> {
-                if (!left.isAssignableTo(right) && !right.isAssignableTo(left)) {
-                    diagnostics.error(
-                        "cannot compare a value of type ${left.displayName} with one of type " +
-                            right.displayName,
-                        expression.operatorSpan,
-                    )
-                    ErrorType
-                } else {
-                    BoolType
-                }
-            }
-
-            BinaryOperator.LESS, BinaryOperator.LESS_EQUAL,
-            BinaryOperator.GREATER, BinaryOperator.GREATER_EQUAL,
-            -> {
-                requireInt(left, expression.left, operator)
-                requireInt(right, expression.right, operator)
-                BoolType
-            }
-
-            BinaryOperator.AND, BinaryOperator.OR -> {
-                requireBoolOperand(left, expression.left, operator)
-                requireBoolOperand(right, expression.right, operator)
+                // What `!` proves is read from the *condition* by [factsTrue] and [factsFalse],
+                // which undo the negation where it stands. Nothing is applied here: `!x` is a value
+                // like any other, and a fact recorded while typing one would outlive the test it
+                // came from.
                 BoolType
             }
         }
     }
 
     /**
-     * Reports an operand of the wrong type, anchored at the operand itself.
+     * Types the literal under a `-` as the negated value the source actually names.
      *
-     * The operand is passed as an [Expression] rather than as a bare [Span] so that the diagnostic
-     * cannot accidentally be pointed at the wrong sub-expression.
+     * A `1L` under the minus keeps its suffix, and the literal's resolved type is what the emitter
+     * reads, so recording the sign on the node is also what makes `-1L` compile to `-1L` rather than to
+     * a negation the language never wrote.
      */
-    private fun requireInt(type: NekoType, operand: Expression, operator: BinaryOperator) {
-        if (type.isError || type == IntType) return
-        diagnostics.error(
-            "operator '${operator.display}' requires int operands but this operand has type " +
-                type.displayName,
-            operand.span,
-        )
+    private fun analyseLiteralWithSign(literal: IntegerLiteral, expectedType: NekoType?): NekoType {
+        literal.isNegated = true
+        return analyzeIntegerLiteral(literal, expectedType)
+    }
+
+    /**
+     * The type of `left operator right`.
+     *
+     * ### Neko has no numeric promotion
+     *
+     * Java's rule is that `int + long` is a `long`: the narrower operand is widened, silently, before
+     * the operation. Neko does not do that, and this is where the decision lives. Two operands must
+     * have the *same* numeric type, and the result is that type — `long + long` is a `long`,
+     * `float * float` is a `float`, and `int + long` is an error, exactly as `int + string` already
+     * is. That is a deliberate departure from Java, not an omission: this language's rule everywhere
+     * else is that a named type is what it says, and a table of widenings is a second rule to learn
+     * on top of it. A program that wants one type says so with a literal — `x: long = 1` — which is
+     * where the conversion is visible in the source.
+     *
+     * [expectedType] is passed down to the operands, which is the one thing that makes
+     * `x: long = 1 + 2` work: both literals are read as `long`, so the operation is `long + long`.
+     */
+    private fun analyzeBinary(expression: BinaryExpression, expectedType: NekoType?): NekoType {
+        val operator = expression.operator
+
+        // `&&` and `||` short-circuit, so their operands are booleans rather than numbers and the
+        // context of the whole expression says nothing about either of them.
+        if (operator == BinaryOperator.AND || operator == BinaryOperator.OR) {
+            val left = analyzeExpression(expression.left)
+            // Short-circuiting is what makes a fact available on the right, and *which* fact is what
+            // the operator decides: `&&` reaches its second operand only when the first held, while
+            // `||` reaches it only when the first did not. So `x == null || x.f` knows `x` is there,
+            // for the same reason `x != null && x.f` does.
+            val incoming = saveNarrowings()
+            applyFacts(if (operator == BinaryOperator.AND) factsTrue(expression.left) else factsFalse(expression.left))
+            val right = analyzeExpression(expression.right)
+            restoreNarrowings(incoming)
+            if (left.isError || right.isError) return ErrorType
+            requireBoolOperand(left, expression.left, operator)
+            requireBoolOperand(right, expression.right, operator)
+            return BoolType
+        }
+
+        // `x == null` reads the `null` in the type of the *other* operand, whichever side it is
+        // written on: the literal is the only expression that cannot say what type it is absent from,
+        // so `null == x` has to be as legal as `x == null` and mean the same thing.
+        if (operator == BinaryOperator.EQUAL || operator == BinaryOperator.NOT_EQUAL) {
+            val literal = when {
+                expression.left is NullLiteral -> expression.left to expression.right
+                expression.right is NullLiteral -> expression.right to expression.left
+                else -> null
+            }
+            if (literal != null) {
+                val (nullSide, other) = literal
+                val otherType = analyzeExpression(other, expectedType)
+                if (otherType.isError) return ErrorType
+                // The question is only worth asking of a value that can be absent. A non-nullable one
+                // has an answer known at compile time, so it is reported here with the reason rather
+                // than with the general "where a nullable type is expected" advice, which would tell
+                // the reader to fix the wrong expression. The *declared* type is what decides, not the
+                // type this read happens to have: a value already narrowed to `Cat` is still a `Cat?`
+                // that a second test may legitimately ask about.
+                val declared = declaredTypeOf(other)
+                if (declared !is NullableType) {
+                    diagnostics.error(
+                        "${other.span.text} has type ${declared.displayName}, which is not " +
+                            "nullable, so it can never be null; write ${declared.displayName}? for " +
+                            "the value to be able to be absent",
+                        expression.operatorSpan,
+                    )
+                    return ErrorType
+                }
+                analyzeExpression(nullSide, declared)
+                return BoolType
+            }
+        }
+
+        val left = analyzeExpression(expression.left, expectedType)
+        // The right operand is read in the *left* operand's type, which is the same rule the
+        // declaration gave the whole expression one level up: it is what lets `b == 1` read the `1` as
+        // a `byte` — the only type that comparison could be about — while leaving `aInt + aLong` an
+        // error, because a `long` has a type of its own and no context can take it away.
+        val right = analyzeExpression(expression.right, left)
+
+        if (left.isError || right.isError) return ErrorType
+
+        return when (operator) {
+            BinaryOperator.SUBTRACT, BinaryOperator.MULTIPLY,
+            BinaryOperator.DIVIDE, BinaryOperator.REMAINDER,
+            -> requireSameNumericType(left, right, expression, operator)
+
+            BinaryOperator.ADD -> when {
+                left == StringType && right == StringType -> StringType
+                else -> requireSameNumericType(left, right, expression, operator)
+            }
+
+            BinaryOperator.EQUAL, BinaryOperator.NOT_EQUAL -> compareTypes(left, right, expression)
+
+            BinaryOperator.LESS, BinaryOperator.LESS_EQUAL,
+            BinaryOperator.GREATER, BinaryOperator.GREATER_EQUAL,
+            -> requireSameNumericType(left, right, expression, operator)
+
+            BinaryOperator.AND, BinaryOperator.OR -> error("handled above")
+        }
+    }
+
+    /**
+     * Checks that `==` or `!=` can be asked of [left] and [right], and answers the `bool` it is worth.
+     *
+     * The test is assignability in *either* direction, which is what makes `a == b` work when one side
+     * is the other's supertype: a `Cat` and an `Animal` can be compared because a `Cat` is an
+     * `Animal`, and two unrelated classes cannot because nothing says what comparing them would mean.
+     * A nullable type accepts its own inner type in one of those directions, so `x == 1` on an `int?`
+     * passes for the same reason.
+     *
+     * [isAssignable] rather than the two types' own rule, so that a *declared* subtype counts: an
+     * interface and the class implementing it are comparable, and only the class symbols know that.
+     * Either direction alone would be wrong — `Cat? == Cat()` has to be a legal question.
+     */
+    private fun compareTypes(left: NekoType, right: NekoType, expression: BinaryExpression): NekoType {
+        if (!isAssignable(left, right) && !isAssignable(right, left)) {
+            diagnostics.error(
+                "cannot compare a value of type ${left.displayName} with one of type " +
+                    right.displayName,
+                expression.operatorSpan,
+            )
+            return ErrorType
+        }
+        return BoolType
+    }
+
+    /**
+     * Checks an arithmetic or relational expression's two operands and answers their shared type.
+     *
+     * Both operands have to be numeric and to be the *same* numeric type; the result is that type —
+     * except for a relational operator, whose result is the `bool` the answer actually is. See
+     * [analyzeBinary] for why mixing is refused rather than promoted.
+     *
+     * The mismatched operand is the one reported, so `1 + 2L` points at `2L` and not at the `+`. Both
+     * messages keep the phrase "int operands" that the language used when `int` was the only numeric
+     * type, because a reader who has learned that `int + string` is rejected should recognise
+     * `bool > bool` being rejected beside it.
+     */
+    private fun requireSameNumericType(
+        left: NekoType,
+        right: NekoType,
+        expression: BinaryExpression,
+        operator: BinaryOperator,
+    ): NekoType {
+        if (!left.isNumeric) {
+            diagnostics.error(
+                "operator '${operator.display}' requires int operands but this operand has type " +
+                    left.displayName,
+                expression.left.span,
+            )
+            return ErrorType
+        }
+        if (!right.isNumeric) {
+            diagnostics.error(
+                "operator '${operator.display}' requires int operands but this operand has type " +
+                    right.displayName,
+                expression.right.span,
+            )
+            return ErrorType
+        }
+        if (left != right) {
+            diagnostics.error(
+                "operator '${operator.display}' requires operands of the same numeric type, but " +
+                    "this one has type ${right.displayName} where ${left.displayName} is expected; " +
+                    "Neko does not convert between numeric types, so write a ${left.displayName} " +
+                    "value or use a ${right.displayName} on both sides",
+                expression.right.span,
+            )
+            return ErrorType
+        }
+        return if (operator.isRelational) BoolType else left
     }
 
     private fun requireBoolOperand(type: NekoType, operand: Expression, operator: BinaryOperator) {
@@ -1987,6 +2553,14 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 // receiver to invoke it on. Reporting it here keeps the two spellings consistent.
                 checkMemberReachable(selected, callee.span)
                 checkCallableNormally(selected, callee.span)
+                // A declared function is resolved by name, so there is no value that could be absent.
+                if (expression.isSafeCall) {
+                    reportRedundantSafeCall(
+                        callee.span,
+                        "'${callee.name}' is a declared function, so it is never null",
+                        "${callee.name}(…)",
+                    )
+                }
                 return selected.returnType
             }
 
@@ -2010,6 +2584,15 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
             // A capitalized name that is not a function constructs a class: `CustomException()`.
             if (callee.name.firstOrNull()?.isUpperCase() == true) {
+                // A class name is not a value either: `Cls?()` would be a construction that always
+                // happens, spelled as if it might not.
+                if (expression.isSafeCall) {
+                    reportRedundantSafeCall(
+                        callee.span,
+                        "$callee.name is a class name, so constructing it is never null",
+                        "${callee.name}(…)",
+                    )
+                }
                 return analyzeConstruction(expression, callee)
             }
 
@@ -2025,10 +2608,18 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             callee.resolution = value
             // The callee is a *value* of function type, so code generation has to know its type to
             // pick the interface to `invokeinterface` on. Analysing it as an expression would record
-            // this too, but the name was already resolved by hand above.
-            callee.resolvedType = value.type
+            // this too, but the name was already resolved by hand above. A narrowed read is what makes
+            // `if (f != null) f(1)` call without the question mark: the test proved `f` is there, so
+            // the call is as safe as one on a plain function.
+            val valueType = readTypeOf(value)
+            callee.resolvedType = valueType
             checkMemberReachable(value, callee.span)
-            return callFunctionValue(expression, value.type, value.name)
+            return callFunctionValue(
+                expression = expression,
+                calleeType = valueType,
+                calleeName = value.name,
+                safeCall = expression.isSafeCall,
+            )
         }
 
         if (callee is MemberAccessExpression) {
@@ -2041,7 +2632,12 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             for (argument in expression.arguments) analyzeExpression(argument)
             return ErrorType
         }
-        return callFunctionValue(expression, calleeType, callee.span.text)
+        return callFunctionValue(
+            expression = expression,
+            calleeType = calleeType,
+            calleeName = callee.span.text,
+            safeCall = expression.isSafeCall,
+        )
     }
 
     /**
@@ -2056,6 +2652,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         val className = (callee.receiver as? NameExpression)?.name
         val namedClass = className?.let { classes[it] }
         if (namedClass != null) {
+            if (callee.isSafeCall) reportSafeCallOnClassName(callee.memberSpan, className)
             callee.receiverIsClass = true
             callee.receiver.resolvedType = ClassType(namedClass.jvmInternalName, namedClass.name)
             return resolveMemberCall(expression, callee, namedClass, className, viaClass = true)
@@ -2067,7 +2664,12 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             for (argument in expression.arguments) analyzeExpression(argument)
             return ErrorType
         }
-        if (receiverType !is ClassType) {
+
+        // As for a field read: `?.` is the licence to call into a nullable receiver, and the call's
+        // own value becomes nullable because it may not have happened at all.
+        val safe = callee.isSafeCall
+        val present = receiverType.unwrapNullable()
+        if (present !is ClassType) {
             for (argument in expression.arguments) analyzeExpression(argument)
             diagnostics.error(
                 "cannot call member '${callee.memberName}' on a value of type " +
@@ -2076,18 +2678,31 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             )
             return ErrorType
         }
+        if (receiverType is NullableType && !safe) {
+            for (argument in expression.arguments) analyzeExpression(argument)
+            val arguments = expression.arguments.joinToString(", ") { it.span.text }
+            reportUnsafeDereference(
+                "cannot call member '${callee.memberName}' on a value of type " +
+                    receiverType.displayName,
+                safeCallAdvice(callee.receiver.span.text, callee.memberName, "($arguments)"),
+                callee.memberSpan,
+            )
+            return ErrorType
+        }
 
-        val classSymbol = classOf(receiverType)
+        val classSymbol = classOf(present)
         if (classSymbol == null) {
             for (argument in expression.arguments) analyzeExpression(argument)
             diagnostics.error(
-                "cannot call '${callee.memberName}': ${receiverType.displayName} is not declared " +
+                "cannot call '${callee.memberName}': ${present.displayName} is not declared " +
                     "in this file, so its members cannot be checked",
                 callee.memberSpan,
             )
             return ErrorType
         }
-        return resolveMemberCall(expression, callee, classSymbol, receiverType.displayName, viaClass = false)
+        val returned =
+            resolveMemberCall(expression, callee, classSymbol, present.displayName, viaClass = false)
+        return if (safe) nullableResultOf(returned) else returned
     }
 
     /**
@@ -2154,6 +2769,20 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // A static call needs no receiver; an instance one does, and it must be evaluated once.
         if (!candidate.isStatic) expression.instanceReceiver = callee.receiver
         expression.instanceMethod = candidate
+
+        // `obj.f?()` — a member function is resolved by name, so unlike a function *value* there is
+        // nothing that could be absent. The `?` after the member would quietly mean the same as no
+        // `?` at all, so it is reported rather than ignored. The meaningful safe form is
+        // `obj?.f()`, which is `callee.isSafeCall` and is left alone.
+        if (expression.isSafeCall) {
+            val arguments = expression.arguments.joinToString(", ") { it.span.text }
+            val dot = if (callee.isSafeCall) "?." else "."
+            reportRedundantSafeCall(
+                callee.memberSpan,
+                "'${callee.memberName}' is a function of $receiverName, so it is never null",
+                "${callee.receiver.span.text}$dot${callee.memberName}($arguments)",
+            )
+        }
 
         // The receiver *is* the object, so an instance member reached through one is always
         // reachable — there is nothing for `checkMemberReachable` to report. It is only the
@@ -2230,12 +2859,27 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         return type
     }
 
+    /**
+     * Calls a *value* of function type, e.g. `f(1)` where `f` holds a lambda.
+     *
+     * [safeCall] is the `?` of `f?(1)`, and it is the licence to call a value that may be absent —
+     * the same trade `?.` makes for a member. Without it a nullable function value cannot be called at
+     * all, because there is no member to guard: the callee itself is what might not be there. The
+     * answer is nullable whenever the `?` is written, for the same reason `?.` widens its result: a
+     * call that was skipped has no result, so the type has to admit the absence. That is deliberately
+     * not made conditional on the callee actually being nullable — the rule is "`?` makes the result
+     * nullable", which is one sentence, rather than one that also depends on the callee's type.
+     */
     private fun callFunctionValue(
         expression: CallExpression,
         calleeType: NekoType,
         calleeName: String,
+        safeCall: Boolean = false,
     ): NekoType {
-        if (calleeType !is FunctionType) {
+        // `?` guards the absent case, so the type it is asked of is the one underneath.
+        val present = calleeType.unwrapNullable()
+
+        if (present !is FunctionType) {
             diagnostics.error(
                 "'$calleeName' cannot be called because it is not a function; its type is " +
                     calleeType.displayName,
@@ -2244,8 +2888,20 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             for (argument in expression.arguments) analyzeExpression(argument)
             return ErrorType
         }
-        checkArguments(expression, calleeType.parameters, calleeName)
-        return calleeType.returnType
+
+        if (calleeType is NullableType && !safeCall) {
+            for (argument in expression.arguments) analyzeExpression(argument)
+            val arguments = expression.arguments.joinToString(", ") { it.span.text }
+            reportUnsafeDereference(
+                "cannot call '$calleeName' because its type is ${calleeType.displayName}",
+                "write '$calleeName?($arguments)' to do nothing when it is absent",
+                expression.callee.span,
+            )
+            return ErrorType
+        }
+
+        checkArguments(expression, present.parameters, calleeName)
+        return if (safeCall) nullableResultOf(present.returnType) else present.returnType
     }
 
     /**
@@ -2330,7 +2986,10 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * type of the first `yield` in the body, falling back to the expected return type.
      */
     private fun analyzeLambda(expression: LambdaExpression, expectedType: NekoType?): NekoType {
-        val expectedFunction = expectedType as? FunctionType
+        // A lambda is a *value*, so it satisfies a nullable function type as readily as a plain one:
+        // `f: ([int] -> int)? = { x -> ... }` is a real value in a place that may also hold nothing.
+        // The parameter types it infers come from the function type underneath.
+        val expectedFunction = expectedType?.unwrapNullable() as? FunctionType
 
         if (expectedFunction == null && expression.parameters.any { it.declaredType == null }) {
             diagnostics.error(
@@ -2358,6 +3017,12 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         expression.resolvedParameterTypes = parameterTypes
 
         val state = LambdaState(identity = Any())
+        // The expected function type is already known here, so its result type is what each `yield`
+        // is checked against from the start — which is the only way a bare `yield null` can have a
+        // type to be absent from. Without this the first `yield` would fix the result type from its
+        // own value alone, and a literal whose type only its context can supply would have none.
+        state.expectedReturnType = expectedFunction?.returnType
+        state.returnTypeIsDeclared = expectedFunction != null
         expression.identity = state.identity
         val outerLambda = currentLambda
         val outerFunction = currentFunction
@@ -2369,6 +3034,12 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // function must not stay visible here.
         currentFunction = null
         implicitThisClass = null
+        // What is known about a field is known about its value at this point in the *enclosing*
+        // method, and the body will run at some later moment instead: a `val` field tested here may
+        // have been given something else by then, so the body starts from nothing known about fields.
+        // The enclosing facts come back afterwards, because the lambda expression itself is still
+        // sitting exactly where they were proved.
+        val enclosingFacts = forgetFieldNarrowings()
 
         pushScope(identifier = state.identity)
         val parameterSymbols = mutableListOf<LocalSymbol>()
@@ -2398,6 +3069,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         analyzeBlock(expression.body)
 
         popScope()
+        restoreNarrowings(enclosingFacts)
         currentLambda = outerLambda
         currentFunction = outerFunction
         implicitThisClass = outerImplicitThis
@@ -2435,6 +3107,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         val className = (expression.receiver as? NameExpression)?.name
         val namedClass = className?.let { classes[it] }
         if (namedClass != null) {
+            if (expression.isSafeCall) reportSafeCallOnClassName(expression.memberSpan, className)
             expression.receiverIsClass = true
             expression.receiver.resolvedType = ClassType(namedClass.jvmInternalName, namedClass.name)
             return staticMemberOf(namedClass, expression, namedClass.name)
@@ -2443,7 +3116,12 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         val receiverType = analyzeExpression(expression.receiver)
 
         if (receiverType.isError) return ErrorType
-        if (receiverType !is ClassType) {
+
+        // `?.` is what makes reaching into a nullable value legal, so the two questions are asked of
+        // the *same* receiver: what it is when it is there, and whether it might not be.
+        val safe = expression.isSafeCall
+        val present = receiverType.unwrapNullable()
+        if (present !is ClassType) {
             diagnostics.error(
                 "cannot access member '${expression.memberName}' on a value of type " +
                     "${receiverType.displayName}, which has no members",
@@ -2451,12 +3129,25 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             )
             return ErrorType
         }
+        if (receiverType is NullableType && !safe) {
+            reportUnsafeDereference(
+                "cannot access member '${expression.memberName}' on a value of type " +
+                    receiverType.displayName,
+                safeCallAdvice(expression.receiver.span.text, expression.memberName, ""),
+                expression.memberSpan,
+            )
+            return ErrorType
+        }
 
-        val classSymbol = classOf(receiverType)
+        val classSymbol = classOf(present)
         val field = classSymbol?.fields?.get(expression.memberName)
         if (field != null) {
             expression.resolvedField = field
-            return field.type
+            // Reading through `?.` produces `null` when the receiver was `null`, so the member's own
+            // type is the *present* answer and the read's type is that or absent. A plain read may
+            // still be narrowed: `if (point.x != null) { point.x.f }` reaches the same field through
+            // the same value, so what the test proved is what this read has.
+            return if (safe) nullableResultOf(field.type) else readFieldTypeOf(field, expression.receiver) ?: field.type
         }
 
         val functions = classSymbol?.functions?.get(expression.memberName).orEmpty()
@@ -2465,7 +3156,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             // and the sample never needs one, so say so plainly instead of guessing an overload.
             expression.resolvedFunction = functions.first()
             diagnostics.error(
-                "'${expression.memberName}' is a function of ${receiverType.displayName}; write " +
+                "'${expression.memberName}' is a function of ${present.displayName}; write " +
                     "'${expression.receiver.span.text}.${expression.memberName}(...)' to call it",
                 expression.memberSpan,
             )
@@ -2473,10 +3164,67 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         }
 
         diagnostics.error(
-            "${receiverType.displayName} has no member named '${expression.memberName}'",
+            "${present.displayName} has no member named '${expression.memberName}'",
             expression.memberSpan,
         )
         return ErrorType
+    }
+
+    /**
+     * [type] as the value a `?.` answers: the member's own type, or that type made nullable when it is
+     * not already.
+     *
+     * A member that is *itself* nullable stays as it is. Wrapping it again would describe a `T??`,
+     * which the parser refuses to let anyone write and which would mean nothing extra here anyway:
+     * `a?.b` where `b` is a `string?` is absent exactly when either the receiver or the field is.
+     */
+    private fun nullableResultOf(type: NekoType): NekoType =
+        if (type.isError || type === VoidType || type is NullableType) type else NullableType(type)
+
+    /**
+     * Reports reaching into a nullable value without `?.`, which is the one mistake the nullable type
+     * is there to catch.
+     *
+     * [prefix] says what was being done — `cannot access member 'x' on a value of type Point?` — and
+     * [advice] says what to write instead: the same expression spelled safely, or why there is no safe
+     * spelling. The advice is a parameter rather than a fixed sentence because the three dereferences
+     * differ: a read and a call have a `?.` form, an index does not, and a *write* has no `?.` form at
+     * all — `?.` guards a read — so a reader has to be told something else there.
+     */
+    private fun reportUnsafeDereference(prefix: String, advice: String, span: Span) {
+        diagnostics.error("$prefix, which may be null; $advice", span)
+    }
+
+    /**
+     * The advice for a read or a call, which is the same sentence with the member spelled differently.
+     *
+     * A test is *not* offered first, even though smart cast means one would work: the advice has to
+     * make sense for every read, and a value that is absent on the path it is written on would only
+     * be refused again inside the branch. `?.` always works, and the second clause names the lasting
+     * fix — a value that is never absent needs no guard at all.
+     */
+    private fun safeCallAdvice(receiver: String, member: String, suffix: String): String =
+        "write '$receiver?.$member$suffix' to do nothing when it is absent, or give the value a " +
+            "non-nullable type"
+
+    /**
+     * Reports a `?` written where nothing can be absent — on a class name or a declared function.
+     *
+     * Both are resolved at compile time rather than held in a value, so there is no null for the `?`
+     * to guard and the safe form would quietly mean the ordinary one. Saying so is better than
+     * accepting a `?` that does nothing, which would read as if the call might not happen.
+     */
+    private fun reportRedundantSafeCall(span: Span, reason: String, plain: String) {
+        diagnostics.error("'?' is not needed here: $reason; write '$plain' instead", span)
+    }
+
+    /** Reports `Cls?.member` or `Cls.member?()`, where the receiver is a class name. */
+    private fun reportSafeCallOnClassName(span: Span, className: String) {
+        reportRedundantSafeCall(
+            span,
+            "$className is a class name, which is never null",
+            "$className.…",
+        )
     }
 
     /**
@@ -2500,7 +3248,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 )
             }
             expression.resolvedField = field
-            return field.type
+            // A static field is one place, so `if (Holder.only != null)` narrows every later read of
+            // it — including a bare `only` inside the class itself, which is the same storage.
+            return narrowings[field] ?: field.type
         }
 
         val functions = classSymbol.functions[expression.memberName].orEmpty()
@@ -2590,6 +3340,287 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
     private fun packagePrefix(): String = currentClass?.packagePrefix ?: ""
 
+    // ---------------------------------------------------------------- narrowing
+
+    /**
+     * A `val` field read through one particular value: `point.x`.
+     *
+     * The field alone is not the place the test was about — `left.x` and `right.x` are two
+     * different places — so the key pairs the field with the value it was reached through. That
+     * pairing is what lets `if (point.x != null) { point.x }` be remembered without assuming
+     * anything about `point` itself.
+     */
+    private data class FieldFact(val field: FieldSymbol, val receiver: Any)
+
+    /**
+     * The key a fact about the value [expression] reads is filed under, or `null` when this is not
+     * a stored value a test could pin down.
+     */
+    private fun narrowingKeyOf(expression: Expression): Any? = when (expression) {
+        is NameExpression -> narrowingKeyOf(expression.resolution)
+        is MemberAccessExpression -> {
+            val field = expression.resolvedField ?: return null
+            fieldFactKeyOf(field, expression.receiver)
+        }
+        else -> null
+    }
+
+    /**
+     * The key a fact about [symbol] is filed under, or `null` when nothing may be assumed of it.
+     *
+     * A local is always a key, even a `var` one: nothing outside its own function can write it, so
+     * dropping the fact at every write the analyzer *does* see is enough on its own — and that is
+     * what lets a *parameter* be narrowed at all, since a parameter reports itself mutable. A field
+     * is a key only when it was declared with `val`. Any other method could write a `var` field
+     * between the test and the read, and the analyzer would never see the write.
+     */
+    private fun narrowingKeyOf(symbol: Symbol?): Any? = when (symbol) {
+        is LocalSymbol -> symbol
+        is FieldSymbol -> if (symbol.isMutable) null else symbol
+        else -> null
+    }
+
+    /**
+     * The key a fact about [field] reached through [receiver] is filed under.
+     *
+     * A static field lives on the class rather than on a value, and `this.x` names the same storage
+     * a bare `x` does, so both are keyed by the field alone. Any other receiver names a *particular*
+     * object, and two reads are the same place only when they are reached through the same value.
+     */
+    private fun fieldFactKeyOf(field: FieldSymbol, receiver: Expression): Any? {
+        if (field.isMutable) return null
+        if (field.isStatic || receiver is ThisExpression) return field
+        val owner = narrowingKeyOf(receiver) ?: return null
+        return FieldFact(field, owner)
+    }
+
+    /**
+     * The type a read of [symbol] has at this point in the program.
+     *
+     * A narrowing changes *this read*, not the declaration: `symbol.type` is still `T?` everywhere
+     * the proof does not hold, which is what keeps the fact a statement about one path rather than
+     * about the variable. A symbol that cannot be narrowed simply never has a fact.
+     */
+    private fun readTypeOf(symbol: Symbol?): NekoType {
+        if (symbol == null) return ErrorType
+        val key = narrowingKeyOf(symbol) ?: return symbol.type
+        return narrowings[key] ?: symbol.type
+    }
+
+    /** The type a read of [field] through [receiver] has here, or `null` when it is not narrowed. */
+    private fun readFieldTypeOf(field: FieldSymbol, receiver: Expression): NekoType? =
+        fieldFactKeyOf(field, receiver)?.let { narrowings[it] }
+
+    /**
+     * The type [expression] was *declared* with, ignoring any narrowing proved about it.
+     *
+     * This is the type a question about the declaration is answered from — "can this value be
+     * absent at all?" — and it is why a value already narrowed to `Cat` may still be compared
+     * against `null`: the suffix is part of the declaration, and a test does not remove it.
+     */
+    private fun declaredTypeOf(expression: Expression): NekoType = when (expression) {
+        is NameExpression -> expression.resolution?.type ?: expression.type
+        // A safe read declares itself nullable whatever the field holds — `obj?.x` is the field's type
+        // made absent — so the field's own type is the answer only for a plain read.
+        is MemberAccessExpression -> if (expression.isSafeCall) {
+            expression.type
+        } else {
+            expression.resolvedField?.type ?: expression.type
+        }
+        else -> expression.type
+    }
+
+    /**
+     * What is true when [condition] turns out to be *true*, as a map from the key of a stored value
+     * to the type the test proved it has.
+     *
+     * Only one shape proves anything. `x != null` proves `x` present, and that is the whole of what
+     * a `T?` test can establish: there is no type meaning "is null" for the other side to narrow to.
+     * The two connecting operators carry the facts the way their own truth does — `a && b` being
+     * true means both sides held, so the facts are the two sets together, while `a || b` being true
+     * means only that *one* of them held, so the only facts left standing are the ones both sides
+     * agree on.
+     */
+    private fun factsTrue(condition: Expression): Map<Any, NekoType> = when {
+        condition is UnaryExpression && condition.operator == UnaryOperator.NOT ->
+            factsFalse(condition.operand)
+
+        condition is BinaryExpression && condition.operator == BinaryOperator.AND ->
+            combineFacts(factsTrue(condition.left), factsTrue(condition.right))
+
+        condition is BinaryExpression && condition.operator == BinaryOperator.OR ->
+            commonFacts(factsTrue(condition.left), factsTrue(condition.right))
+
+        else -> presentFact(condition, whenPresent = true)
+    }
+
+    /**
+     * What is true when [condition] turns out to be *false*.
+     *
+     * The mirror of [factsTrue]: `x == null` failing is what proves `x` present, and the operators
+     * swap roles, because failing a conjunction tells us about only *one* of its sides.
+     */
+    private fun factsFalse(condition: Expression): Map<Any, NekoType> = when {
+        condition is UnaryExpression && condition.operator == UnaryOperator.NOT ->
+            factsTrue(condition.operand)
+
+        condition is BinaryExpression && condition.operator == BinaryOperator.AND ->
+            commonFacts(factsFalse(condition.left), factsFalse(condition.right))
+
+        condition is BinaryExpression && condition.operator == BinaryOperator.OR ->
+            combineFacts(factsFalse(condition.left), factsFalse(condition.right))
+
+        else -> presentFact(condition, whenPresent = false)
+    }
+
+    /**
+     * The fact a bare null test gives, when that test's outcome is [whenPresent].
+     *
+     * `x != null` proves `x` present when it holds; `x == null` proves the same thing when it
+     * *fails*. The two other combinations prove nothing, and neither does a comparison against
+     * anything but the `null` literal — which is why the form is read off the syntax rather than
+     * from the two types, exactly as the equality check itself reads it.
+     */
+    private fun presentFact(condition: Expression, whenPresent: Boolean): Map<Any, NekoType> {
+        if (condition !is BinaryExpression) return emptyMap()
+        val operator = condition.operator
+        if (operator != BinaryOperator.EQUAL && operator != BinaryOperator.NOT_EQUAL) return emptyMap()
+        if ((operator == BinaryOperator.NOT_EQUAL) != whenPresent) return emptyMap()
+        val tested = when {
+            condition.left is NullLiteral && condition.right !is NullLiteral -> condition.right
+            condition.right is NullLiteral && condition.left !is NullLiteral -> condition.left
+            else -> return emptyMap()
+        }
+        val key = narrowingKeyOf(tested) ?: return emptyMap()
+        val present = tested.type.unwrapNullable()
+        if (present.isError) return emptyMap()
+        return mapOf(key to present)
+    }
+
+    /**
+     * Everything both sets of facts establish.
+     *
+     * This is the rule for a true `&&` and for a false `||`: both readings being known to hold means
+     * both sets do. A key proved by both keeps the tighter of the two types, which is what makes a
+     * doubly-narrowed value stay at the type the more specific test gave it.
+     */
+    private fun combineFacts(first: Map<Any, NekoType>, second: Map<Any, NekoType>): Map<Any, NekoType> {
+        if (first.isEmpty()) return second
+        if (second.isEmpty()) return first
+        val combined = LinkedHashMap(first)
+        for ((key, type) in second) {
+            val existing = combined[key]
+            if (existing == null || type.isAssignableTo(existing)) combined[key] = type
+        }
+        return combined
+    }
+
+    /**
+     * The facts both sets agree on, which is all a true `||` and a false `&&` leave standing: when
+     * only one side is known to have held, the other side's facts cannot be assumed.
+     */
+    private fun commonFacts(first: Map<Any, NekoType>, second: Map<Any, NekoType>): Map<Any, NekoType> {
+        if (first.isEmpty() || second.isEmpty()) return emptyMap()
+        val common = LinkedHashMap<Any, NekoType>()
+        for ((key, type) in first) {
+            if (second[key] == type) common[key] = type
+        }
+        return common
+    }
+
+    /**
+     * The facts in force, as a construct that forks the flow found them, together with the number of
+     * writes each was proved under.
+     *
+     * The two belong together. A construct that forks the flow puts the facts back when it is done,
+     * but a write that happened inside one of its arms may or may not have run — so a fact that arm
+     * invalidated must not be restored, or `if (c) { h = null }` would leave `h` looking present.
+     * Counting writes is how the snapshot can tell a fact that is simply being restored from one
+     * that has since been overwritten.
+     */
+    private class NarrowingSnapshot(
+        val facts: Map<Any, NekoType>,
+        val writes: Map<Any, Int>,
+    )
+
+    /**
+     * How many times each key has been written since the analyzer started.
+     *
+     * Only ever increases, and is never rolled back by a restore: a write that *may* have run still
+     * invalidates the fact, which is exactly the conservative answer a merge needs.
+     */
+    private val writeCounts = HashMap<Any, Int>()
+
+    /** The facts in force, so that a construct which forks the flow can put them back afterwards. */
+    private fun saveNarrowings(): NarrowingSnapshot = NarrowingSnapshot(
+        LinkedHashMap(narrowings),
+        narrowings.keys.associateWith { writeCounts[it] ?: 0 },
+    )
+
+    private fun restoreNarrowings(saved: NarrowingSnapshot) {
+        narrowings.clear()
+        for ((key, type) in saved.facts) {
+            if ((writeCounts[key] ?: 0) == saved.writes[key]) narrowings[key] = type
+        }
+    }
+
+    private fun applyFacts(facts: Map<Any, NekoType>) {
+        narrowings.putAll(facts)
+    }
+
+    /** Drops every fact [key] holds and records that a write has happened to it. */
+    private fun invalidate(key: Any) {
+        narrowings.remove(key)
+        writeCounts[key] = (writeCounts[key] ?: 0) + 1
+    }
+
+    /**
+     * Drops every fact a write to [symbol] invalidates.
+     *
+     * The symbol's own fact goes, and so do the facts about fields reached *through* it: after
+     * `point = other`, `point.x` is a different place, so what was proved of the old one says
+     * nothing about the new one.
+     */
+    private fun forgetNarrowingsOf(symbol: Symbol?) {
+        if (symbol == null) return
+        val reached = narrowings.keys.filter { it is FieldFact && it.receiver == symbol }
+        invalidate(symbol)
+        reached.forEach { invalidate(it) }
+    }
+
+    /** Drops every fact about [field] itself, for a write to it. */
+    private fun forgetNarrowingsOfField(field: FieldSymbol) {
+        val reached = narrowings.keys.filter { it is FieldFact && it.field == field }
+        invalidate(field)
+        reached.forEach { invalidate(it) }
+    }
+
+    /**
+     * Forgets every fact, because a new function body is about to be analysed.
+     *
+     * Locals do not outlive their function, but a `val` *field* does: a fact proved about one in
+     * `main` would otherwise still be in force in the next method, where nothing has tested it.
+     */
+    private fun resetNarrowings() {
+        narrowings.clear()
+        writeCounts.clear()
+    }
+
+    /**
+     * Drops every fact about a field, keeping the ones about names, and returns the snapshot that
+     * [restoreNarrowings] wants.
+     *
+     * A lambda body is where this matters. A local is captured *by value* at the point the lambda
+     * object is made, so a fact proved there is a fact about the captured value and may be used in
+     * the body. A field is not captured at all — the body reads it when the lambda is *called*,
+     * which may be long afterwards and long after the test that proved anything about it.
+     */
+    private fun forgetFieldNarrowings(): NarrowingSnapshot {
+        val incoming = saveNarrowings()
+        narrowings.keys.removeAll { it is FieldSymbol || it is FieldFact }
+        return incoming
+    }
+
     // ----------------------------------------------------------------- helpers
 
     /**
@@ -2620,11 +3651,38 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             }
         }
 
+        // `string?` is `string` plus permission to be absent, and it is the *only* type `null` may
+        // be assigned to: wrapping is the whole of what the suffix means, so the inner type is
+        // resolved exactly as it would be without it.
+        is NullableTypeReference -> resolveNullableType(reference)
+
         is ArrayTypeReference -> ArrayType(resolveType(reference.element))
         is FunctionTypeReference -> FunctionType(
             parameters = reference.parameters.map { resolveType(it) },
             returnType = resolveType(reference.returnType),
         )
+    }
+
+    /**
+     * Resolves `T?` to [NullableType] wrapping whatever `T` resolves to.
+     *
+     * The parser already refuses a second `?` on one type, so the only way a [NullableType] can turn
+     * up here is by the inner type *being* a nullable one — which happens when a name is reused:
+     * `type Maybe = string?` is not a thing Neko has, but a class named for a built-in, or a second
+     * `?` written after a suffix the parser read as `[]`, could reach this point. Reporting it here
+     * rather than in the parser is what lets the message name the resolved type instead of the text.
+     */
+    private fun resolveNullableType(reference: NullableTypeReference): NekoType {
+        val inner = resolveType(reference.inner)
+        if (inner is NullableType) {
+            diagnostics.error(
+                "${inner.displayName} is already nullable, so the second '?' adds nothing; write " +
+                    "'${inner.displayName}'",
+                reference.questionSpan,
+            )
+            return inner
+        }
+        return NullableType(inner)
     }
 
     /**
@@ -2651,16 +3709,21 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // catch it. Whether it exists is answered by the platform rather than by a list, so every
         // `java.lang` class works, including ones added later.
         //
-        // `Integer`, `Boolean` and `String` are not reached here: they name built-in types, and
-        // [resolveType] resolves them before this point so that the two spellings are one type.
+        // Every name in [BuiltinTypes.byName] is also a real JDK class — `Integer`, `Boolean`,
+        // `Character`, `String` — and none of them is reached here: [resolveType] resolves them
+        // before this point so that the two spellings are one type rather than a primitive and the
+        // boxed class it happens to share a name with.
         if (isPlatformClass(name)) return ClassType("java/lang/$name", name)
 
         if (!name.first().isUpperCase()) {
             diagnostics.error(
-                "unknown type '$name': Neko has 'int', 'string', 'bool', 'Object' and " +
-                    "'Throwable', or the Java spellings 'Integer', 'String' and 'Boolean'; array " +
-                    "types such as 'string[]', function types such as '[int] -> int'; and class " +
-                    "types, whose names start with a capital letter",
+                "unknown type '$name': Neko has the eight primitives 'byte', 'short', 'char', " +
+                    "'int', 'long', 'float', 'double' and 'bool' (also spelled 'boolean'), whose " +
+                    "Java reference names 'Byte', 'Short', 'Character', 'Integer', 'Long', 'Float', " +
+                    "'Double' and 'Boolean' are the same types, plus 'string' (also spelled " +
+                    "'String'), 'Object' and 'Throwable'; array types such as 'string[]', function " +
+                    "types such as '[int] -> int'; and class types, whose names start with a capital " +
+                    "letter",
                 span,
             )
             return ErrorType
@@ -2720,6 +3783,16 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private class LambdaState(val identity: Any) {
         /** The type produced by `yield`, set by the first `yield` analysed. */
         var expectedReturnType: NekoType? = null
+
+        /**
+         * Whether [expectedReturnType] came from the function type the lambda is used as rather than
+         * from an earlier `yield`.
+         *
+         * The two produce the same *check* but want different *words*: a mismatch against the
+         * destination is not a disagreement with a previous `yield`, and saying it was would send the
+         * reader looking for a `yield` that is not there.
+         */
+        var returnTypeIsDeclared: Boolean = false
     }
 
     private companion object {
@@ -2748,6 +3821,16 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 private fun Symbol.isDeclaration(): Boolean = this is LocalSymbol || this is FieldSymbol
 
 /**
+ * Whether [this] is one of the four operators whose result is a `bool` rather than an operand.
+ *
+ * Arithmetic and comparison share their operand rule — same numeric type on both sides — and differ
+ * only in what they are worth, so which one this is *is* the answer to "what is the result type".
+ */
+private val BinaryOperator.isRelational: Boolean
+    get() = this == BinaryOperator.LESS || this == BinaryOperator.LESS_EQUAL ||
+        this == BinaryOperator.GREATER || this == BinaryOperator.GREATER_EQUAL
+
+/**
  * Whether a symbol may be the target of an assignment.
  *
  * Only locals and fields can be, and only when they were not declared with `val`.
@@ -2770,14 +3853,31 @@ private fun Symbol.describeKind(): String = when (this) {
 private val NekoType.isVoidOrError: Boolean get() = this is VoidType || isError
 
 /**
+ * The numeric types, i.e. the ones arithmetic and ordering are defined on.
+ *
+ * `bool` is not among them even though it is a primitive: `true + true` has no answer the language
+ * wants, and treating a boolean as a number is how a program ends up comparing one against an `int`.
+ */
+private val NekoType.isNumeric: Boolean get() = BuiltinTypes.isNumeric(this)
+
+/**
+ * The inclusive range of an integral type, or `null` for one that has none.
+ *
+ * `char` is unsigned, so its range starts at zero: that is what makes `x: char = -1` a mistake worth
+ * reporting rather than a value that quietly wraps to 65535.
+ */
+private fun NekoType.integralRange(): LongRange? = BuiltinTypes.integralRangeOf(this)
+
+/**
  * Types with a well-defined zero value, which may therefore be declared without an initializer.
  *
- * `int` and `bool` default to `0`/`false`; every reference type — a class, an array, a function
- * value — defaults to `null`, exactly as the JVM's field initialization does. That is what lets the
- * standard library declare `private val data: Object[]` and assign it in the constructor.
+ * Every primitive defaults to `0` or `false` in its own type — a `long` field starts at `0L`, not at
+ * an `int` zero that would need converting — and every reference type defaults to `null`, exactly as
+ * the JVM's field initialization does. That is what lets the standard library declare
+ * `private val data: Object[]` and assign it in the constructor.
  */
 private val NekoType.hasImplicitDefault: Boolean
-    get() = this == IntType || this == BoolType || isReferenceType || isError
+    get() = isNumeric || this == BoolType || isReferenceType || isError
 
 /**
  * A conservative "does this body definitely return on every path" test.
@@ -2799,6 +3899,9 @@ private fun Statement.alwaysReturns(): Boolean = when (this) {
     is IfStatement -> elseBranch != null && thenBranch.alwaysReturns() && elseBranch.alwaysReturns()
     is WhenStatement -> hasElseBranch && branches.all { it.body.alwaysReturns() }
     is WhileStatement -> false
+    // A `nya` throws only when its condition fails, so control can reach whatever follows it — it is
+    // a check on the way past, not a way out.
+    is NyaStatement -> false
     // A `try` with a `finally` returns only if every path out of it does, which is more than a
     // conservative test can tell; reporting "maybe falls through" is the safe answer.
     is YieldStatement, is VariableDeclarationStatement, is AssignmentStatement,
@@ -2817,6 +3920,8 @@ private fun Statement.terminatesFlow(): Boolean = when (this) {
     is BlockStatement -> statements.any { it.terminatesFlow() }
     is IfStatement -> elseBranch != null && thenBranch.terminatesFlow() && elseBranch.terminatesFlow()
     is WhenStatement -> hasElseBranch && branches.all { it.body.terminatesFlow() }
+    // `nya` lets control through when it holds, so it never makes the next statement unreachable.
+    is NyaStatement -> false
     else -> false
 }
 

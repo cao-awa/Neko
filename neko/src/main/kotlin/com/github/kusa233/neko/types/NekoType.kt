@@ -5,10 +5,37 @@ package com.github.kusa233.neko.types
  *
  * Types are value-like and compared structurally: two [ArrayType]s are equal exactly when their
  * element types are, and likewise for function types.
+ *
+ * The primitive types are Java's eight, and they are eight *distinct* types rather than points on a
+ * numeric lattice. That is the language's rule and not an accident of the implementation: Neko does
+ * no implicit conversion between named types at all — `int + string` is an error — so `long` is not
+ * a wider `int` to convert into, it is a different type that happens to be spelled similarly. A
+ * literal is the one exception, because it has no type of its own until its context gives it one.
  */
 sealed interface NekoType {
     /** How the type is spelled in user-facing messages. */
     val displayName: String
+}
+
+/** 8-bit signed integer, lowered to the JVM `byte`. */
+data object ByteType : NekoType {
+    override val displayName: String get() = "byte"
+}
+
+/** 16-bit signed integer, lowered to the JVM `short`. */
+data object ShortType : NekoType {
+    override val displayName: String get() = "short"
+}
+
+/**
+ * 16-bit unsigned integer, lowered to the JVM `char`.
+ *
+ * Unsigned is the property that makes `char` its own type rather than a `short` under another name:
+ * `0xFFFF` is a legal `char` and an illegal `short`, and `char` arithmetic wraps at 65535 rather
+ * than at 32767.
+ */
+data object CharType : NekoType {
+    override val displayName: String get() = "char"
 }
 
 /** 32-bit signed integer, lowered to the JVM `int`. */
@@ -16,14 +43,34 @@ data object IntType : NekoType {
     override val displayName: String get() = "int"
 }
 
-/** Immutable UTF-16 string, lowered to `java.lang.String`. */
-data object StringType : NekoType {
-    override val displayName: String get() = "string"
+/**
+ * 64-bit signed integer, lowered to the JVM `long`.
+ *
+ * A `long` is the first type in the language that occupies *two* local-variable slots, which is a
+ * fact every pass that hands out slots has to know about; see `BuiltinTypes.slotCountOf`.
+ */
+data object LongType : NekoType {
+    override val displayName: String get() = "long"
+}
+
+/** 32-bit floating point, lowered to the JVM `float`. */
+data object FloatType : NekoType {
+    override val displayName: String get() = "float"
+}
+
+/** 64-bit floating point, lowered to the JVM `double`. */
+data object DoubleType : NekoType {
+    override val displayName: String get() = "double"
 }
 
 /** Boolean, lowered to the JVM `boolean`. */
 data object BoolType : NekoType {
     override val displayName: String get() = "bool"
+}
+
+/** Immutable UTF-16 string, lowered to `java.lang.String`. */
+data object StringType : NekoType {
+    override val displayName: String get() = "string"
 }
 
 /**
@@ -69,6 +116,35 @@ data object ErrorType : NekoType {
 /** A fixed-length array whose elements all have type [element]. */
 data class ArrayType(val element: NekoType) : NekoType {
     override val displayName: String get() = "${element.displayName}[]"
+}
+
+/**
+ * A type that additionally admits `null` — written `T?` in the source.
+ *
+ * This is the *only* type `null` may be assigned to, and the wrapper is what records that: a plain
+ * `string` and a `string?` are different types, so a program that hands a `string?` to something
+ * wanting a `string` is rejected rather than failing at run time. A nullable value is therefore
+ * always a reference — for a primitive [inner], that means the boxed type, because a JVM `int` slot
+ * has no room for `null` at all.
+ *
+ * A nullable value is deliberately *not* usable for much: it may be assigned, compared against
+ * `null` with `==`/`!=`, passed along as another nullable type, or dereferenced through `?.`. Every
+ * other use — reading a field, calling a function, indexing — is a compile-time error, because those
+ * are exactly the operations that would otherwise raise a null-pointer exception. Once a value has
+ * been narrowed to `T`, the operations of `T` become available again.
+ */
+data class NullableType(val inner: NekoType) : NekoType {
+    /**
+     * The inner name with `?` appended — parenthesised when the inner type is a function.
+     *
+     * A function type ends in its return type, so `[int] -> string?` already means "returns a
+     * `string?`"; appending a bare `?` to the whole of it would read the same way while meaning "the
+     * function itself may be absent". The parentheses are not decoration: without them the two
+     * different types have one spelling, and a diagnostic quoting it back would describe the wrong
+     * one.
+     */
+    override val displayName: String
+        get() = if (inner is FunctionType) "(${inner.displayName})?" else "${inner.displayName}?"
 }
 
 /**
@@ -127,23 +203,74 @@ val NekoType.isError: Boolean get() = this === ErrorType
  *
  *  * [ErrorType] is accepted in both directions, so one mistake does not cascade.
  *  * A primitive is assignable to [ObjectType], and every reference type is too. `Object` is what a
- *    type parameter erases to, so a value of *any* type can be stored as one — an `int` arrives
- *    boxed, exactly as it would in Java's generics. That is what makes `Object[]` usable as the
- *    carrier a `raise` boxes its values into.
+ *    type parameter erases to, so a value of *any* type can be stored as one — an `int` or a `long`
+ *    arrives boxed, exactly as it would in Java's generics. That is what makes `Object[]` usable as
+ *    the carrier a `raise` boxes its values into.
+ *
+ * Nothing else is: in particular two different numeric primitives are not assignable to each other
+ * in either direction, which is what makes `x: long = someInt` an error. A *literal* is the one thing
+ * that may be read as a different type, and that happens in the analyzer, where the literal's value
+ * is visible — a value that already has a type is never converted.
+ *
+ * Nullability is asymmetric, and deliberately so:
+ *
+ *  * A `T` may be used where `T?` is expected — the value is already not null, so the wider type
+ *    costs nothing. This is what makes a nullable parameter usable without ceremony.
+ *  * A `T?` may *not* be used where `T` is expected. That direction is the one that would need a
+ *    run-time check the language refuses to perform implicitly, so it is a compile-time error.
  */
 fun NekoType.isAssignableTo(target: NekoType): Boolean {
     if (this === ErrorType || target === ErrorType) return true
     if (this == target) return true
+    if (target is NullableType) {
+        // Both nullable: the inner types decide. A non-null value: it fits if its own type does,
+        // which is the "non-null to nullable is allowed" direction.
+        return if (this is NullableType) inner.isAssignableTo(target.inner) else isAssignableTo(target.inner)
+    }
     if (target === ObjectType) return this !== VoidType
+    // A nullable value never fits a non-nullable type; the caller must narrow it first.
+    if (this is NullableType) return false
     return false
 }
 
-/** Whether this type is represented by a JVM reference, so it can be stored as an `Object`. */
+/**
+ * Whether this type is represented by a JVM reference, so it can be stored as an `Object`.
+ *
+ * Every primitive is excluded, which is the point of asking: a `long` cannot be stored as an `Object`
+ * until it has been boxed, and a pass that treats it as if it could will emit an `AASTORE` of a
+ * two-slot value.
+ */
 val NekoType.isReferenceType: Boolean
     get() = this is ClassType || this is ArrayType || this is FunctionType || this === StringType ||
-        this === ObjectType || this === ThrowableType
+        this === ObjectType || this === ThrowableType || this is NullableType
 
-/** Whether this type occupies a JVM local-variable slot in category 1 (all Neko types do). */
+/**
+ * Whether this type admits `null`.
+ *
+ * The question a caller means is "may I assign `null` here?" — and for anything but a [NullableType]
+ * the answer is no, which is what makes `x: string = null` a compile-time error rather than a
+ * run-time surprise.
+ */
+val NekoType.isNullable: Boolean get() = this is NullableType
+
+/**
+ * [this] with its [NullableType] wrapper removed, e.g. `int?` becomes `int`; anything else is itself.
+ *
+ * The question a caller means is "what is this a nullable *of*?". That is what a pass working in
+ * terms of the JVM's representation needs: an `int?` is stored as a `java.lang.Integer`, and the
+ * wrapper names a reference, so naming that box means asking about the inner type.
+ *
+ * One unwrapping is always enough: the parser rejects a second `?` on the same type, so `int??`
+ * cannot reach the analyzer and there is never more than one wrapper to strip.
+ */
+fun NekoType.unwrapNullable(): NekoType = if (this is NullableType) inner else this
+
+/**
+ * Whether this type occupies a JVM local-variable slot and so can be a local's type.
+ *
+ * A `long` or a `double` occupies *two* slots; that is a question about how many, not whether, and
+ * `BuiltinTypes.slotCountOf` answers it.
+ */
 val NekoType.isValueType: Boolean get() = this !== VoidType && this !== ErrorType
 
 /**

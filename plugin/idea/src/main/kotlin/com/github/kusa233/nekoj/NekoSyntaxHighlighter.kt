@@ -46,6 +46,9 @@ private fun buildKeys(): Map<IElementType, Array<TextAttributesKey>> {
         TokenType.BANG,
         TokenType.ARROW,
         TokenType.COLON,
+        // `?` is both halves of the nullable feature — the type suffix and the `?.` safe call — and
+        // reads as an operator in both.
+        TokenType.QUESTION,
     )
 
     return HashMap<IElementType, Array<TextAttributesKey>>().apply {

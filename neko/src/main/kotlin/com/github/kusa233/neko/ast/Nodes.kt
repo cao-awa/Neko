@@ -329,6 +329,19 @@ class FunctionTypeReference(
     override val span: Span,
 ) : TypeReference
 
+/**
+ * `string?`, `int?`, `Point?` — a type that additionally admits `null`.
+ *
+ * The question mark is kept as its own node rather than being folded into the inner reference so
+ * that the inner type is resolved by exactly the code that resolves it without one, and so a
+ * diagnostic about `int?` can point at the `?` that made it nullable.
+ */
+class NullableTypeReference(
+    val inner: TypeReference,
+    val questionSpan: Span,
+    override val span: Span,
+) : TypeReference
+
 // -------------------------------------------------------------------------- statements
 
 sealed interface Statement : Node
@@ -442,6 +455,27 @@ class WhenBranch(
     val body: Statement,
     override val span: Span,
 ) : Node
+
+/**
+ * `nya condition` — checks that the condition holds, and throws an `AssertionError` when it does not.
+ *
+ * This is where a program states what it believes rather than what it computes: the condition is an
+ * ordinary `bool` expression, and a run that reaches this statement with it false ends there.
+ *
+ * The failure message is the condition's own source text, read from [condition]'s span at generation
+ * time rather than carried as a string here. That keeps the message in step with the expression it
+ * describes without the text being written twice, and it is why there is no message operand.
+ *
+ * The check is unconditional — unlike Java's `assert`, no flag turns it off — so a `nya` always costs
+ * the comparison it names. That is deliberate: a check that silently does nothing is worse than no
+ * check, and Neko has no flag to enable one with.
+ */
+class NyaStatement(
+    /** Span of the `nya` keyword, used when reporting a missing or mistyped condition. */
+    val keywordSpan: Span,
+    val condition: Expression,
+    override val span: Span,
+) : Statement
 
 /**
  * `raise e1, e2` — leaves the enclosing `emit`-declaring function early, handing the values to the
@@ -620,11 +654,100 @@ class NameExpression(
     var resolution: Symbol? = null
 }
 
-class IntegerLiteral(val value: Long, override val span: Span) : Expression()
+/**
+ * A whole-number literal, with or without a trailing `L`/`l`.
+ *
+ * The value is stored as a `Long` because that is the widest whole number the language can spell, and
+ * the *type* is not fixed here: `1` is an `int` where nothing says otherwise and a `byte`, `short`,
+ * `char` or `long` where the surrounding context asks for one and the value fits. That is what lets
+ * `x: byte = 1` mean what it looks like without making `int + long` legal — see the analyzer's
+ * literal handling, which fills in the resolved type every expression carries.
+ */
+class IntegerLiteral(
+    val value: Long,
+    /** `true` when the source wrote an `L`/`l` suffix, which names the 64-bit type outright. */
+    val isLong: Boolean,
+    override val span: Span,
+) : Expression() {
+    /**
+     * Filled in by the analyzer: the literal's value does not fit the type its context asked for.
+     *
+     * The fact is recorded rather than reported where it is discovered because the *value* is a
+     * property of the literal while the context is a property of whoever wrote the expectation, and
+     * only one of the two dozen callers that hand a type down is in a position to say both. Reporting
+     * it there, once, is also what keeps one mistake from producing one message per mention.
+     */
+    var isOutOfRange: Boolean = false
+
+    /** The type the context asked for and the value did not fit; meaningful only with [isOutOfRange]. */
+    var outOfRangeType: NekoType? = null
+
+    /**
+     * Filled in by the analyzer: this literal is written under a `-`.
+     *
+     * `-128` is one value rather than a negation of `128`, and the difference is visible: 128 does not
+     * fit in a `byte` and -128 does. The analyzer records the sign here so that both the range check
+     * and the emitter see the number the reader wrote rather than the one the parser happened to read
+     * first.
+     */
+    var isNegated: Boolean = false
+
+    /** The value this literal names, sign included. */
+    val signedValue: Long get() = if (isNegated) -value else value
+
+    /** How the literal is spelled back to the reader in a diagnostic, sign included. */
+    val signedText: String get() = if (isNegated) "-$value" else "$value"
+
+    /**
+     * The literal read as an `int`, which is what it is when no context gives it a type.
+     *
+     * The clamping is what keeps a rejected literal from also breaking code generation: the value the
+     * reader is told about is out of range anyway, and a class file still has to come out so the rest
+     * of the program's diagnostics are not lost with it.
+     */
+    val intValue: Int get() = signedValue.toInt()
+}
+
+/**
+ * A fractional literal, e.g. `1.5` or `1.5f`.
+ *
+ * [isFloat] records whether the source asked for `float`, which only the *parser* can know: the
+ * analyzer sees an `Expression` and would otherwise have to re-read the token's text, and the
+ * emitter would have to guess. A `double` is what an unsuffixed decimal is, because that is the
+ * wider type and Java's own default.
+ */
+class DoubleLiteral(val value: Double, val isFloat: Boolean, override val span: Span) : Expression() {
+    /**
+     * Filled in by the analyzer: it has already objected to the type this literal was written with.
+     *
+     * A field's initializer is analysed twice — once while signatures are resolved and once with its
+     * class' body — and an objection about a *literal* is a fact about that literal rather than about
+     * the visit, so it is remembered and made once.
+     */
+    var isTypeReported: Boolean = false
+}
+
+/**
+ * A single-character literal, e.g. `'a'`.
+ *
+ * Kept distinct from [IntegerLiteral] rather than folded into it so that the diagnostic for
+ * `x: bool = 'a'` can name a character, and so a reader of the tree can see which spelling was
+ * written.
+ */
+class CharLiteral(val value: Char, override val span: Span) : Expression()
 
 class StringLiteral(val value: String, override val span: Span) : Expression()
 
 class BoolLiteral(val value: Boolean, override val span: Span) : Expression()
+
+/**
+ * `null` — the one value a nullable type exists to hold.
+ *
+ * It has no type of its own: it takes whichever nullable type its context asks for, exactly as an
+ * integer literal takes the integral type it is used as. That is why the analyzer, not the parser,
+ * decides what type this node has.
+ */
+class NullLiteral(override val span: Span) : Expression()
 
 /** `left operator right` */
 class BinaryExpression(
@@ -685,6 +808,16 @@ class CallExpression(
     /** Span of the parenthesised argument list, including both parentheses. */
     val argumentListSpan: Span,
     override val span: Span,
+    /**
+     * Whether this is `callee?(arguments)` — a call that is skipped when the *function value* being
+     * called is absent.
+     *
+     * This is the `?.` of a call rather than of a member. `obj?.f(x)` guards the *receiver*, because
+     * the member is reached through it; `f?(x)` guards the *callee itself*, because a function value
+     * held in a nullable variable is the thing that may not be there. The two answer a nullable value
+     * for the same reason: a call that did not happen has no result.
+     */
+    val isSafeCall: Boolean = false,
 ) : Expression() {
     /**
      * Filled in by the analyzer when the call constructs a class rather than invoking a function.
@@ -718,12 +851,20 @@ class CallExpression(
     var instanceMethod: FunctionSymbol? = null
 }
 
-/** `receiver.member` — reads a field or names an instance function of [receiver]. */
+/** `receiver.member`, or `receiver?.member` when [isSafeCall] is set. */
 class MemberAccessExpression(
     val receiver: Expression,
     val memberName: String,
     val memberSpan: Span,
     override val span: Span,
+    /**
+     * `true` for `receiver?.member`, which evaluates to `null` rather than dereferencing when
+     * [receiver] is null.
+     *
+     * The receiver is still a nullable type here: the safe call is what makes reading a member off
+     * one legal, and the *result* becomes nullable because the member may not have been read at all.
+     */
+    val isSafeCall: Boolean = false,
 ) : Expression() {
     /**
      * Filled in by the analyzer: the field this access reads.

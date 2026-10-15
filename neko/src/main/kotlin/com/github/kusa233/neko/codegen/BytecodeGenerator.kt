@@ -24,8 +24,11 @@ import org.objectweb.asm.Opcodes.*
  *    `this` from inside another instance member of the same class. Instance field initializers run
  *    in `<init>`, static ones in `<clinit>`. `fun main(args: string[])` is a JVM entry point only
  *    when the source declares it `static`, exactly as the source reads.
- *  * **Values.** `int` →`I`, `bool` →`Z`, `string` →`Ljava/lang/String;`, `T[]` →`[<T>`, and a
- *    function type →a generated interface (see below).
+ *  * **Values.** `byte`→`B`, `short`→`S`, `char`→`C`, `int`→`I`, `long`→`J`, `float`→`F`,
+ *    `double`→`D`, `bool`→`Z`, `string`→`Ljava/lang/String;`, `T[]`→`[<T>`, and a function type→a
+ *    generated interface (see below). `byte`, `short` and `char` are `int`s to the JVM wherever a
+ *    value is on the stack or in a local, and are narrowed back with `I2B`/`I2S`/`I2C` wherever one is
+ *    *stored*; `long` and `double` occupy two local slots rather than one.
  *  * **A function type becomes an interface, and a lambda becomes a class.** For every distinct
  *    function type used, one interface `Neko$Function$n` is emitted with a single method
  *    `invoke`. Each lambda literal becomes a `final` class implementing that interface, with its
@@ -252,10 +255,11 @@ class BytecodeGenerator(
             emitFunction(writer, function, functionSymbol, internalName)
         }
 
-        // A `meow class` derives `equals` and `hashCode` from its fields. They are emitted as raw
-        // bytecode rather than lowered from a Neko body because the language cannot express either
-        // one: `equals` has to compare a value whose class it only learns at run time, and it has no
-        // body to write that in.
+        // A `meow class` derives `equals`, `hashCode` and `toString` from its fields. They are emitted
+        // as raw bytecode rather than lowered from a Neko body because the language cannot express any
+        // of them: `equals` has to compare a value whose class it only learns at run time, `hashCode`
+        // has to fold a value into an `int`, and `toString` has to read a field of a type the source
+        // never named. None of the three has a body to write them in.
         if (declaration.isMeow) emitDerivedObjectMethods(writer, declaration, symbol)
 
         emitMainBridge(writer, declaration, symbol)
@@ -307,6 +311,7 @@ class BytecodeGenerator(
             val initializer = field.initializer!!
             markLine(mv, initializer)
             emitExpression(initializer, scope)
+            emitStoreValue(initializer.type, fieldSymbol.type, mv)
             mv.visitFieldInsn(
                 PUTSTATIC,
                 symbol.jvmInternalName,
@@ -389,10 +394,11 @@ class BytecodeGenerator(
     // ------------------------------------------------- a meow class' derived methods
 
     /**
-     * The `equals` and `hashCode` a `meow class` gets from its fields.
+     * The `equals`, `hashCode` and `toString` a `meow class` gets from its fields.
      *
-     * Both are JDK 8 APIs —[java.lang.Object]'s own `equals`/`hashCode`, `getClass`, and
-     * `java.util.Objects` —which is what `V1_8` program classes are written against.
+     * All three are JDK 8 APIs —[java.lang.Object]'s own `equals`/`hashCode`/`toString`, `getClass`,
+     * `java.util.Objects` and `java.lang.StringBuilder` —which is what `V1_8` program classes are
+     * written against.
      *
      * A body the author wrote wins: the analyzer left the class' own `equals`/`hashCode` in
      * [ClassSymbol.functions], so emitting a derived one beside it would produce a duplicate method
@@ -408,6 +414,9 @@ class BytecodeGenerator(
         }
         if (!declaresOwnMethod(symbol, "hashCode", emptyList())) {
             emitDerivedHashCode(writer, symbol)
+        }
+        if (!declaresOwnMethod(symbol, "toString", emptyList())) {
+            emitDerivedToString(writer, symbol)
         }
     }
 
@@ -499,17 +508,29 @@ class BytecodeGenerator(
             mv.visitFieldInsn(GETFIELD, internalName, field.name, descriptorOf(field.type))
             mv.visitVarInsn(ALOAD, 2)
             mv.visitFieldInsn(GETFIELD, internalName, field.name, descriptorOf(field.type))
-            if (field.type == IntType || field.type == BoolType) {
-                mv.visitJumpInsn(IF_ICMPNE, notEqual)
-            } else {
-                mv.visitMethodInsn(
-                    INVOKESTATIC,
-                    "java/util/Objects",
-                    "equals",
-                    "(Ljava/lang/Object;Ljava/lang/Object;)Z",
-                    false,
-                )
-                mv.visitJumpInsn(IFEQ, notEqual)
+            // A primitive field is compared by value, and a *wide* one cannot be compared by a branch
+            // instruction: `lcmp`/`fcmp`/`dcmp` first, then the test against zero. The narrow ones are
+            // ints on the stack, so one branch instruction is the whole comparison.
+            when {
+                field.type.isWidePrimitive -> {
+                    mv.visitInsn(wideCompareOpcode(field.type))
+                    mv.visitJumpInsn(IFNE, notEqual)
+                }
+
+                BuiltinTypes.isPrimitive(field.type) -> mv.visitJumpInsn(IF_ICMPNE, notEqual)
+
+                // A reference field goes through `Objects.equals`, which is what a field holding
+                // `null` needs and which dispatches to the field's own `equals` otherwise.
+                else -> {
+                    mv.visitMethodInsn(
+                        INVOKESTATIC,
+                        "java/util/Objects",
+                        "equals",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+                        false,
+                    )
+                    mv.visitJumpInsn(IFEQ, notEqual)
+                }
             }
         }
 
@@ -552,8 +573,15 @@ class BytecodeGenerator(
             mv.visitInsn(IMUL)
             mv.visitVarInsn(ALOAD, 0)
             mv.visitFieldInsn(GETFIELD, internalName, field.name, descriptorOf(field.type))
-            if (field.type != IntType && field.type != BoolType) {
-                mv.visitMethodInsn(
+            // A primitive folds in as its own `int` value, without allocating; everything else goes
+            // through `Objects.hashCode`, which is what keeps the derived hash consistent with the
+            // derived `equals` for a reference field. The wide primitives are the ones that need real
+            // work: their first four bytes alone are not their hash, so `Long.hashCode`'s fold and
+            // `Float`/`Double`'s widening have to happen here.
+            when {
+                field.type.isWidePrimitive -> emitWideHashOf(field.type, mv)
+                BuiltinTypes.isPrimitive(field.type) -> Unit
+                else -> mv.visitMethodInsn(
                     INVOKESTATIC,
                     "java/util/Objects",
                     "hashCode",
@@ -576,6 +604,163 @@ class BytecodeGenerator(
     private fun instanceFieldsOf(symbol: ClassSymbol): List<FieldSymbol> =
         symbol.fields.values.filterNot { it.isStatic }
 
+    /**
+     * `public String toString()`, printing the class name and every field: `Cat(age=1, name="cat")`.
+     *
+     * The shape is the one `meow class` implies rather than one the language offers to change: the
+     * simple class name, then `(` … `)` around a comma-separated `field=value` list in declaration
+     * order. Nothing else about it is derivable, so it is fixed here and a hand-written `toString`
+     * is the way to get anything different.
+     *
+     * Two choices are worth naming. A `string` field is **quoted**, which is the only reading that
+     * keeps the output unambiguous — an unquoted empty string, a string that is itself `)`, and the
+     * text `null` would otherwise all be indistinguishable from the fields around them — and matching
+     * quotes are the convention every language with a derived `toString` follows. A `string?` field is
+     * the one case where a *value* decides the format: a present one is quoted and an absent one
+     * prints the bare `null`, because `"null"` would claim to be a string. Every other field prints
+     * exactly as its own `toString` does, which is what makes a `meow class` holding a `meow class`
+     * print the whole thing: `Cat(age=1, owner=Owner(name="kusa"))`.
+     *
+     * A field that is null prints `null`, because the values go through `StringBuilder.append` and
+     * `append`'s reference overloads all answer `String.valueOf`, which is `"null"` for a null
+     * reference. That is what keeps this method from being the one place the nullable type does not
+     * cover: `toString` on a `meow class` cannot throw, whatever its fields hold.
+     */
+    private fun emitDerivedToString(writer: ClassWriter, symbol: ClassSymbol) {
+        val internalName = symbol.jvmInternalName
+        val mv = writer.visitMethod(ACC_PUBLIC, "toString", "()Ljava/lang/String;", null, null)
+        mv.visitCode()
+
+        // `StringBuilder` rather than repeated `String` concatenation: the fields are known only here,
+        // so there is no chain of `+` to lower, and one builder is what a Java compiler emits anyway.
+        mv.visitTypeInsn(NEW, "java/lang/StringBuilder")
+        mv.visitInsn(DUP)
+        mv.visitMethodInsn(INVOKESPECIAL, "java/lang/StringBuilder", "<init>", "()V", false)
+
+        val className = symbol.jvmInternalName.substringAfterLast('/')
+        appendConstant(mv, "$className(")
+
+        for ((index, field) in instanceFieldsOf(symbol).withIndex()) {
+            if (index > 0) appendConstant(mv, ", ")
+
+            // A `string` field is quoted, and the opening quote goes into the *label* rather than
+            // being appended on its own: the value is already on the stack by then, and a constant
+            // pushed afterwards would land on top of it rather than beside it.
+            //
+            // A nullable string is the one case where a *value* decides the format. An absent one has
+            // to print the bare word `null` rather than `"null"`, because the quotes claim "this is a
+            // string" and a `null` is not one — so both halves of the quoting become conditional, and
+            // that needs the value somewhere other than the stack.
+            val plainString = field.type === StringType
+            val nullableString = field.type is NullableType && field.type.inner === StringType
+            appendConstant(mv, if (plainString) "${field.name}=\"" else "${field.name}=")
+
+            mv.visitVarInsn(ALOAD, 0)
+            mv.visitFieldInsn(GETFIELD, internalName, field.name, descriptorOf(field.type))
+
+            when {
+                nullableString -> emitQuotedStringAppend(mv)
+                else -> {
+                    mv.visitMethodInsn(
+                        INVOKEVIRTUAL,
+                        "java/lang/StringBuilder",
+                        "append",
+                        appendDescriptorOf(field.type),
+                        false,
+                    )
+                    if (plainString) appendConstant(mv, "\"")
+                }
+            }
+        }
+
+        appendConstant(mv, ")")
+        mv.visitMethodInsn(
+            INVOKEVIRTUAL,
+            "java/lang/StringBuilder",
+            "toString",
+            "()Ljava/lang/String;",
+            false,
+        )
+        mv.visitInsn(ARETURN)
+
+        mv.visitMaxs(0, 0)
+        mv.visitEnd()
+    }
+
+    /**
+     * Appends a nullable `String` in quotes, or the bare word `null` when it is absent.
+     *
+     * The value arrives on top of the builder, and quoting it means putting text on *both* sides —
+     * which the stack cannot do directly, because everything appended has to be pushed after what it
+     * follows. So the value is put in a local for the duration. Slot 1 is free in a `toString` that
+     * takes no parameters, and the method is generated so narrowly that nothing else can want it.
+     */
+    private fun emitQuotedStringAppend(mv: MethodVisitor) {
+        val absent = Label()
+        val end = Label()
+
+        mv.visitVarInsn(ASTORE, 1)
+
+        mv.visitVarInsn(ALOAD, 1)
+        mv.visitJumpInsn(IFNULL, absent)
+
+        appendConstant(mv, "\"")
+        mv.visitVarInsn(ALOAD, 1)
+        mv.visitMethodInsn(
+            INVOKEVIRTUAL,
+            "java/lang/StringBuilder",
+            "append",
+            "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+            false,
+        )
+        appendConstant(mv, "\"")
+        mv.visitJumpInsn(GOTO, end)
+
+        // Absent: `append(Object)` on the `null` prints `null`, unquoted.
+        mv.visitLabel(absent)
+        mv.visitVarInsn(ALOAD, 1)
+        mv.visitMethodInsn(
+            INVOKEVIRTUAL,
+            "java/lang/StringBuilder",
+            "append",
+            "(Ljava/lang/Object;)Ljava/lang/StringBuilder;",
+            false,
+        )
+
+        mv.visitLabel(end)
+    }
+
+    /** Appends the constant string [value] to the `StringBuilder` on the stack. */
+    private fun appendConstant(mv: MethodVisitor, value: String) {
+        mv.visitLdcInsn(value)
+        mv.visitMethodInsn(
+            INVOKEVIRTUAL,
+            "java/lang/StringBuilder",
+            "append",
+            "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+            false,
+        )
+    }
+
+    /**
+     * The `StringBuilder.append` overload [type] needs, so a field prints the way its own `toString`
+     * does.
+     *
+     * `byte` and `short` have no overload of their own and are ints on the stack, so they take
+     * `append(int)`; a `char` has one, because `append(int)` would print a number where
+     * `Character.toString` prints the character itself. Everything else — including a nullable type,
+     * which is carried boxed — takes `append(Object)`, which prints `null` rather than throwing.
+     */
+    private fun appendDescriptorOf(type: NekoType): String = when (type) {
+        BoolType -> "(Z)Ljava/lang/StringBuilder;"
+        CharType -> "(C)Ljava/lang/StringBuilder;"
+        LongType -> "(J)Ljava/lang/StringBuilder;"
+        FloatType -> "(F)Ljava/lang/StringBuilder;"
+        DoubleType -> "(D)Ljava/lang/StringBuilder;"
+        ByteType, ShortType, IntType -> "(I)Ljava/lang/StringBuilder;"
+        else -> "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"
+    }
+
     /** `<init>`'s middle step: every non-static field's initializer, in declaration order. */
     private fun emitFieldInitializers(
         mv: MethodVisitor,
@@ -594,8 +779,11 @@ class BytecodeGenerator(
             val fieldSymbol = field.symbol ?: continue
             val initializer = field.initializer ?: continue
             markLine(mv, initializer)
+            // The receiver sits *under* the value for `putfield`, so it is pushed first — before the
+            // conversion, which would otherwise have a receiver in the way of a boxing `invokestatic`.
             mv.visitVarInsn(ALOAD, 0)
             emitExpression(initializer, scope)
+            emitStoreValue(initializer.type, fieldSymbol.type, mv)
             mv.visitFieldInsn(
                 PUTFIELD,
                 symbol.jvmInternalName,
@@ -700,6 +888,7 @@ class BytecodeGenerator(
             firstSlot = if (symbol.isStatic) 0 else 1,
             static = symbol.isStatic,
             builderPrefix = function.name,
+            returnType = returnType,
         )
 
         for (parameter in parametersByFunction[function].orEmpty()) {
@@ -739,6 +928,7 @@ class BytecodeGenerator(
             is IfStatement -> emitIf(statement, scope)
             is WhileStatement -> emitWhile(statement, scope)
             is WhenStatement -> emitWhen(statement, scope)
+            is NyaStatement -> emitNya(statement, scope)
             is RaiseStatement -> emitRaise(statement, scope)
             is TryStatement -> emitTry(statement, scope)
             is TryCatchStatement -> emitTryCatch(statement, scope)
@@ -751,6 +941,10 @@ class BytecodeGenerator(
         val initializer = statement.initializer
         if (initializer != null) {
             emitExpression(initializer, scope)
+            // A `byte`, `short` or `char` local holds a value narrowed to its type, which is what lets
+            // every later read of it skip the conversion; a nullable one holds a *boxed* value, which
+            // is what lets `null` be stored in it at all.
+            emitStoreValue(initializer.type, symbol.type, scope.mv)
         } else {
             pushDefault(symbol.type, scope.mv)
         }
@@ -775,6 +969,7 @@ class BytecodeGenerator(
             // needs its object on the stack *under* the value, which is why the receiver goes first.
             if (!field.isStatic) emitExpression(memberTarget.receiver, scope)
             emitExpression(statement.value, scope)
+            emitStoreValue(statement.value.type, field.type, scope.mv)
             if (field.isStatic) {
                 scope.mv.visitFieldInsn(
                     PUTSTATIC,
@@ -799,6 +994,7 @@ class BytecodeGenerator(
 
         when (symbol) {
             is LocalSymbol -> {
+                emitStoreValue(statement.value.type, symbol.type, scope.mv)
                 // A statement that introduces the name -- `instance = Instance()`, where nothing was
                 // in scope before -- needs a slot of its own. One that writes to a local which
                 // already exists stores into the slot that local already has, which is what makes a
@@ -817,6 +1013,7 @@ class BytecodeGenerator(
             }
 
             is FieldSymbol -> if (symbol.isStatic) {
+                emitStoreValue(statement.value.type, symbol.type, scope.mv)
                 scope.mv.visitFieldInsn(
                     PUTSTATIC,
                     symbol.enclosingClass.jvmInternalName,
@@ -825,10 +1022,30 @@ class BytecodeGenerator(
                 )
             } else {
                 // Implicit `this.field = value`, which is the only way a bare name reaches an
-                // instance field: the analyzer allows it only inside a non-static member.
-                scope.mv.visitVarInsn(ALOAD, 0)
-                // The receiver must sit *under* the value, so swap the two on the stack.
-                scope.mv.visitInsn(SWAP)
+                // instance field: the analyzer allows it only inside a non-static member. The
+                // receiver has to sit *under* the value for `putfield`, so it is pushed after it and
+                // the two are swapped — which works because the value has already been converted to
+                // the field's type, and every type that can be written this way is one slot wide once
+                // its name is `byte`, `short`, `char`, `int`, `bool`, a reference or a nullable type.
+                // A `long` or a `double` is the exception, and `SWAP` is not defined for a two-slot
+                // value: the value goes into a temporary instead, which keeps the order of evaluation
+                // — the value is still read before the receiver is — with three instructions whose
+                // stack effect is obvious.
+                val twoSlots = BuiltinTypes.slotCountOf(symbol.type) == 2
+                if (twoSlots) {
+                    val scratch = scope.allocateTemp(symbol.type)
+                    scope.mv.visitVarInsn(storeOpcode(symbol.type), scratch)
+                    scope.mv.visitVarInsn(ALOAD, 0)
+                    scope.mv.visitVarInsn(loadOpcode(symbol.type), scratch)
+                } else {
+                    // The conversion happens *before* the receiver is pushed, which is the whole
+                    // reason it sits here rather than after the `SWAP`: boxing a `long` into a
+                    // `long?` pops two slots, and with the receiver already on the stack those two
+                    // would be the receiver and half the value.
+                    emitStoreValue(statement.value.type, symbol.type, scope.mv)
+                    scope.mv.visitVarInsn(ALOAD, 0)
+                    scope.mv.visitInsn(SWAP)
+                }
                 scope.mv.visitFieldInsn(
                     PUTFIELD,
                     symbol.enclosingClass.jvmInternalName,
@@ -848,7 +1065,16 @@ class BytecodeGenerator(
             return
         }
         emitExpression(value, scope)
-        scope.mv.visitInsn(returnOpcode(value.type))
+        // `return b` where `b` is a `byte` has to answer a narrowed `byte`, not the `int` an arithmetic
+        // expression on them left behind, and `return 1` out of a `fun f(): int?` has to answer the
+        // `Integer` the box is — the two conversions a store makes, made to the method's own type.
+        val target = scope.returnType
+        emitStoreValue(value.type, target, scope.mv)
+        // The opcode follows what the *method* is declared to answer, which is what the verifier
+        // checks it against; a rejected body whose method has no type worth speaking of falls back to
+        // the value's own, so a class file still comes out.
+        val opcodeType = if (target === ErrorType || target === VoidType) value.type else target
+        scope.mv.visitInsn(returnOpcode(opcodeType))
     }
 
     /**
@@ -856,7 +1082,8 @@ class BytecodeGenerator(
      * expression's whose extractor it is written in —i.e. it returns from the generated `invoke`.
      *
      * An extractor's `invoke` answers the interface's erased `R`, which is `Object`, so the value is
-     * boxed on the way out; a lambda's answers its own return type and needs no boxing.
+     * boxed on the way out; a lambda's answers its own return type and is converted to it exactly as a
+     * `return` would be —narrowed for a `byte`, and boxed for a nullable one.
      */
     private fun emitYield(statement: YieldStatement, scope: MethodScope) {
         emitExpression(statement.value, scope)
@@ -865,7 +1092,11 @@ class BytecodeGenerator(
             scope.mv.visitInsn(ARETURN)
             return
         }
-        scope.mv.visitInsn(returnOpcode(statement.value.type))
+        emitStoreValue(statement.value.type, scope.returnType, scope.mv)
+        // The lambda's `invoke` answers whatever its function type says. A rejected body can leave the
+        // scope without one, and then the value's own type is the only thing left to answer with.
+        val target = scope.returnType
+        scope.mv.visitInsn(returnOpcode(if (target === VoidType || target === ErrorType) statement.value.type else target))
     }
 
     private fun emitIf(statement: IfStatement, scope: MethodScope) {
@@ -911,7 +1142,7 @@ class BytecodeGenerator(
     private fun emitWhen(statement: WhenStatement, scope: MethodScope) {
         val mv = scope.mv
         val subjectType = statement.subject.type
-        val subjectSlot = scope.allocateTemp()
+        val subjectSlot = scope.allocateTemp(subjectType)
 
         markLine(mv, statement.subject)
         emitExpression(statement.subject, scope)
@@ -926,12 +1157,15 @@ class BytecodeGenerator(
             markLine(mv, condition)
             mv.visitVarInsn(loadOpcode(subjectType), subjectSlot)
             emitExpression(condition, scope)
-            // Only int and bool subjects are comparable with `==` in Neko.
-            if (subjectType == IntType || subjectType == BoolType) {
-                mv.visitJumpInsn(IF_ICMPEQ, bodies[index])
-            } else {
-                mv.visitJumpInsn(IF_ACMPEQ, bodies[index])
-            }
+            // A nullable subject is carried boxed while a literal branch value beside it is still an
+            // `int`, so the value on top has to become a reference before the test — and only then,
+            // because the subject underneath cannot be reached with the condition in the way. Nothing
+            // is boxed on the subject's behalf: a nullable type is never a JVM primitive.
+            if (!BuiltinTypes.isPrimitive(subjectType)) emitBox(condition.type, mv)
+            // A subject and its branch values are compared with the same rule `==` uses: the narrow
+            // types and `bool` in one branch instruction, and a `long`, `float` or `double` through
+            // a `cmp` first, because those are too wide to compare in the jump itself.
+            emitEqualityTest(scope, subjectType, condition.type, bodies[index])
         }
 
         if (elseIndex >= 0) {
@@ -984,7 +1218,7 @@ class BytecodeGenerator(
         val handlerLabels = statement.catches.map { Label() }
         // A `finally` needs somewhere to park the exception it is running on top of, so that it can
         // rethrow it once its body finishes.
-        val pendingSlot = if (finallyBlock != null) scope.allocateTemp() else null
+        val pendingSlot = if (finallyBlock != null) scope.allocateTemp(ThrowableType) else null
 
         mv.visitLabel(start)
         emitStatement(statement.body, scope)
@@ -1050,7 +1284,49 @@ class BytecodeGenerator(
         emitExpression(statement.index, scope)
         emitExpression(statement.value, scope)
         val element = (statement.array.type as? ArrayType)?.element
+        // An element of a `byte[]`, `short[]` or `char[]` is narrowed on the way in, so the array
+        // holds values that are really of its element type rather than the `int` they were computed as;
+        // an element of a nullable element type is boxed, for the same reason a nullable local is.
+        if (element != null) emitStoreValue(statement.value.type, element, mv)
         mv.visitInsn(arrayStoreOpcode(element ?: ErrorType))
+    }
+
+    /**
+     * `nya condition` — jumps over the failure when the condition holds, and throws from here when
+     * it does not.
+     *
+     * The check is the two instructions a guard already compiles to — evaluate, then branch on
+     * zero — so a `nya` that passes costs exactly the comparison it names and nothing else. The
+     * failure path is straight-line code that is normally never run, which is why it is emitted
+     * inline rather than as a helper: falling into it from the branch above is one jump.
+     *
+     * The message is the condition's own source text, taken from its span. That is the reason the
+     * text is not an operand of the statement: the compiler already has the exact expression the
+     * reader wrote, and quoting it back is more accurate than any message they would have written
+     * twice. `AssertionError`'s `String` constructor is private, so the text goes in as an `Object`
+     * — the public constructor that takes one — which is also the one Java's own `assert` uses.
+     */
+    private fun emitNya(statement: NyaStatement, scope: MethodScope) {
+        val mv = scope.mv
+        val passed = Label()
+
+        markLine(mv, statement)
+        emitExpression(statement.condition, scope)
+        mv.visitJumpInsn(IFNE, passed)
+
+        mv.visitTypeInsn(NEW, ASSERTION_ERROR_CLASS)
+        mv.visitInsn(DUP)
+        mv.visitLdcInsn(statement.condition.span.text)
+        mv.visitMethodInsn(
+            INVOKESPECIAL,
+            ASSERTION_ERROR_CLASS,
+            "<init>",
+            "(Ljava/lang/Object;)V",
+            false,
+        )
+        mv.visitInsn(ATHROW)
+
+        mv.visitLabel(passed)
     }
 
     /**
@@ -1080,7 +1356,8 @@ class BytecodeGenerator(
             false,
         )
 
-        val valuesSlot = scope.allocateTemp()
+        // One slot for the `Object[]`, and a reference — so one slot wide whatever was raised.
+        val valuesSlot = scope.allocateTemp(ObjectType)
         mv.visitVarInsn(ASTORE, valuesSlot)
         emitEarlyEmitThrow(scope, valuesSlot)
     }
@@ -1121,19 +1398,23 @@ class BytecodeGenerator(
         )
         mv.visitCode()
 
-        pushInt(valueTypes.size.toLong(), mv)
+        pushInt(valueTypes.size, mv)
         mv.visitTypeInsn(ANEWARRAY, "java/lang/Object")
 
-        // The parameters occupy slots 0..n-1, so the array's slot is the one after them.
-        val arraySlot = valueTypes.size
+        // The parameters occupy slots 0..n-1 *in JVM terms*, which for a `long` or a `double` is two
+        // slots rather than one: the array's slot is the total width of what came before it, not the
+        // number of parameters.
+        val arraySlot = valueTypes.sumOf { BuiltinTypes.slotCountOf(it) }
         mv.visitVarInsn(ASTORE, arraySlot)
 
+        var parameterSlot = 0
         for ((index, type) in valueTypes.withIndex()) {
             mv.visitVarInsn(ALOAD, arraySlot)
-            pushInt(index.toLong(), mv)
-            mv.visitVarInsn(loadOpcode(type), index)
+            pushInt(index, mv)
+            mv.visitVarInsn(loadOpcode(type), parameterSlot)
             emitBox(type, mv)
             mv.visitInsn(AASTORE)
+            parameterSlot += BuiltinTypes.slotCountOf(type)
         }
 
         mv.visitVarInsn(ALOAD, arraySlot)
@@ -1165,7 +1446,9 @@ class BytecodeGenerator(
      */
     private fun emitTryExpression(expression: TryExpression, scope: MethodScope) {
         val mv = scope.mv
-        val resultSlot = scope.allocateTemp()
+        // The slot holds a boxed value from either path, so it is one `Object` wide whatever the
+        // `try` is worth.
+        val resultSlot = scope.allocateTemp(ObjectType)
         emitExtractorTry(expression, scope, resultSlot)
 
         mv.visitVarInsn(ALOAD, resultSlot)
@@ -1195,7 +1478,7 @@ class BytecodeGenerator(
         val after = Label()
 
         // The exception object is kept so its array can be handed to the extractor in a moment.
-        val exceptionSlot = scope.allocateTemp()
+        val exceptionSlot = scope.allocateTemp(ThrowableType)
 
         mv.visitTryCatchBlock(start, end, handler, exceptionClass)
 
@@ -1355,14 +1638,26 @@ class BytecodeGenerator(
             extractorResult = yields,
         )
 
-        // Each `Object` parameter is unboxed into the typed local the body expects to read.
+        // Each `Object` parameter is unboxed into a typed local the body reads.
+        //
+        // The *interface* passes one `Object` per parameter, and those are the first slots — `this`,
+        // then `arity` references. The *locals* the body reads are typed, so a `long` or a `double`
+        // among them needs two slots, and they are therefore allocated after that block rather than
+        // over it: unboxing a `long` into the parameter slots would put its second half on top of the
+        // next incoming `Object`, and the verifier rejects the method outright.
+        val firstLocal = 1 + parameters.size
+        var nextSlot = firstLocal
         parameters.forEachIndexed { index, parameter ->
             val symbol = parameter.symbol ?: return@forEachIndexed
-            val slot = scope.allocate(symbol)
             mv.visitVarInsn(ALOAD, index + 1)
             emitUnbox(parameter.resolvedType ?: ErrorType, mv)
-            mv.visitVarInsn(storeOpcode(symbol.type), slot)
+            mv.visitVarInsn(storeOpcode(symbol.type), nextSlot)
+            scope.reserve(symbol, nextSlot)
+            nextSlot += BuiltinTypes.slotCountOf(symbol.type)
         }
+        // Whatever the body allocates next must not land inside the block just written, so the scope
+        // is told how far it now reaches — a `long` parameter extends it by two rather than one.
+        scope.advancePast(nextSlot)
 
         for (inner in construct.extractorBody.statements) {
             emitStatement(inner, scope)
@@ -1387,41 +1682,139 @@ class BytecodeGenerator(
         return captures to className
     }
 
-    /** Boxes an `int`/`bool` already on the stack; reference types are left alone. */
+    /**
+     * Boxes a primitive already on the stack into its Java reference type; reference types are left
+     * alone.
+     *
+     * Every primitive gets a `valueOf`, including `byte`, `short` and `char`, whose wrappers have had
+     * one since Java 5: a `raise` that carried a `short` has to hand the extractor an object, and the
+     * extractor casts back to whatever the `emit` clause declared.
+     */
     private fun emitBox(type: NekoType, mv: MethodVisitor) {
+        if (!BuiltinTypes.isPrimitive(type)) return
+        val boxed = BuiltinTypes.boxedInternalNameOf(type) ?: return
+        mv.visitMethodInsn(
+            INVOKESTATIC,
+            boxed,
+            "valueOf",
+            "(${descriptorOf(type)})L$boxed;",
+            false,
+        )
+    }
+
+    /**
+     * Unboxes an `Object` on the stack into [type]; reference types are left alone.
+     *
+     * The checkcast is what makes the cast safe rather than hopeful: the value arriving here came from
+     * a `raise` or an erased type parameter, so its static type is `Object` and only the `emit`
+     * clause's declared type says what it really is. A `ClassCastException` from a mismatch is the
+     * right answer — the alternative is a silently wrong value.
+     */
+    private fun emitUnbox(type: NekoType, mv: MethodVisitor) {
         when (type) {
-            IntType -> mv.visitMethodInsn(
-                INVOKESTATIC, "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;", false,
-            )
-
-            BoolType -> mv.visitMethodInsn(
-                INVOKESTATIC, "java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;", false,
-            )
-
+            ByteType -> unboxTo(mv, "java/lang/Byte", "byteValue", "()B")
+            ShortType -> unboxTo(mv, "java/lang/Short", "shortValue", "()S")
+            CharType -> unboxTo(mv, "java/lang/Character", "charValue", "()C")
+            IntType -> unboxTo(mv, "java/lang/Integer", "intValue", "()I")
+            LongType -> unboxTo(mv, "java/lang/Long", "longValue", "()J")
+            FloatType -> unboxTo(mv, "java/lang/Float", "floatValue", "()F")
+            DoubleType -> unboxTo(mv, "java/lang/Double", "doubleValue", "()D")
+            BoolType -> unboxTo(mv, "java/lang/Boolean", "booleanValue", "()Z")
+            StringType -> mv.visitTypeInsn(CHECKCAST, "java/lang/String")
             else -> Unit
         }
     }
 
-    /** Unboxes an `Object` on the stack into [type]; reference types are left alone. */
-    private fun emitUnbox(type: NekoType, mv: MethodVisitor) {
-        when (type) {
-            IntType -> {
-                mv.visitTypeInsn(CHECKCAST, "java/lang/Integer")
-                mv.visitMethodInsn(
-                    INVOKEVIRTUAL, "java/lang/Integer", "intValue", "()I", false,
-                )
-            }
+    /** The `checkcast`-then-`xxxValue` pair every primitive unboxing is. */
+    private fun unboxTo(mv: MethodVisitor, boxed: String, method: String, descriptor: String) {
+        mv.visitTypeInsn(CHECKCAST, boxed)
+        mv.visitMethodInsn(INVOKEVIRTUAL, boxed, method, descriptor, false)
+    }
 
-            BoolType -> {
-                mv.visitTypeInsn(CHECKCAST, "java/lang/Boolean")
-                mv.visitMethodInsn(
-                    INVOKEVIRTUAL, "java/lang/Boolean", "booleanValue", "()Z", false,
-                )
-            }
-
-            StringType -> mv.visitTypeInsn(CHECKCAST, "java/lang/String")
+    /**
+     * Narrows the value on the stack to [to] when that is a type the JVM computes on more widely than
+     * it stores.
+     *
+     * `byte`, `short` and `char` are *not* distinct types to the JVM's instruction set: arithmetic on
+     * them is `int` arithmetic — there is no `BADD` — so `b + b` leaves an `int` on the stack and only
+     * the `istore` that follows makes it a `byte` again. Left alone, `100 + 100` would print `200`
+     * for a type whose every value is between -128 and 127. The explicit `I2B`/`I2S`/`I2C` is what
+     * makes the wrap happen where the language says the type applies.
+     *
+     * Only the *target* type decides this, which is why it is the only parameter: the value on the
+     * stack is an `int` whatever the source type was, and a target that is not one of the three needs
+     * nothing done to it.
+     *
+     * Every *storage point* does this — a declared local, an assignment, a field, an array element and
+     * a `return` — so a value of one of these types is always in range wherever it is kept. That is
+     * also what keeps the check cheap: a value read back out of a local or a field is already
+     * narrowed, so the loads need no conversion of their own.
+     */
+    private fun emitNarrow(to: NekoType, mv: MethodVisitor) {
+        when (to) {
+            ByteType -> mv.visitInsn(I2B)
+            ShortType -> mv.visitInsn(I2S)
+            CharType -> mv.visitInsn(I2C)
             else -> Unit
         }
+    }
+
+    /**
+     * Converts the value of [valueType] on the stack into the representation [targetType] is stored
+     * in, which is the pair of steps every store needs.
+     *
+     * A value only ever arrives here as the *primitive* its expression resolved to, so the two things
+     * that can be missing are both about the target:
+     *
+     *  * a `byte`, `short` or `char` target needs the value narrowed — see [emitNarrow], which is what
+     *    makes the wrap happen where the language says the type applies;
+     *  * a **nullable** target needs the value boxed, because `int?` is carried as a
+     *    `java.lang.Integer` and the `int` on the stack is not one. This is the case the type checker
+     *    makes easy to forget: `x: int? = 1` reads the `1` as an `int` — the nullable type has no
+     *    literal of its own — and is still a legal assignment, so the conversion belongs here rather
+     *    than in a rule about which expressions may be assigned where.
+     *
+     * Equal types need neither, and the equality test is what keeps a reference value from being
+     * narrowed or a plain `int` from being boxed: `descriptorOf` already agrees with the value's own
+     * type in that case, so touching the stack at all would be the mistake.
+     */
+    private fun emitStoreValue(valueType: NekoType, targetType: NekoType, mv: MethodVisitor) {
+        if (valueType === ErrorType || targetType === ErrorType) return
+
+        val target = targetType as? NullableType
+        val stored = target?.inner ?: targetType
+
+        // Only a primitive value ever needs converting. A reference is already what it is: `null` is
+        // the absent value of every nullable reference type, and no conversion could make a `String`
+        // more of a `String`.
+        if (valueType is NullableType || !BuiltinTypes.isPrimitive(valueType)) return
+
+        // A `byte`, `short` or `char` storage holds its value narrowed, whether or not it is nullable.
+        emitNarrow(stored, mv)
+
+        // A reference storage holds the value boxed: `Object` because that is what the declared type
+        // is, and a nullable primitive because the box *is* how `null` is stored in it.
+        if (stored === ObjectType || target != null) emitBox(valueType, mv)
+    }
+
+    /**
+     * Converts a read the analyzer *narrowed* from [declared] to [actual] into the representation
+     * [actual] promises.
+     *
+     * A nullable primitive is stored boxed — that is how `null` fits in an `int?` — so a read that
+     * has been narrowed to the primitive itself arrives as an `Integer` and has to be unboxed
+     * before it can be used as one. The read still loads through the declared descriptor, because
+     * that is what the field or slot actually holds; this is the step that turns it back into the
+     * value the narrowed type says it is.
+     *
+     * A nullable *reference* type needs nothing: `string?` and `string` are the same `String` on the
+     * stack. That is why this asks whether the inner type is a primitive rather than whether the
+     * declared type was nullable at all.
+     */
+    private fun emitNarrowedRead(declared: NekoType, actual: NekoType, mv: MethodVisitor) {
+        if (declared !is NullableType || actual is NullableType) return
+        if (!BuiltinTypes.isPrimitive(declared.inner)) return
+        emitUnbox(declared.inner, mv)
     }
 
     // ----------------------------------------------------------- expressions
@@ -1429,9 +1822,20 @@ class BytecodeGenerator(
     /** Emits [expression], leaving exactly one value on the stack unless its type is void. */
     private fun emitExpression(expression: Expression, scope: MethodScope) {
         when (expression) {
-            is IntegerLiteral -> pushInt(expression.value, scope.mv)
+            is IntegerLiteral -> emitIntegerLiteral(expression, scope.mv)
+            is DoubleLiteral -> if (expression.isFloat) {
+                pushFloat(expression.value.toFloat(), scope.mv)
+            } else {
+                pushDouble(expression.value, scope.mv)
+            }
+
+            is CharLiteral -> pushInt(expression.value.code, scope.mv)
             is StringLiteral -> scope.mv.visitLdcInsn(expression.value)
             is BoolLiteral -> scope.mv.visitInsn(if (expression.value) ICONST_1 else ICONST_0)
+            // `null` is the `aconst_null` the JVM has for it, whatever the nullable type it is being
+            // read as: an `int?` is carried as an `Integer`, so the very same `null` reference is the
+            // absent value of every nullable type there is.
+            is NullLiteral -> scope.mv.visitInsn(ACONST_NULL)
 
             is NameExpression -> emitName(expression, scope)
             is ThisExpression -> scope.mv.visitVarInsn(ALOAD, 0)
@@ -1443,6 +1847,54 @@ class BytecodeGenerator(
             is MemberAccessExpression -> emitMemberAccess(expression, scope)
             is IndexExpression -> emitIndex(expression, scope)
             is TryExpression -> emitTryExpression(expression, scope)
+        }
+    }
+
+    /**
+     * Emits a whole-number literal as the type the analyzer gave it.
+     *
+     * The literal's *text* is not what decides this: `1` used as a `long` is the same digits as `1`
+     * used as an `int`, and the difference is exactly the context the analyzer recorded. Reading the
+     * type back off the node is therefore the only correct source, and it is why the node keeps it.
+     *
+     * A literal analysis rejected still has to produce something, and the `int` reading is the one it
+     * would have had without a context, so a class file still comes out for a program that failed to
+     * compile.
+     */
+    private fun emitIntegerLiteral(expression: IntegerLiteral, mv: MethodVisitor) {
+        when (expression.type) {
+            LongType -> pushLong(expression.signedValue, mv)
+            FloatType -> pushFloat(expression.signedValue.toFloat(), mv)
+            DoubleType -> pushDouble(expression.signedValue.toDouble(), mv)
+            // `byte`, `short`, `char`, `int` and `bool` are all one slot of `int` width on the stack;
+            // the narrowing to the declared type happens where the value is stored, loaded from an
+            // array, or written to a field.
+            else -> pushInt(expression.intValue, mv)
+        }
+    }
+
+    /**
+     * Emits `args` and converts each one to the type its parameter declares.
+     *
+     * A parameter of `Object` accepts a value of any type — that is what a type parameter erases to —
+     * and a primitive handed to one has to be boxed. Doing it from [parameterTypes] rather than from
+     * the argument's own type is what makes it correct for every kind of call: the callee's signature
+     * is what the JVM will check the stack against.
+     *
+     * A mismatch between an argument's type and its parameter's is left alone, because analysis has
+     * already reported it and emitting a conversion the program did not ask for would only move the
+     * failure to the verifier.
+     */
+    private fun emitArguments(
+        arguments: List<Expression>,
+        parameterTypes: List<NekoType>,
+        scope: MethodScope,
+    ) {
+        arguments.forEachIndexed { index, argument ->
+            emitExpression(argument, scope)
+            val parameterType = parameterTypes.getOrNull(index) ?: return@forEachIndexed
+            if (argument.type == parameterType || argument.type === ErrorType) return@forEachIndexed
+            emitCoerce(argument.type, parameterType, scope)
         }
     }
 
@@ -1473,6 +1925,23 @@ class BytecodeGenerator(
                 field.name,
                 descriptorOf(field.type),
             )
+            emitNarrowedRead(field.type, expression.type, mv)
+            return
+        }
+
+        if (expression.isSafeCall) {
+            emitSafeReceiver(expression.receiver, scope, absent = true) {
+                mv.visitFieldInsn(
+                    GETFIELD,
+                    field.enclosingClass.jvmInternalName,
+                    field.name,
+                    descriptorOf(field.type),
+                )
+                // The read's type is the field's made nullable, so a primitive field is carried
+                // boxed — and has to be, or the two arms of the guard would leave an `int` and a
+                // `null` and the verifier would reject the merge.
+                emitBox(field.type, mv)
+            }
             return
         }
 
@@ -1483,6 +1952,51 @@ class BytecodeGenerator(
             field.name,
             descriptorOf(field.type),
         )
+        // A read of a `val` field the analyzer narrowed — `if (point.x != null) { point.x }` — has the
+        // narrowed type, and the field is still stored with its declared one.
+        emitNarrowedRead(field.type, expression.type, mv)
+    }
+
+    /**
+     * Emits `receiver?.member` or `callee?(...)`: the receiver, a null test, and [onPresent] for the
+     * case it is there.
+     *
+     * The three instructions before the branch are the whole of `?.`. The receiver is pushed once and
+     * `dup`ed, because it is needed both for the test and for the `getfield`/`invokevirtual` that
+     * follows; the copy is what the test consumes. If it is null the copy is discarded and the
+     * expression's answer is pushed instead, and the jump over [onPresent] is what makes the member
+     * *not* be read — a `?.` on an absent receiver must not evaluate the arguments either, which is
+     * why they are emitted inside [onPresent] rather than before the guard.
+     *
+     * [receiver] is the expression being guarded. For `?.` that is the object whose member is read;
+     * for `f?(...)` it is the function value being called, which is why this takes the expression
+     * rather than a `MemberAccessExpression` — the two safe forms differ in *what* is guarded, not in
+     * how, and sharing the guard is what keeps them from drifting apart.
+     *
+     * [absent] says whether the absent case has an answer to push. It does for every expression —
+     * `null`, which is the whole point of the safe call — except a call to a function that returns
+     * nothing, where there is no value to be absent and the arm has to leave the stack as it found it.
+     */
+    private fun emitSafeReceiver(
+        receiver: Expression,
+        scope: MethodScope,
+        absent: Boolean,
+        onPresent: () -> Unit,
+    ) {
+        val mv = scope.mv
+        val present = Label()
+        val end = Label()
+
+        emitExpression(receiver, scope)
+        mv.visitInsn(DUP)
+        mv.visitJumpInsn(IFNONNULL, present)
+        mv.visitInsn(POP)
+        if (absent) mv.visitInsn(ACONST_NULL)
+        mv.visitJumpInsn(GOTO, end)
+
+        mv.visitLabel(present)
+        onPresent()
+        mv.visitLabel(end)
     }
 
     private fun emitName(expression: NameExpression, scope: MethodScope) {
@@ -1491,6 +2005,9 @@ class BytecodeGenerator(
                 val slot = scope.slotOf(symbol)
                 if (slot != null) {
                     scope.mv.visitVarInsn(loadOpcode(symbol.type), slot)
+                    // The slot is declared with the symbol's own type; a narrowed read says the value
+                    // is there, which for a nullable primitive means it is no longer a box.
+                    emitNarrowedRead(symbol.type, expression.type, scope.mv)
                     return
                 }
                 // Not a local of this method: the lambda must have captured it.
@@ -1498,6 +2015,7 @@ class BytecodeGenerator(
                 if (capture != null) {
                     scope.mv.visitVarInsn(ALOAD, 0)
                     scope.mv.visitFieldInsn(GETFIELD, scope.owner, capture, descriptorOf(symbol.type))
+                    emitNarrowedRead(symbol.type, expression.type, scope.mv)
                     return
                 }
                 scope.mv.visitInsn(pushDefaultOpcode(symbol.type))
@@ -1510,6 +2028,7 @@ class BytecodeGenerator(
                     symbol.name,
                     descriptorOf(symbol.type),
                 )
+                emitNarrowedRead(symbol.type, expression.type, scope.mv)
             } else {
                 // An implicit `this.field` read: the analyzer only allows a bare reference here
                 // inside a non-static method, so slot 0 holds the receiver.
@@ -1520,6 +2039,7 @@ class BytecodeGenerator(
                     symbol.name,
                     descriptorOf(symbol.type),
                 )
+                emitNarrowedRead(symbol.type, expression.type, scope.mv)
             }
 
             is FunctionSymbol ->
@@ -1553,6 +2073,13 @@ class BytecodeGenerator(
             return
         }
 
+        // `==` emits its own operands, because whether they are compared as primitives or as
+        // references decides what has to happen to each of them on the way in.
+        if (operator == BinaryOperator.EQUAL || operator == BinaryOperator.NOT_EQUAL) {
+            emitEquality(expression, scope)
+            return
+        }
+
         emitExpression(expression.left, scope)
         emitExpression(expression.right, scope)
 
@@ -1568,56 +2095,188 @@ class BytecodeGenerator(
             return
         }
 
+        // The operands' *own* type picks the instruction, not the expression's: a comparison is worth
+        // a `bool` but adds two `long`s. The analyzer has already established that both operands share
+        // one numeric type and that it is a numeric one, so this reads that type off the left operand.
+        val operandType = expression.left.type
+
         when (operator) {
-            BinaryOperator.ADD -> mv.visitInsn(IADD)
-            BinaryOperator.SUBTRACT -> mv.visitInsn(ISUB)
-            BinaryOperator.MULTIPLY -> mv.visitInsn(IMUL)
-            BinaryOperator.DIVIDE -> mv.visitInsn(IDIV)
-            BinaryOperator.REMAINDER -> mv.visitInsn(IREM)
-            BinaryOperator.EQUAL, BinaryOperator.NOT_EQUAL -> emitEquality(expression, scope)
-            BinaryOperator.LESS -> emitComparison(scope, IF_ICMPLT)
-            BinaryOperator.LESS_EQUAL -> emitComparison(scope, IF_ICMPLE)
-            BinaryOperator.GREATER -> emitComparison(scope, IF_ICMPGT)
-            BinaryOperator.GREATER_EQUAL -> emitComparison(scope, IF_ICMPGE)
+            BinaryOperator.ADD -> mv.visitInsn(arithmeticOpcode(IADD, LADD, FADD, DADD, operandType))
+            BinaryOperator.SUBTRACT ->
+                mv.visitInsn(arithmeticOpcode(ISUB, LSUB, FSUB, DSUB, operandType))
+
+            BinaryOperator.MULTIPLY ->
+                mv.visitInsn(arithmeticOpcode(IMUL, LMUL, FMUL, DMUL, operandType))
+
+            BinaryOperator.DIVIDE ->
+                mv.visitInsn(arithmeticOpcode(IDIV, LDIV, FDIV, DDIV, operandType))
+
+            BinaryOperator.REMAINDER ->
+                mv.visitInsn(arithmeticOpcode(IREM, LREM, FREM, DREM, operandType))
+
+            BinaryOperator.EQUAL, BinaryOperator.NOT_EQUAL -> Unit // handled above
+            BinaryOperator.LESS -> emitComparison(scope, BinaryOperator.LESS, operandType)
+            BinaryOperator.LESS_EQUAL -> emitComparison(scope, BinaryOperator.LESS_EQUAL, operandType)
+            BinaryOperator.GREATER -> emitComparison(scope, BinaryOperator.GREATER, operandType)
+            BinaryOperator.GREATER_EQUAL ->
+                emitComparison(scope, BinaryOperator.GREATER_EQUAL, operandType)
+
             BinaryOperator.AND, BinaryOperator.OR -> Unit // handled above
         }
     }
 
     /**
-     * `==` on primitives is a numeric compare; on everything else it is `equals`, dispatched
-     * virtually on the left operand.
+     * The instruction that applies an arithmetic operator to two values of [type].
      *
-     * The owner is `java/lang/Object` rather than the operand's own class. `invokevirtual` picks the
-     * method from the receiver's run-time class, so naming the top of the hierarchy is enough and is
-     * always verifiable: the receiver is by definition assignable to `Object`. Naming a narrower
-     * owner is not — a `String` receiver was assumed for every reference type here once, which made
-     * `a == b` on two plain objects emit a call to `String.equals` on a `Plain`, and the class failed
-     * to load with a `VerifyError` instead of comparing anything. Strings still reach
-     * `String.equals` through this call; they simply are not the only thing that can.
+     * `byte`, `short`, `char`, `int` and `bool` share the `int` instruction because that is how the
+     * JVM computes on them: a `char` sum is an `int` sum, and the value is narrowed back to the
+     * declared type when it is stored. There is no promotion here, because the analyzer has already
+     * required both operands to be the same type — the choice is only about *width*.
+     */
+    private fun arithmeticOpcode(int: Int, long: Int, float: Int, double: Int, type: NekoType): Int =
+        when (type) {
+            LongType -> long
+            FloatType -> float
+            DoubleType -> double
+            else -> int
+        }
+
+    /**
+     * The `cmp` that reduces two [type] values on the stack to an `int` of -1, 0 or 1.
+     *
+     * `cmpg` is the variant that answers 1 for `NaN`, which is the right answer for an equality test
+     * because `NaN == anything` is false either way; the distinction only matters for the relational
+     * operators, and [emitComparison] is where it does.
+     */
+    private fun wideCompareOpcode(type: NekoType): Int = when (type) {
+        LongType -> LCMP
+        FloatType -> FCMPG
+        DoubleType -> DCMPG
+        else -> error("'$type' is not a wide primitive")
+    }
+
+    /**
+     * Reduces a `long`/`float`/`double` already on the stack to the `int` its class' own `hashCode`
+     * answers.
+     *
+     * The three folds are the ones `java.lang.Long`, `Float` and `Double` document, written out rather
+     * than called: calling them would box the value first, and a derived `hashCode` that allocates
+     * once per field is the cost `Objects.hash` was avoided for in the first place. `long` folds its
+     * two halves together, `float` is the bits of its `int` representation, and `double` first widens
+     * to a `long` and folds that.
+     */
+    private fun emitWideHashOf(type: NekoType, mv: MethodVisitor) {
+        when (type) {
+            FloatType -> mv.visitMethodInsn(
+                INVOKESTATIC,
+                "java/lang/Float",
+                "floatToIntBits",
+                "(F)I",
+                false,
+            )
+
+            DoubleType -> {
+                mv.visitMethodInsn(
+                    INVOKESTATIC,
+                    "java/lang/Double",
+                    "doubleToLongBits",
+                    "(D)J",
+                    false,
+                )
+                foldLongToInt(mv)
+            }
+
+            LongType -> foldLongToInt(mv)
+
+            else -> error("'$type' is not a wide primitive")
+        }
+    }
+
+    /** `(int) (value ^ (value >>> 32))` for the `long` on the stack, which is `Long.hashCode`. */
+    private fun foldLongToInt(mv: MethodVisitor) {
+        mv.visitInsn(DUP2)
+        pushInt(32, mv)
+        mv.visitInsn(LUSHR)
+        mv.visitInsn(LXOR)
+        mv.visitInsn(L2I)
+    }
+
+    /**
+     * A null-safe `==` or `!=` that never throws.
+     *
+     * The one hazard a comparison of two references has is a `null` operand reaching a method call.
+     * `a.equals(b)` throws when `a` is `null`, and that is precisely the failure this must not have:
+     * `x == null` and `x != null` are the only ways a Neko program can *ask* whether a nullable value
+     * is absent, so failing on the absent case would make the question unaskable. Every path below is
+     * therefore chosen so that neither operand is ever dereferenced.
+     *
+     * Which path is decided by what the two operands are, not by one of them alone. A literal `null`
+     * is a `NullLiteral` whose own type is not a value type at all — it is whatever the surrounding
+     * context said — so the only reliable reading is the analyser's verdict on the pair: if the two
+     * types are comparable through `isAssignableTo` in one direction, then one of them is the other's
+     * supertype and the comparison is a reference one, however the operands are spelled.
+     *
+     * The two reference paths differ only in what they can do without a `null` test. A **literal**
+     * `null` is known to be `null` at compile time, so `ref == null` is an `ifnull` — one instruction,
+     * no call, nothing to throw. Anything else goes through `java.util.Objects.equals`, which tests
+     * both arguments for `null` before comparing them and so is safe in every direction; it is also
+     * what makes `a == b` on two plain objects compare their fields rather than their identities.
      */
     private fun emitEquality(expression: BinaryExpression, scope: MethodScope) {
         val mv = scope.mv
-        val operandType = expression.left.type
+        val left = expression.left
+        val right = expression.right
+        val leftType = left.type
+        val rightType = right.type
         val wantsEqual = expression.operator == BinaryOperator.EQUAL
 
-        if (operandType == IntType || operandType == BoolType) {
-            emitComparison(scope, if (wantsEqual) IF_ICMPEQ else IF_ICMPNE)
+        // A comparison where either side failed to type is emitted with the operands' own default
+        // shape — a reference compare — so the method stays verifiable while the diagnostics stand.
+        val notComparable = leftType === ErrorType || rightType === ErrorType ||
+            leftType === VoidType || rightType === VoidType
+
+        // `x == null` / `null == x`: the literal side is null by construction, so the *other* side is
+        // compared against it with one null test rather than a call.
+        val nullLiteralOnLeft = left is NullLiteral
+        val nullLiteralOnRight = right is NullLiteral
+        if (!notComparable && (nullLiteralOnLeft || nullLiteralOnRight)) {
+            val other = if (nullLiteralOnLeft) right else left
+            emitExpression(other, scope)
+            // `x == null` is true when `x` is null; `x != null` is true when it is not.
+            emitNullTestJump(scope, if (wantsEqual) IFNULL else IFNONNULL)
             return
         }
 
-        // A `meow class` compares through the `equals` derived from its fields. This dispatch is
-        // essential rather than convenient: Neko has no `is` operator and no cast, so without it
-        // `a == b` would fall through to the call below and the generated method would be
-        // unreachable from any program.
-        val meowClass = meowClassOf(operandType)
-        val owner = meowClass?.jvmInternalName ?: "java/lang/Object"
-        mv.visitMethodInsn(
-            INVOKEVIRTUAL,
-            owner,
-            "equals",
-            "(Ljava/lang/Object;)Z",
-            false,
-        )
+        // A primitive comparison, which for every type the JVM has an instruction for is the same
+        // shape: leave an `int` on the stack — from `lcmp`/`fcmp`/`dcmp` when the values are too wide
+        // to compare with a jump — and test it against zero.
+        if (!notComparable && BuiltinTypes.isPrimitive(leftType) && BuiltinTypes.isPrimitive(rightType)) {
+            emitExpression(left, scope)
+            emitExpression(right, scope)
+            when (leftType) {
+                LongType, FloatType, DoubleType -> {
+                    mv.visitInsn(wideCompareOpcode(leftType))
+                    emitComparisonJump(scope, if (wantsEqual) IFEQ else IFNE)
+                }
+
+                // `byte`, `short`, `char`, `int` and `bool` are ints on the stack.
+                else -> emitComparisonJump(scope, if (wantsEqual) IF_ICMPEQ else IF_ICMPNE)
+            }
+            return
+        }
+
+        emitExpression(left, scope)
+        // `x == 1` for an `int?` is the case this handles: a nullable operand is carried boxed while
+        // the literal beside it is still an `int`, so the value that is not boxed yet has to be — or
+        // the pair handed to `Objects.equals` would be a reference and an `int`.
+        emitBox(leftType, mv)
+        emitExpression(right, scope)
+        emitBox(rightType, mv)
+
+        // A nullable primitive is carried boxed, so `int? == int?` compares two `Integer`s through
+        // `Objects.equals` and answers by value — which is what makes `x == 1` true for an `int?`
+        // holding one, and cannot throw on the absent one.
+        emitReferenceEquality(scope)
 
         if (!wantsEqual) {
             val trueLabel = Label()
@@ -1632,22 +2291,12 @@ class BytecodeGenerator(
     }
 
     /**
-     * The symbol [type] names when it is a `meow class`, or `null` for everything else.
+     * `x == null` as a `bool`: an `ifnull` that leaves `1`, and the other arm leaving `0`.
      *
-     * The test is on the class *symbol* rather than on the name: a class that merely happens to be
-     * called `Point` has whatever `equals` its author wrote, and dispatching `==` to a derived one
-     * would call a method that class file does not have.
-     *
-     * A meow class held as an `Object` — the one type through which the JVM erases a type parameter —
-     * is not recognised here and falls back to `String.equals`. That is unreachable from Neko: a
-     * value's type is what its expression resolved to, and nothing in the language can name a class
-     * it declares as an `Object`.
+     * [opcode] is the branch that means "the answer is true" — `IFNULL` for `==` and `IFNONNULL` for
+     * `!=` — so the two callers share the shape and differ only in which test they ask for.
      */
-    private fun meowClassOf(type: NekoType): ClassSymbol? =
-        ((type as? ClassType)?.let { classes[it.simpleName] })?.takeIf { it.isMeow }
-
-    /** Emits `a op b` for the two int operands already on the stack, leaving a boolean. */
-    private fun emitComparison(scope: MethodScope, opcode: Int) {
+    private fun emitNullTestJump(scope: MethodScope, opcode: Int) {
         val mv = scope.mv
         val trueLabel = Label()
         val endLabel = Label()
@@ -1657,6 +2306,136 @@ class BytecodeGenerator(
         mv.visitLabel(trueLabel)
         mv.visitInsn(ICONST_1)
         mv.visitLabel(endLabel)
+    }
+
+    /**
+     * Emits `a == b` for two *reference* values already on the stack, leaving a `bool`.
+     *
+     * This is `java.util.Objects.equals`, which answers `true` for two `null`s and `false` for exactly
+     * one of them, without ever dereferencing either argument. Hand-rolled, that is a `null` test on
+     * both sides around an `equals` call; `Objects.equals` is that same chain, written once by the JDK
+     * and already used by the `equals` a `meow class` derives, so the two spellings of "are these
+     * equal?" agree by construction.
+     *
+     * It also dispatches properly. A `meow class` compares through its derived `equals`, and so does
+     * everything else through whatever `equals` its class declares — `String.equals` for two strings,
+     * `Object.equals` for two classes that declare none — because `Objects.equals` calls
+     * `a.equals(b)` internally, with `a` already known not to be `null`.
+     *
+     * Nothing here needs to know the operands' type: `Objects.equals` takes two `Object`s and every
+     * reference is one, so no `checkcast` is due and no narrower owner can be named. That the type is
+     * not a parameter is the point — a version of this that took one is how `a == b` on two plain
+     * objects once came to emit a call to `String.equals` and fail to verify.
+     */
+    private fun emitReferenceEquality(scope: MethodScope) {
+        scope.mv.visitMethodInsn(
+            INVOKESTATIC,
+            "java/util/Objects",
+            "equals",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+            false,
+        )
+    }
+
+    /**
+     * Branches to [target] when the two values already on the stack — a `when` subject of
+     * [operandType] and one branch value of [valueType] — are equal.
+     *
+     * `when` needs a *test* rather than the `bool` [emitEquality] materialises, and both are built from
+     * the same two steps: a `cmp` for the types too wide for a branch instruction, then one conditional
+     * jump. Keeping the two side by side is what stops the spellings of "are these equal?" drifting
+     * apart — a `when` over `long` that fell through to reference equality would compile and never
+     * match.
+     *
+     * Both types decide which of the two comparisons it is, so both are passed: a branch value read in
+     * a nullable subject's type is a plain `int` while the subject is a boxed one, and comparing those
+     * with `IF_ICMPEQ` would be a verification error.
+     */
+    private fun emitEqualityTest(
+        scope: MethodScope,
+        operandType: NekoType,
+        valueType: NekoType,
+        target: Label,
+    ) {
+        val mv = scope.mv
+        if (BuiltinTypes.isPrimitive(operandType) && BuiltinTypes.isPrimitive(valueType)) {
+            when (operandType) {
+                LongType, FloatType, DoubleType -> {
+                    mv.visitInsn(wideCompareOpcode(operandType))
+                    mv.visitJumpInsn(IFEQ, target)
+                }
+
+                else -> mv.visitJumpInsn(IF_ICMPEQ, target)
+            }
+            return
+        }
+
+        emitReferenceEquality(scope)
+        mv.visitJumpInsn(IFNE, target)
+    }
+
+    /**
+     * Emits `a op b` for two operands of [operandType] already on the stack, leaving a boolean.
+     *
+     * The JVM splits comparisons in two, and the split is not cosmetic. A `byte`, `short`, `char`,
+     * `int` or `bool` fits in the branch instruction itself, so `IF_ICMPLT` compares and branches in
+     * one step. A `long`, `float` or `double` is too wide for that: `lcmp`/`fcmp`/`dcmp` reduce the
+     * pair to an `int` of -1, 0 or 1, and a second branch tests *that* against zero.
+     *
+     * Which of the two `fcmp`/`dcmp` variants is used is what decides the answer for `NaN`, and the
+     * choice is the one Java makes: `cmpl` answers -1 when either operand is `NaN` and `cmpg` answers
+     * 1, so `<` and `<=` take the `cmpg` form — `NaN` is not less than anything — while `>` and `>=`
+     * take `cmpl`. Getting this backwards would make every comparison against `NaN` answer `true`,
+     * which is the opposite of what IEEE 754 and every other language say.
+     */
+    private fun emitComparison(scope: MethodScope, operator: BinaryOperator, operandType: NekoType) {
+        val mv = scope.mv
+        when (operandType) {
+            LongType, FloatType, DoubleType -> {
+                mv.visitInsn(wideComparisonFor(operator, operandType))
+                emitComparisonJump(scope, cmpResultJump(operator))
+            }
+
+            // `byte`, `short`, `char`, `int` and `bool` are all ints on the stack, so one branch
+            // instruction does the whole comparison.
+            else -> emitComparisonJump(scope, intComparisonJump(operator))
+        }
+    }
+
+    /**
+     * Emits a branch followed by a materialised `0`/`1`, turning a jump into a `bool`.
+     *
+     * [opcode] is the jump that is taken when the comparison *holds*: the `true` path is the fall
+     * through, which is what keeps a single shape for both the one-step and the two-step comparisons.
+     */
+    private fun emitComparisonJump(scope: MethodScope, opcode: Int) {
+        val mv = scope.mv
+        val trueLabel = Label()
+        val endLabel = Label()
+        mv.visitJumpInsn(opcode, trueLabel)
+        mv.visitInsn(ICONST_0)
+        mv.visitJumpInsn(GOTO, endLabel)
+        mv.visitLabel(trueLabel)
+        mv.visitInsn(ICONST_1)
+        mv.visitLabel(endLabel)
+    }
+
+    /** The `IF_ICMP*` that is taken when `a op b` holds, for int-shaped operands. */
+    private fun intComparisonJump(operator: BinaryOperator): Int = when (operator) {
+        BinaryOperator.LESS -> IF_ICMPLT
+        BinaryOperator.LESS_EQUAL -> IF_ICMPLE
+        BinaryOperator.GREATER -> IF_ICMPGT
+        BinaryOperator.GREATER_EQUAL -> IF_ICMPGE
+        else -> error("'${operator.display}' is not a relational operator")
+    }
+
+    /** The test of a `cmp` result that is taken when `a op b` holds, for wide operands. */
+    private fun cmpResultJump(operator: BinaryOperator): Int = when (operator) {
+        BinaryOperator.LESS -> IFLT
+        BinaryOperator.LESS_EQUAL -> IFLE
+        BinaryOperator.GREATER -> IFGT
+        BinaryOperator.GREATER_EQUAL -> IFGE
+        else -> error("'${operator.display}' is not a relational operator")
     }
 
     /**
@@ -1671,10 +2450,13 @@ class BytecodeGenerator(
      */
     private fun emitChainedComparison(expression: ChainedComparisonExpression, scope: MethodScope) {
         val mv = scope.mv
+        val operandType = expression.operands.first().type
         val slots = expression.operands.map { operand ->
             emitExpression(operand, scope)
-            val slot = scope.allocateTemp()
-            mv.visitVarInsn(ISTORE, slot)
+            // A `long` or a `double` takes two slots, so the temporary is asked for by type rather
+            // than by count: a bare count would hand the next one the second half of this value.
+            val slot = scope.allocateTemp(operandType)
+            mv.visitVarInsn(storeOpcode(operandType), slot)
             slot
         }
 
@@ -1682,10 +2464,10 @@ class BytecodeGenerator(
         val endLabel = Label()
 
         for (index in expression.operators.indices) {
-            mv.visitVarInsn(ILOAD, slots[index])
-            mv.visitVarInsn(ILOAD, slots[index + 1])
+            mv.visitVarInsn(loadOpcode(operandType), slots[index])
+            mv.visitVarInsn(loadOpcode(operandType), slots[index + 1])
             // The negated test jumps to `false`, so every comparison must hold to reach `true`.
-            mv.visitJumpInsn(negatedComparisonOpcode(expression.operators[index]), falseLabel)
+            emitNegatedComparison(scope, expression.operators[index], operandType, falseLabel)
         }
 
         mv.visitInsn(ICONST_1)
@@ -1693,6 +2475,41 @@ class BytecodeGenerator(
         mv.visitLabel(falseLabel)
         mv.visitInsn(ICONST_0)
         mv.visitLabel(endLabel)
+    }
+
+    /**
+     * Branches to [target] when `a op b` does **not** hold, for the two operands already on the stack.
+     *
+     * The wide types need the same `cmp`-then-test split [emitComparison] makes; the narrow ones are
+     * one negated branch instruction.
+     */
+    private fun emitNegatedComparison(
+        scope: MethodScope,
+        operator: BinaryOperator,
+        operandType: NekoType,
+        target: Label,
+    ) {
+        val mv = scope.mv
+        when (operandType) {
+            LongType, FloatType, DoubleType -> {
+                mv.visitInsn(wideComparisonFor(operator, operandType))
+                mv.visitJumpInsn(negatedCmpResultJump(operator), target)
+            }
+
+            else -> mv.visitJumpInsn(negatedComparisonOpcode(operator), target)
+        }
+    }
+
+    /**
+     * The `cmp` a comparison on [type] uses, chosen for its `NaN` answer as [emitComparison] describes.
+     *
+     * `long` has only one `cmp`, so the choice only exists for the two floating-point types.
+     */
+    private fun wideComparisonFor(operator: BinaryOperator, type: NekoType): Int = when (type) {
+        LongType -> LCMP
+        FloatType -> if (operator == BinaryOperator.LESS || operator == BinaryOperator.LESS_EQUAL) FCMPG else FCMPL
+        DoubleType -> if (operator == BinaryOperator.LESS || operator == BinaryOperator.LESS_EQUAL) DCMPG else DCMPL
+        else -> error("'$type' is not a wide primitive")
     }
 
     /** The opcode that jumps when `a op b` is *false*, used to short-circuit a comparison chain. */
@@ -1704,10 +2521,29 @@ class BytecodeGenerator(
         else -> error("'${operator.display}' is not a relational operator")
     }
 
+    /** The test of a `cmp` result that is taken when `a op b` is *false*. */
+    private fun negatedCmpResultJump(operator: BinaryOperator): Int = when (operator) {
+        BinaryOperator.LESS -> IFGE
+        BinaryOperator.LESS_EQUAL -> IFGT
+        BinaryOperator.GREATER -> IFLE
+        BinaryOperator.GREATER_EQUAL -> IFLT
+        else -> error("'${operator.display}' is not a relational operator")
+    }
+
     private fun emitUnary(expression: UnaryExpression, scope: MethodScope) {
         emitExpression(expression.operand, scope)
         when (expression.operator) {
-            UnaryOperator.NEGATE -> scope.mv.visitInsn(INEG)
+            // The operand's own type picks the negation, and the result keeps that type: `-1L` is a
+            // `long` and `-1.5f` a `float`, so a negated value fits wherever an unnegated one did.
+            UnaryOperator.NEGATE -> scope.mv.visitInsn(
+                when (expression.operand.type) {
+                    LongType -> LNEG
+                    FloatType -> FNEG
+                    DoubleType -> DNEG
+                    else -> INEG
+                },
+            )
+
             UnaryOperator.NOT -> {
                 // `!b` is `b == 0`.
                 val mv = scope.mv
@@ -1751,20 +2587,40 @@ class BytecodeGenerator(
         if (instanceMethod != null) {
             val receiver = expression.instanceReceiver
             if (receiver != null) {
-                emitExpression(receiver, scope)
-                for (argument in expression.arguments) emitExpression(argument, scope)
-                // A method declared in an interface must be dispatched with `invokeinterface`; the
-                // JVM treats using `invokevirtual` on one as a verification error.
-                val opcode = if (instanceMethod.ownerIsInterface) INVOKEINTERFACE else INVOKEVIRTUAL
-                mv.visitMethodInsn(
-                    opcode,
-                    instanceMethod.jvmOwner,
-                    instanceMethod.name,
-                    descriptorOf(instanceMethod.parameterTypes, instanceMethod.returnType),
-                    instanceMethod.ownerIsInterface,
-                )
+                val call = {
+                    emitArguments(expression.arguments, instanceMethod.parameterTypes, scope)
+                    // A method declared in an interface must be dispatched with `invokeinterface`; the
+                    // JVM treats using `invokevirtual` on one as a verification error.
+                    val opcode = if (instanceMethod.ownerIsInterface) INVOKEINTERFACE else INVOKEVIRTUAL
+                    mv.visitMethodInsn(
+                        opcode,
+                        instanceMethod.jvmOwner,
+                        instanceMethod.name,
+                        descriptorOf(instanceMethod.parameterTypes, instanceMethod.returnType),
+                        instanceMethod.ownerIsInterface,
+                    )
+                    // A safe call's own type is the return type made nullable, so a function answering
+                    // a primitive answers a boxed one here: the absent arm pushes `null`, and the two
+                    // arms have to meet on the same type.
+                    if (expression.type is NullableType) emitBox(instanceMethod.returnType, mv)
+                }
+                // `recv?.f(...)`: the receiver is tested for null, and the call — arguments included —
+                // happens only when it is there. The call's own type is nullable, so an absent
+                // receiver answers `null`; a function that returns nothing has no such value, and the
+                // guard leaves the stack empty instead.
+                if (callee is MemberAccessExpression && callee.isSafeCall) {
+                    emitSafeReceiver(
+                        callee.receiver,
+                        scope,
+                        absent = instanceMethod.returnType !== VoidType,
+                        onPresent = call,
+                    )
+                } else {
+                    emitExpression(receiver, scope)
+                    call()
+                }
             } else {
-                for (argument in expression.arguments) emitExpression(argument, scope)
+                emitArguments(expression.arguments, instanceMethod.parameterTypes, scope)
                 mv.visitMethodInsn(
                     INVOKESTATIC,
                     instanceMethod.jvmOwner,
@@ -1786,21 +2642,47 @@ class BytecodeGenerator(
 
         // Calling a value of function type: push the callee, then the arguments.
         val calleeType = expression.callee.type
-        emitExpression(callee, scope)
-        for (argument in expression.arguments) emitExpression(argument, scope)
 
-        if (calleeType is FunctionType) {
-            mv.visitMethodInsn(
-                INVOKEINTERFACE,
-                functionInterfaceName(calleeType),
-                INVOKE_METHOD_NAME,
-                descriptorOf(calleeType.parameters, calleeType.returnType),
-                true,
-            )
-        } else {
-            // Analysis already reported that this is not callable.
-            popIfValue(calleeType, mv)
+        if (calleeType is FunctionType || (calleeType is NullableType && calleeType.inner is FunctionType)) {
+            // The signature lives under the `?`, if there is one: a nullable function value is still
+            // called with the interface its own type names.
+            val functionType = calleeType.unwrapNullable() as FunctionType
+            val call = {
+                // A function *value*'s signature is its own type, so that is what the arguments are
+                // converted against — there is no symbol to ask.
+                emitArguments(expression.arguments, functionType.parameters, scope)
+                mv.visitMethodInsn(
+                    INVOKEINTERFACE,
+                    functionInterfaceName(functionType),
+                    INVOKE_METHOD_NAME,
+                    descriptorOf(functionType.parameters, functionType.returnType),
+                    true,
+                )
+                // A safe call answers `null` when the callee was absent, so a function answering a
+                // primitive is carried boxed here — the two arms have to meet on the same type.
+                if (expression.type is NullableType) emitBox(functionType.returnType, mv)
+            }
+
+            // `f?(...)`: the callee is tested for null, and the call — arguments included — happens
+            // only when it is there. There is no receiver to guard, so the guard is on the callee.
+            if (expression.isSafeCall) {
+                emitSafeReceiver(
+                    expression.callee,
+                    scope,
+                    absent = functionType.returnType !== VoidType,
+                    onPresent = call,
+                )
+            } else {
+                emitExpression(callee, scope)
+                call()
+            }
+            return
         }
+
+        // Analysis already reported that this is not callable.
+        emitExpression(callee, scope)
+        emitArguments(expression.arguments, emptyList(), scope)
+        popIfValue(calleeType, mv)
     }
 
     /**
@@ -1842,17 +2724,18 @@ class BytecodeGenerator(
     }
 
     /**
-     * Converts the value on the stack from [from] to [to].
+     * Converts the value on the stack from [from] to the type [to] a parameter declares.
      *
-     * Two conversions are possible in Neko: boxing a primitive into the `Object` a type parameter
-     * erased to, and boxing it for an `Object` parameter. The reverse —unboxing —is the extractor's
-     * job at run time, because only then is the concrete type known.
+     * Three conversions are possible in Neko, and all three are about the *target*: boxing a
+     * primitive into the `Object` a type parameter erased to, boxing it into an `Object` parameter,
+     * and boxing it into a nullable one — where the box is not a convenience but the only way the
+     * value can be carried, since `int?` is an `Integer`. Narrowing is the fourth, for a `byte`,
+     * `short` or `char` parameter. The reverse —unboxing —is the extractor's job at run time, because
+     * only then is the concrete type known.
      */
     private fun emitCoerce(from: NekoType, to: NekoType?, scope: MethodScope) {
         if (to == null) return
-        if (to === ObjectType && from !== ObjectType) {
-            emitBox(from, scope.mv)
-        }
+        emitStoreValue(from, to, scope.mv)
     }
 
     private fun emitNamedCall(
@@ -1885,7 +2768,7 @@ class BytecodeGenerator(
         // A bare call reaches an instance function through the receiver the method already has in
         // slot 0, so `this` goes on the stack first; a static one is an ordinary `invokestatic`.
         if (symbol.isStatic) {
-            for (argument in expression.arguments) emitExpression(argument, scope)
+            emitArguments(expression.arguments, symbol.parameterTypes, scope)
             mv.visitMethodInsn(
                 INVOKESTATIC,
                 symbol.jvmOwner,
@@ -1897,7 +2780,7 @@ class BytecodeGenerator(
         }
 
         mv.visitVarInsn(ALOAD, 0)
-        for (argument in expression.arguments) emitExpression(argument, scope)
+        emitArguments(expression.arguments, symbol.parameterTypes, scope)
         mv.visitMethodInsn(
             INVOKEVIRTUAL,
             symbol.jvmOwner,
@@ -2103,7 +2986,13 @@ class BytecodeGenerator(
     // ------------------------------------------------------------ descriptors
 
     private fun descriptorOf(type: NekoType): String = when (type) {
+        ByteType -> "B"
+        ShortType -> "S"
+        CharType -> "C"
         IntType -> "I"
+        LongType -> "J"
+        FloatType -> "F"
+        DoubleType -> "D"
         BoolType -> "Z"
         StringType -> "Ljava/lang/String;"
         VoidType -> "V"
@@ -2112,20 +3001,53 @@ class BytecodeGenerator(
         is ArrayType -> "[" + descriptorOf(type.element)
         is FunctionType -> "L" + functionInterfaceName(type) + ";"
         is ClassType -> "L" + type.internalName + ";"
+        // A nullable type is carried as a reference whatever it wraps, so `int?` is a
+        // `java.lang.Integer` and `Point?` is a `Point`. That is what makes `null` storable in it:
+        // a JVM primitive has no `null` to be absent as. A nullable *reference* type is unchanged —
+        // `string?` is the same `String` `string` already is — so only a nullable primitive needs
+        // its box named here.
+        is NullableType -> nullableDescriptorOf(type)
         ErrorType -> "Ljava/lang/Object;"
     }
 
-    /** The `*aload` that reads one element of an array of [element]. */
+    /** The descriptor a nullable [type] is carried as: its inner type's box, or its inner type. */
+    private fun nullableDescriptorOf(type: NullableType): String {
+        val inner = type.inner
+        val boxed = if (BuiltinTypes.isPrimitive(inner)) {
+            BuiltinTypes.referenceTypeNameOf(inner)
+        } else {
+            null
+        }
+        return if (boxed == null) descriptorOf(inner) else "L${boxed.replace('.', '/')};"
+    }
+
+    /**
+     * The `*aload` that reads one element of an array of [element].
+     *
+     * Three of these are worth naming rather than looking up: `byte` and `bool` share `BALOAD` because
+     * the JVM has one array type for both, and `byte`, `short` and `char` are all `int`s on the stack,
+     * so only the *array* distinguishes them.
+     */
     private fun arrayLoadOpcode(element: NekoType): Int = when (element) {
+        ByteType, BoolType -> BALOAD
+        ShortType -> SALOAD
+        CharType -> CALOAD
         IntType -> IALOAD
-        BoolType -> BALOAD
+        LongType -> LALOAD
+        FloatType -> FALOAD
+        DoubleType -> DALOAD
         else -> AALOAD
     }
 
     /** The `*astore` that writes one element of an array of [element]. */
     private fun arrayStoreOpcode(element: NekoType): Int = when (element) {
+        ByteType, BoolType -> BASTORE
+        ShortType -> SASTORE
+        CharType -> CASTORE
         IntType -> IASTORE
-        BoolType -> BASTORE
+        LongType -> LASTORE
+        FloatType -> FASTORE
+        DoubleType -> DASTORE
         else -> AASTORE
     }
 
@@ -2140,26 +3062,52 @@ class BytecodeGenerator(
         append(returnDescriptor)
     }
 
+    /**
+     * The opcode that reads a value of [type] out of a local.
+     *
+     * `byte`, `short`, `char`, `int` and `bool` all share `ILOAD`: the JVM has one `int` slot type, and
+     * the narrower ones are distinguished by *how many bits are meaningful*, not by how they are
+     * carried. `long`, `float` and `double` each have their own.
+     */
     private fun loadOpcode(type: NekoType): Int = when (type) {
-        IntType, BoolType -> ILOAD
+        ByteType, ShortType, CharType, IntType, BoolType -> ILOAD
+        LongType -> LLOAD
+        FloatType -> FLOAD
+        DoubleType -> DLOAD
         else -> ALOAD
     }
 
     private fun storeOpcode(type: NekoType): Int = when (type) {
-        IntType, BoolType -> ISTORE
+        ByteType, ShortType, CharType, IntType, BoolType -> ISTORE
+        LongType -> LSTORE
+        FloatType -> FSTORE
+        DoubleType -> DSTORE
         else -> ASTORE
     }
 
     private fun returnOpcode(type: NekoType): Int = when (type) {
         VoidType -> RETURN
-        IntType, BoolType -> IRETURN
+        ByteType, ShortType, CharType, IntType, BoolType -> IRETURN
+        LongType -> LRETURN
+        FloatType -> FRETURN
+        DoubleType -> DRETURN
         else -> ARETURN
     }
 
-    private fun popOpcode(type: NekoType): Int = if (type == IntType || type == BoolType) POP else POP
+    /**
+     * The opcode that discards a value of [type].
+     *
+     * A `long` or a `double` occupies two slots, so discarding one takes `POP2`; using `POP` there
+     * would leave half the value on the stack and every frame after it would be wrong.
+     */
+    private fun popOpcode(type: NekoType): Int =
+        if (BuiltinTypes.slotCountOf(type) == 2) POP2 else POP
 
     private fun pushDefaultOpcode(type: NekoType): Int = when (type) {
-        IntType, BoolType -> ICONST_0
+        ByteType, ShortType, CharType, IntType, BoolType -> ICONST_0
+        LongType -> LCONST_0
+        FloatType -> FCONST_0
+        DoubleType -> DCONST_0
         else -> ACONST_NULL
     }
 
@@ -2170,9 +3118,24 @@ class BytecodeGenerator(
     private fun emitDefaultReturn(returnType: NekoType, mv: MethodVisitor) {
         when (returnType) {
             VoidType -> mv.visitInsn(RETURN)
-            IntType, BoolType -> {
+            ByteType, ShortType, CharType, IntType, BoolType -> {
                 mv.visitInsn(ICONST_0)
                 mv.visitInsn(IRETURN)
+            }
+
+            LongType -> {
+                mv.visitInsn(LCONST_0)
+                mv.visitInsn(LRETURN)
+            }
+
+            FloatType -> {
+                mv.visitInsn(FCONST_0)
+                mv.visitInsn(FRETURN)
+            }
+
+            DoubleType -> {
+                mv.visitInsn(DCONST_0)
+                mv.visitInsn(DRETURN)
             }
 
             else -> {
@@ -2183,13 +3146,17 @@ class BytecodeGenerator(
     }
 
     private fun popIfValue(type: NekoType, mv: MethodVisitor) {
-        if (type != VoidType && type !== ErrorType) mv.visitInsn(POP)
+        if (type != VoidType && type !== ErrorType) mv.visitInsn(popOpcode(type))
     }
 
-    /** Emits the most compact instruction that pushes [value]. */
-    private fun pushInt(value: Long, mv: MethodVisitor) {
-        val int = value.toInt()
-        when (int) {
+    /**
+     * Emits the most compact instruction that pushes [value] as an `int`.
+     *
+     * Only the `int`-shaped types use this: a `byte`, `short` or `char` literal is still an `int` on
+     * the stack, and the narrowing back happens where the value is stored.
+     */
+    private fun pushInt(value: Int, mv: MethodVisitor) {
+        when (value) {
             -1 -> mv.visitInsn(ICONST_M1)
             0 -> mv.visitInsn(ICONST_0)
             1 -> mv.visitInsn(ICONST_1)
@@ -2197,9 +3164,43 @@ class BytecodeGenerator(
             3 -> mv.visitInsn(ICONST_3)
             4 -> mv.visitInsn(ICONST_4)
             5 -> mv.visitInsn(ICONST_5)
-            in Byte.MIN_VALUE..Byte.MAX_VALUE -> mv.visitIntInsn(BIPUSH, int)
-            in Short.MIN_VALUE..Short.MAX_VALUE -> mv.visitIntInsn(SIPUSH, int)
-            else -> mv.visitLdcInsn(int)
+            in Byte.MIN_VALUE..Byte.MAX_VALUE -> mv.visitIntInsn(BIPUSH, value)
+            in Short.MIN_VALUE..Short.MAX_VALUE -> mv.visitIntInsn(SIPUSH, value)
+            else -> mv.visitLdcInsn(value)
+        }
+    }
+
+    /** Emits the most compact instruction that pushes [value] as a `long`. */
+    private fun pushLong(value: Long, mv: MethodVisitor) {
+        when (value) {
+            0L -> mv.visitInsn(LCONST_0)
+            1L -> mv.visitInsn(LCONST_1)
+            else -> mv.visitLdcInsn(value)
+        }
+    }
+
+    /**
+     * Emits the most compact instruction that pushes [value] as a `float`.
+     *
+     * The three constants the JVM has a dedicated opcode for are the ones a program writes most often;
+     * everything else — including `-0.0f`, which `FCONST_0` would turn into `+0.0f` — is a constant
+     * pool entry, which ASM emits as `LDC` for a `Float` because that is the only width a `float`
+     * constant has.
+     */
+    private fun pushFloat(value: Float, mv: MethodVisitor) {
+        when {
+            value == 0.0f && 1.0f / value == Float.POSITIVE_INFINITY -> mv.visitInsn(FCONST_0)
+            value == 1.0f -> mv.visitInsn(FCONST_1)
+            value == 2.0f -> mv.visitInsn(FCONST_2)
+            else -> mv.visitLdcInsn(value)
+        }
+    }
+
+    private fun pushDouble(value: Double, mv: MethodVisitor) {
+        when {
+            value == 0.0 && 1.0 / value == Double.POSITIVE_INFINITY -> mv.visitInsn(DCONST_0)
+            value == 1.0 -> mv.visitInsn(DCONST_1)
+            else -> mv.visitLdcInsn(value)
         }
     }
 
@@ -2231,6 +3232,7 @@ class BytecodeGenerator(
             is ExpressionStatement -> collectLocalReferences(node.expression, into)
             is ReturnStatement -> node.value?.let { collectLocalReferences(it, into) }
             is YieldStatement -> collectLocalReferences(node.value, into)
+            is NyaStatement -> collectLocalReferences(node.condition, into)
             is IfStatement -> {
                 collectLocalReferences(node.condition, into)
                 collectLocalReferences(node.thenBranch, into)
@@ -2327,6 +3329,14 @@ class BytecodeGenerator(
         /** The function whose name prefixes the `raise` builders this method registers. */
         val builderPrefix: String = "emit",
         /**
+         * The type this method answers, which is what a `return` inside it has to be narrowed to.
+         *
+         * A `byte`-returning member that ends in `return a + b` leaves an `int` on the stack and has to
+         * narrow it like any other store into a `byte`; nothing in the `return` statement itself names
+         * the method's type, so the scope carries it.
+         */
+        val returnType: NekoType = VoidType,
+        /**
          * `true` when this method is the `invoke` of a value-returning `try` extractor.
          *
          * A `yield` in such a body produces that `invoke`'s value, i.e. it returns a *boxed* `Object`
@@ -2344,22 +3354,59 @@ class BytecodeGenerator(
         /** Capture field name for [symbol] in this lambda, or `null`. */
         fun captureOf(symbol: LocalSymbol): String? = captures[symbol]
 
-        /** Associates [symbol] with the next free slot and returns it. */
+        /**
+         * Associates [symbol] with the next free slot and returns it.
+         *
+         * The slot count comes from the symbol's *type*, not from a fixed one per local. A `long` or a
+         * `double` occupies two slots in the JVM's frame, and handing out one leaves the second half of
+         * the value overlapping whatever is allocated next: the class still verifies whenever the
+         * overlapping slot is another two-slot value or an unused one, and computes garbage silently,
+         * which is exactly the kind of mistake a test that only checks "it compiled" would miss.
+         */
         fun allocate(symbol: LocalSymbol): Int {
             val existing = slots[symbol]
             if (existing != null) return existing
-            val slot = nextSlot++
+            val slot = nextSlot
+            nextSlot += BuiltinTypes.slotCountOf(symbol.type)
             slots[symbol] = slot
             return slot
         }
 
         /**
-         * Reserves a slot for a compiler-generated temporary, such as the subject of a `when`.
+         * Associates [symbol] with a slot the caller has already chosen.
+         *
+         * Used where the slots are not this scope's to hand out: a `try` extractor's parameters are
+         * unboxed into the fixed block of locals that follows the `Object`s the interface passes, and
+         * the body still has to find them by symbol. The next temporary starts after the whole block,
+         * which is what the widest of the parameters decides.
+         */
+        fun reserve(symbol: LocalSymbol, slot: Int) {
+            slots[symbol] = slot
+        }
+
+        /**
+         * Reserves a slot for a compiler-generated temporary holding a value of [type].
          *
          * Temporaries are never reused, so the slot map stays a pure function of the source and the
-         * stack-map frames ASM computes always agree with the code emitted.
+         * stack-map frames ASM computes always agree with the code emitted. The type is required
+         * rather than optional because the two-slot types are the ones that need it, and a default
+         * would make it easiest to forget exactly there.
          */
-        fun allocateTemp(): Int = nextSlot++
+        fun allocateTemp(type: NekoType): Int {
+            val slot = nextSlot
+            nextSlot += BuiltinTypes.slotCountOf(type)
+            return slot
+        }
+
+        /**
+         * Moves the next free slot past [slot], which the caller has already filled.
+         *
+         * A block of locals allocated by hand — an extractor's unboxed parameters — has to be walked
+         * over before this scope hands out a temporary, or the temporary lands on top of one of them.
+         */
+        fun advancePast(slot: Int) {
+            nextSlot = maxOf(nextSlot, slot)
+        }
     }
 
     /**
@@ -2388,9 +3435,31 @@ class BytecodeGenerator(
 
         /** Prefix of the value-returning extractor family, e.g. `EmitExtractorWithResult2`. */
         const val EMIT_EXTRACTOR_WITH_RESULT_PREFIX = "EmitExtractorWithResult"
+
+        /**
+         * The JDK error a failed `nya` throws, as an internal name.
+         *
+         * It belongs to the platform rather than to the Neko standard library, so unlike
+         * [EARLY_EMIT_EXCEPTION_CLASS] it needs no lookup: `java.lang` is on every JVM that could
+         * load the class this code goes into. Using the same error Java's own `assert` throws is
+         * what makes a Neko check and a Java one fail in the way a reader already expects.
+         */
+        const val ASSERTION_ERROR_CLASS = "java/lang/AssertionError"
     }
 }
 
 /** The name shown in diagnostics and recorded as the class-file source attribute. */
 private fun NekoFile?.sourceName(): String =
     this?.span?.file?.name?.substringAfterLast('/')?.substringAfterLast('\\') ?: "unknown.neko"
+
+/**
+ * Whether this is one of the primitives the JVM *cannot* compare, load or store with the `int`
+ * instructions: `long`, `float` and `double`.
+ *
+ * These are also the three that occupy two local slots, which is not a coincidence — both facts come
+ * from the value being wider than the 32 bits the `int`-shaped instructions are built around — but
+ * they are asked about separately because they are used separately: a `float` needs `fcmpl` where a
+ * `long` needs `lcmp`, while only a *count* of slots is needed to size a local.
+ */
+private val NekoType.isWidePrimitive: Boolean
+    get() = this == LongType || this == FloatType || this == DoubleType

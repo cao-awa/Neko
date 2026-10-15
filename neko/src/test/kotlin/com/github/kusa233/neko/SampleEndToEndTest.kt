@@ -27,6 +27,11 @@ class SampleEndToEndTest {
             "samples/com/github/kusa233/neko/sample/ExceptionSample.neko",
         )
 
+    private fun nyaSamplePath(): Path =
+        TestSupport.projectDirectory.resolve(
+            "samples/com/github/kusa233/neko/sample/NyaSample.neko",
+        )
+
     /**
      * Compiles one sample together with the Neko standard library, as the build does.
      *
@@ -208,6 +213,44 @@ class SampleEndToEndTest {
             listOf("123", "456", "1"),
             buffer.toString(Charsets.UTF_8).replace("\r\n", "\n").trim().lines(),
             "the raised values should reach the extractor in order, then the yield should print",
+        )
+    }
+
+    @Test
+    fun `the nya sample runs every check and prints the failing condition`() {
+        val directory = Files.createTempDirectory("neko-nya-sample")
+        val result = compileSample(nyaSamplePath(), outputDirectory = directory)
+        assertTrue(!result.hasErrors, "the nya sample must compile before it can be run")
+
+        val loader = java.net.URLClassLoader(arrayOf(directory.toUri().toURL()), javaClass.classLoader)
+        val type = Class.forName("com.github.kusa233.neko.sample.NyaSample", true, loader)
+        val main = type.getMethod("main", Array<String>::class.java)
+
+        val original = System.out
+        val buffer = java.io.ByteArrayOutputStream()
+        System.setOut(java.io.PrintStream(buffer, true, Charsets.UTF_8))
+        try {
+            main.invoke(null, arrayOf<String>())
+        } finally {
+            System.setOut(original)
+        }
+
+        // Every check in the sample holds except the one inside the `try`, which is caught. The
+        // message it prints is the condition's own source text, and it is the sample's whole point:
+        // the compiler quotes back the expression rather than making the reader write it twice. The
+        // `4` before it is the narrow read `nya box != null` is what allows.
+        assertEquals(
+            listOf(
+                "3",
+                "6",
+                "ready",
+                "flag",
+                "4",
+                "java.lang.AssertionError: 1 == 2",
+                "caught",
+            ),
+            buffer.toString(Charsets.UTF_8).replace("\r\n", "\n").trim().lines(),
+            "the sample should run every check and print the caught failure's own condition",
         )
     }
 

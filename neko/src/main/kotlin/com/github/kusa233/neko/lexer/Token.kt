@@ -6,6 +6,8 @@ import com.github.kusa233.neko.source.Span
 enum class TokenType(val display: String) {
     IDENTIFIER("identifier"),
     INTEGER_LITERAL("integer literal"),
+    FLOAT_LITERAL("floating-point literal"),
+    CHAR_LITERAL("character literal"),
     STRING_LITERAL("string literal"),
 
     // Declarations and modifiers.
@@ -37,6 +39,18 @@ enum class TokenType(val display: String) {
     ELSE("'else'"),
     WHILE("'while'"),
     WHEN("'when'"),
+    /**
+     * `'nya'` — checks that a condition holds, and stops the program with an `AssertionError` when
+     * it does not.
+     *
+     * It is spelled as a word rather than as a function because what it lowers to is not a call: a
+     * `nya` that fails throws from the statement itself, so it reads as part of the grammar the way
+     * `if` does. It sits beside [RAISE] for that reason — both are statements that leave by throwing
+     * — but it is deliberately *not* gated on the JVM's `-ea` flag, which is what separates it from
+     * Java's `assert`: a check that silently does nothing is worse than no check, and Neko has no
+     * flag to turn it on with.
+     */
+    NYA("'nya'"),
     RAISE("'raise'"),
     EMIT("'emit'"),
     TRY("'try'"),
@@ -49,6 +63,13 @@ enum class TokenType(val display: String) {
     // Literals.
     TRUE("'true'"),
     FALSE("'false'"),
+    /**
+     * `'null'` — the one value a nullable type exists to hold.
+     *
+     * It is a literal rather than an identifier so that it cannot be shadowed by a variable named
+     * `null`, which would make `null` mean two different things in the same scope.
+     */
+    NULL("'null'"),
 
     // Punctuation.
     LEFT_BRACE("'{'"),
@@ -62,6 +83,14 @@ enum class TokenType(val display: String) {
     DOT("'.'"),
     SEMICOLON("';'"),
     ARROW("'->'"),
+    /**
+     * `'?'` — the suffix that makes a type nullable, and the first half of the safe call `'?.'`.
+     *
+     * One token serves both because `?.` is lexed as this followed by [DOT]: the two are only
+     * distinguishable by the character that follows, which the parser can see just as well as the
+     * lexer can.
+     */
+    QUESTION("'?'"),
 
     // Operators.
     ASSIGN("'='"),
@@ -87,7 +116,15 @@ enum class TokenType(val display: String) {
     END_OF_FILE("end of file"),
     ;
 
-    val isLiteral: Boolean get() = this == INTEGER_LITERAL || this == STRING_LITERAL || this == TRUE || this == FALSE
+    /**
+     * Whether this token is a literal of some kind.
+     *
+     * Every literal kind has to be listed, because a caller that asks this question means "is a
+     * written value here?" and an unlisted kind answers no.
+     */
+    val isLiteral: Boolean
+        get() = this == INTEGER_LITERAL || this == FLOAT_LITERAL || this == CHAR_LITERAL ||
+            this == STRING_LITERAL || this == TRUE || this == FALSE || this == NULL
 }
 
 /** One lexed token, together with the exact [span] it occupies in its source file. */
@@ -96,8 +133,19 @@ class Token(
     /** Exact source text of the token. */
     val text: String,
     val span: Span,
-    /** Decoded value for [TokenType.INTEGER_LITERAL] tokens. */
-    val integerValue: Long = 0L,
+    /**
+     * Decoded value of an [TokenType.INTEGER_LITERAL] or [TokenType.CHAR_LITERAL] token.
+     *
+     * The two share a field because they are the same fact — a whole number the source spelled — and
+     * a character literal is one written in quotes. A literal that does not fit the widest type the
+     * language has still carries its clamped value, so the parser has something to build a node from
+     * and the user gets the one diagnostic the lexer already reported rather than a crash.
+     */
+    val literalValue: Long = 0L,
+    /** Decoded value of a [TokenType.FLOAT_LITERAL] token. */
+    val floatValue: Double = 0.0,
+    /** `true` when a [TokenType.FLOAT_LITERAL] asked for `float` with an `f`/`F` suffix. */
+    val isFloatSuffixed: Boolean = false,
     /** Decoded value for [TokenType.STRING_LITERAL] tokens. */
     val stringValue: String = "",
 ) {
@@ -108,6 +156,8 @@ class Token(
     fun describe(): String = when (type) {
         TokenType.IDENTIFIER -> "identifier '$text'"
         TokenType.INTEGER_LITERAL -> "integer literal '$text'"
+        TokenType.FLOAT_LITERAL -> "floating-point literal '$text'"
+        TokenType.CHAR_LITERAL -> "character literal '$text'"
         TokenType.STRING_LITERAL -> "string literal"
         else -> type.display
     }
@@ -136,6 +186,7 @@ internal val KEYWORDS: Map<String, TokenType> = mapOf(
     "else" to TokenType.ELSE,
     "while" to TokenType.WHILE,
     "when" to TokenType.WHEN,
+    "nya" to TokenType.NYA,
     "raise" to TokenType.RAISE,
     "emit" to TokenType.EMIT,
     "try" to TokenType.TRY,
@@ -144,4 +195,5 @@ internal val KEYWORDS: Map<String, TokenType> = mapOf(
     "this" to TokenType.THIS,
     "true" to TokenType.TRUE,
     "false" to TokenType.FALSE,
+    "null" to TokenType.NULL,
 )

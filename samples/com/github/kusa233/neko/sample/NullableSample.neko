@@ -1,0 +1,176 @@
+locate com.github.kusa233.neko.sample
+
+class NullableSample() {
+    static {
+        fun main(args: string[]) {
+            present: string? = "kusa"
+            absent: string? = null
+
+            println(present)              // Should print 'kusa'
+            println(absent)               // Should print 'null'
+
+            // 'T?' is the only type 'null' may be assigned to, and the rule is one-way: a real
+            // value is always allowed, an absent one only where the type says so.
+            present = null
+            // Error to compile: 'string' is not nullable, so it can never hold 'null'.
+            // name: string = null
+
+            // Error to compile: the same in reverse — a 'string?' may be absent, so it cannot be
+            // used where a 'string' is promised.
+            // text: string = absent
+
+            // Comparing is how absence is asked about, and neither side throws: '==' compiles to
+            // 'java.util.Objects.equals', which answers 'true' for two nulls.
+            println(absent == null)       // Should print 'true'
+            println(present == null)      // Should print 'true'
+            println(present != null)      // Should print 'false'
+            println(absent == present)    // Should print 'true'
+
+            // Error to compile: the answer is known at compile time, so it is reported rather
+            // than emitted.
+            // println("text" == null)
+
+            safest()
+            counter()
+            toStringOfMeow()
+            functionValues()
+        }
+
+        // Reaching into a nullable value is the mistake the type exists to catch. '?.' is the way
+        // to do it: the member is read only when the receiver is there.
+        fun safest() {
+            holder: Holder? = Holder(4)
+            println(holder?.value)        // Should print '4'
+
+            // The call does nothing when the receiver is absent, and — this is the part that is
+            // easy to get wrong — its arguments are not evaluated either.
+            holder?.show("inside")        // Should print 'inside'
+
+            missing: Holder? = null
+            println(missing?.value)       // Should print 'null'
+            missing?.show(loud())         // Should print nothing: 'loud' never runs
+
+            // A test that settles whether the value is there narrows it for the branch that knows
+            // the answer, so inside it the value is an ordinary one and no '?' is needed. This is
+            // what makes the guard the natural way to write a nullable value's happy path.
+            if (missing != null) {
+                println("unreachable")    // Never runs: 'missing' is null
+            } else {
+                println(missing?.value)   // Should print 'null'
+            }
+            if (holder != null) {
+                println(holder.value + 1) // Should print '5', and needs no '?'
+            }
+
+            // A guard that leaves is the same idea written the other way round: what follows the
+            // 'if' is on the side where the test failed.
+            if (missing == null) {
+                println("absent")         // Should print 'absent'
+            } else {
+                println("present")
+            }
+
+            // '?.' answers a nullable value, so safe calls chain.
+            outer: Outer? = Outer(7)
+            println(outer?.inner?.value)  // Should print '7'
+            none: Outer? = null
+            println(none?.inner?.value)   // Should print 'null'
+        }
+
+        // '?.' guards the *object* a member is reached through. A function value has no such
+        // object: the callee itself is the thing that may be absent, and '?(...)' is how it is
+        // guarded. Anything a lambda can be held in works, including the result of another call,
+        // which is what 'lambda()?(1, 2)' says.
+        fun functionValues() {
+            present: ([int, int] -> int)? = { x, y ->
+                yield x + y
+            }
+            println(present?(1, 2))       // Should print '3'
+
+            absent: ([int, int] -> int)? = null
+            println(absent?(1, 2))        // Should print 'null'
+
+            // As with '?.', the arguments are not evaluated when the callee is absent.
+            absent?(1, loudNumber())      // Should print nothing
+
+            // The '?' is what makes the answer nullable, so a call through one can be tested.
+            println(absent?(1, 2) == null) // Should print 'true'
+
+            // Calling the function value a call answered, guarded at the call site.
+            println(adder()?(1, 2))       // Should print '3'
+
+            // Error to compile: a declared function is resolved by name, so there is no value that
+            // could be absent — and no redundant '?' is accepted.
+            // println(pick?(true))
+
+            // Error to compile: a nullable function value cannot be called without the '?', because
+            // there would be nothing to guard.
+            // println(absent(1, 2))
+        }
+
+        fun adder(): ([int, int] -> int)? {
+            return { x, y ->
+                yield x + y
+            }
+        }
+
+        fun loudNumber(): int {
+            println("this must not run either")
+            return 0
+        }
+
+        fun loud(): string {
+            println("this must not run")
+            return "loud"
+        }
+
+        // A nullable primitive is carried as its boxed type, which is what makes room for the
+        // absent case in the class file.
+        fun counter() {
+            count: int? = 1
+            println(count)                // Should print '1'
+            println(count == 1)           // Should print 'true'
+            count = null
+            println(count)                // Should print 'null'
+            println(pick(true))           // Should print '9'
+            println(pick(false))          // Should print 'null'
+        }
+
+        fun pick(flag: bool): int? {
+            if (flag) {
+                return 9
+            }
+            return null
+        }
+
+        // A meow class derives 'toString' from its fields, so a nullable one prints its absence
+        // as the bare word rather than as a quoted string.
+        fun toStringOfMeow() {
+            println(Cat(1, "cat-name"))   // Should print 'Cat(age=1, name="cat-name")'
+            println(Cat(2, null))         // Should print 'Cat(age=2, name=null)'
+        }
+    }
+}
+
+meow class Cat(val age: int, val name: string?) {
+}
+
+class Holder {
+    val value: int
+
+    constructor(value: int) {
+        this.value = value
+    }
+
+    fun show(text: string) {
+        println(text)
+    }
+}
+
+class Outer {
+    val inner: Holder?
+
+    constructor(value: int) {
+        this.inner = Holder(value)
+    }
+}

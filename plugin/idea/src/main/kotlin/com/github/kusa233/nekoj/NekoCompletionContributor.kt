@@ -1,6 +1,8 @@
 package com.github.kusa233.nekoj
 
 import com.github.kusa233.neko.analyzer.BuiltinLibrary
+import com.github.kusa233.neko.ast.NekoFile
+import com.github.kusa233.neko.platform.PlatformLibrary
 import com.github.kusa233.neko.symbols.ClassSymbol
 import com.github.kusa233.neko.symbols.FieldSymbol
 import com.github.kusa233.neko.symbols.FunctionSymbol
@@ -15,6 +17,7 @@ import com.intellij.codeInsight.completion.CompletionType
 import com.intellij.codeInsight.lookup.LookupElementBuilder
 import com.intellij.patterns.PlatformPatterns
 import com.intellij.util.ProcessingContext
+import java.nio.file.Path
 
 /**
  * Offers completions for Neko source.
@@ -69,8 +72,9 @@ private class NekoCompletionProvider : CompletionProvider<CompletionParameters>(
 
         // A type is a different vocabulary from a value, so a type position gets its own list: a
         // local variable or a method call is not something that can be written there.
+        val ast = file.parsedFile(model)
         if (isTypePosition(file.text, parameters.offset)) {
-            addTypeNames(model, result)
+            addTypeNames(model, ast, result)
             return
         }
 
@@ -78,10 +82,13 @@ private class NekoCompletionProvider : CompletionProvider<CompletionParameters>(
         // built from. `parameters.position` would be an offset into the throwaway copy the platform
         // makes for the completion, where every span in the tree below would be off by the length of
         // whatever the reader has typed since the last analysis.
-        addNamesFromTheCurrentFile(file, model, parameters.offset, result)
+        if (ast != null) {
+            addNamesFromTheCurrentFile(ast, parameters.offset, result)
+        }
 
         // The classes themselves, which is what a reader needs in order to name a type, construct an
-        // object, or reach a `static` member through its class.
+        // object, or reach a `static` member through its class. The platform's own classes are
+        // included, because an unqualified capitalized name is looked up there first.
         //
         // Their members are deliberately *not* listed here. A member is reached through a receiver
         // -- `obj.field`, or `Cls.field` for a static one -- so offering every class' members as bare
@@ -91,21 +98,32 @@ private class NekoCompletionProvider : CompletionProvider<CompletionParameters>(
         for (symbol in model.classes.values) {
             result.addElement(classLookup(symbol))
         }
+        for ((name, packageName) in platformClasses(ast)) {
+            result.addElement(platformClassLookup(name, packageName))
+        }
     }
 
     /**
-     * Offers the built-in types and the program's classes, which is everything a type may name.
+     * Offers the built-in types, the program's classes, and the Java platform's — everything a type
+     * may name.
      *
      * The built-ins come from the compiler's own catalogue, so the list cannot drift from the names
      * the analyzer actually accepts, and each entry can say which Java reference type it is: that is
      * how a reader learns that `Integer` and `int` are the same type rather than two.
      */
-    private fun addTypeNames(model: NekoProgramModel, result: CompletionResultSet) {
+    private fun addTypeNames(
+        model: NekoProgramModel,
+        ast: NekoFile?,
+        result: CompletionResultSet,
+    ) {
         for ((name, type) in BuiltinTypes.byName) {
             result.addElement(builtinTypeLookup(name, type))
         }
         for (symbol in model.classes.values) {
             result.addElement(classLookup(symbol))
+        }
+        for ((name, packageName) in platformClasses(ast)) {
+            result.addElement(platformClassLookup(name, packageName))
         }
     }
 
@@ -120,14 +138,10 @@ private class NekoCompletionProvider : CompletionProvider<CompletionParameters>(
      * before anything else that comes from the project.
      */
     private fun addNamesFromTheCurrentFile(
-        file: NekoPsiFile,
-        model: NekoProgramModel,
+        ast: NekoFile,
         offset: Int,
         result: CompletionResultSet,
     ) {
-        val path = file.virtualFile?.path?.let { java.nio.file.Path.of(it) }
-        val ast = model.fileOf(path) ?: return
-
         for (local in ast.localsVisibleAt(offset)) {
             result.addElement(localLookup(local))
         }
@@ -161,15 +175,40 @@ private class NekoCompletionProvider : CompletionProvider<CompletionParameters>(
  * is half-way through: `x: <caret>` does not parse into anything useful, and the tree the compiler
  * produced is that of the last complete analysis.
  *
- * Two steps back from the caret. The first drops the name being typed, since `x: in<caret>` is as
- * much a type position as `x: <caret>`. The second drops the space after the colon. What is left
- * ending in `:` is the whole test, and it covers every place Neko writes one: a local's or a
- * field's type, a parameter's, a return type, a `catch` clause's, and a supertype after `class X:`.
+ * Two positions count, and between them they cover every place Neko names a type:
+ *
+ *  * after a `:` — a local's or a field's type, a parameter's, a return type, a `catch` clause's,
+ *    and a supertype after `class X:`;
+ *  * inside an `emit` clause's brackets, as in `} emit [int, <caret>]`.
+ *
+ * The name being typed is dropped first, since `x: in<caret>` is as much a type position as
+ * `x: <caret>`; then the space after the punctuation that introduced it.
+ *
+ * A `->` is deliberately *not* treated as introducing a type, although a function type's return is
+ * written after one. A `when` branch is written after one too and its body is a statement, so the
+ * two cannot be told apart from the text alone — and offering types where a statement goes would be
+ * worse than not offering them for a function type.
  */
 private fun isTypePosition(text: String, offset: Int): Boolean {
     val before = text.substring(0, offset.coerceIn(0, text.length))
     val withoutPartialName = before.trimEnd().trimEnd { it.isLetterOrDigit() || it == '_' }
-    return withoutPartialName.trimEnd().endsWith(":")
+    val context = withoutPartialName.trimEnd()
+    return context.endsWith(":") || insideEmitClause(context)
+}
+
+/**
+ * Whether the caret is inside an `emit [ ... ]` list, given the text up to it.
+ *
+ * True when an `emit` keyword is followed by its `[` with no `]` in between — that is the region the
+ * clause's own types live in. An ordinary bracket, such as a call's arguments or an array index,
+ * has no `emit` before it and so is not a type position.
+ */
+private fun insideEmitClause(context: String): Boolean {
+    val keyword = context.lastIndexOf("emit")
+    if (keyword < 0) return false
+    val open = context.indexOf('[', startIndex = keyword)
+    if (open < 0) return false
+    return context.indexOf(']', startIndex = open) < 0
 }
 
 /**
@@ -185,6 +224,35 @@ private fun builtinTypeLookup(name: String, type: NekoType): LookupElementBuilde
     BuiltinTypes.aliases[name]?.let { builder = builder.withTailText("  alias for $it", true) }
     return builder
 }
+
+/**
+ * The names of the platform's classes that this file may write, without qualification.
+ *
+ * Two sets, because Neko resolves an unqualified capitalized name in two places: `java.lang` first,
+ * and then the file's first imported package. Offering anything else would propose a name that
+ * resolves to the wrong class or to none — the completion list has to describe this file, not the
+ * JDK in general.
+ *
+ * [ast] is `null` when the file has no parse — while it is being written, say — and then only
+ * `java.lang` is offered, since that lookup does not depend on the file.
+ */
+private fun platformClasses(ast: NekoFile?): List<Pair<String, String>> {
+    val imported = ast?.imports?.firstOrNull()?.name
+    val fromImport = if (imported == null) {
+        emptyList()
+    } else {
+        PlatformLibrary.classesIn(imported).map { it to imported }
+    }
+    return PlatformLibrary.javaLangClasses.map { it to "java.lang" } + fromImport
+}
+
+/** A class the Java platform provides, shown with the package it belongs to. */
+private fun platformClassLookup(name: String, packageName: String): LookupElementBuilder =
+    LookupElementBuilder.create(name).withTypeText(packageName, true)
+
+/** The parse of this file, or `null` when it was never parsed. */
+private fun NekoPsiFile.parsedFile(model: NekoProgramModel): NekoFile? =
+    model.fileOf(virtualFile?.path?.let { Path.of(it) })
 
 /**
  * A local or a parameter, labelled as such.

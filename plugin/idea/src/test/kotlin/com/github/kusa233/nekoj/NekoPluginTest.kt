@@ -50,6 +50,7 @@ class NekoPluginTest : BasePlatformTestCase() {
         assertEquals(TokenType.FUN, keywords["fun"])
         assertEquals(TokenType.EMIT, keywords["emit"])
         assertEquals(TokenType.YIELD, keywords["yield"])
+        assertEquals(TokenType.NYA, keywords["nya"])
         assertEquals(TokenType.TRUE, keywords["true"])
 
         // Punctuation is not a word, so it must not be mistaken for one.
@@ -627,6 +628,144 @@ class NekoPluginTest : BasePlatformTestCase() {
 
         // The counterpart of the test above: outside a type position, nothing has been taken away.
         assertContainsElements(completeAtCaret(), "counter")
+    }
+
+    fun testCompletionOffersTypesInAnEmitClause() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun raiser() {
+                    } emit [<caret>]
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // An `emit` clause names types, so it is a type position even though no colon introduces it.
+        assertContainsElements(completeAtCaret(), "int", "string")
+    }
+
+    fun testCompletionOffersTypesAfterACommaInAnEmitClause() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun raiser() {
+                    } emit [int, <caret>]
+                }
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completeAtCaret(), "int", "Object")
+    }
+
+    fun testCompletionDoesNotTreatACallArgumentListAsATypePosition() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main() {
+                        counter: int = 1
+                        println(counter, <caret>)
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // A comma inside a call is a value position. The `emit` keyword is what separates the two,
+        // and its absence here is the whole reason this test exists.
+        assertContainsElements(completeAtCaret(), "counter")
+    }
+
+    fun testCompletionDoesNotTreatAnEmitClauseAsATypePositionOnceItIsClosed() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main() {
+                        counter: int = 1
+                        <caret>
+                    }
+
+                    fun raiser() {
+                    } emit [int]
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // The clause is behind the caret, so the caret is in a statement position and a local is
+        // what belongs there.
+        assertContainsElements(completeAtCaret(), "counter")
+    }
+
+    // ------------------------------------------------------------------------ platform classes
+
+    fun testCompletionOffersJavaLangClasses() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main() {
+                        value: <caret>
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // Read from the running JDK rather than a table, so these are classes the compiler will also
+        // resolve: an unqualified capitalized name is looked up in `java.lang` first.
+        assertContainsElements(completeAtCaret(), "Exception", "RuntimeException")
+    }
+
+    fun testCompletionOffersJavaLangClassesInAValuePositionToo() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main() {
+                        <caret>
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // A class name is nameable wherever a name is, not only in a type position.
+        assertContainsElements(completeAtCaret(), "Exception")
+    }
+
+    fun testCompletionOffersClassesFromTheImportedPackage() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            locate com.github.kusa233.test
+
+            import java.util
+
+            class Sample {
+                static {
+                    fun main() {
+                        value: <caret>
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // An undeclared capitalized name falls back to the file's imported package, so these are
+        // nameable here -- and they are offered because of that import, not in spite of it.
+        assertContainsElements(completeAtCaret(), "ArrayList")
     }
 
     // -------------------------------------------------------------------------------- helpers
