@@ -1,15 +1,22 @@
 locate com.github.kusa233.neko.sample
 
 /**
- * `nya <condition>` — checks what the program believes, and stops when it is wrong.
+ * `nya <condition>` — writes down what the program believes, and says what a wrong belief means.
  *
- * The statement exists because some facts are true of the program rather than of its input: a value
+ * The construct exists because some facts are true of the program rather than of its input: a value
  * that must have been set up, a result that must obey the comment above it, an invariant that holds
  * when a loop ends. A `nya` writes that down where it is relied on, so a run that breaks the
  * assumption ends at the line that made it instead of somewhere later where the damage shows up.
  *
- * Every check below holds, so the program runs to the end. The cases that must not compile are
- * commented out, as the other samples do.
+ * It has three forms, and the sample uses all of them:
+ *
+ *  * `nya condition` — a false condition throws `java.lang.AssertionError` naming the condition.
+ *  * `nya condition { ... }` — the block runs on a false condition and the program carries on, which
+ *    is how a failure that can be dealt with is dealt with.
+ *  * `nya condition { ... } else { ... }` — worth a value, one block per reading of the condition.
+ *
+ * Every check below that must hold does hold, so the program runs to the end. The cases that must not
+ * compile are commented out, as the other samples do.
  */
 class NyaSample() {
     static {
@@ -17,7 +24,8 @@ class NyaSample() {
             comparisons()
             functionCalls()
             narrowing()
-            caught()
+            recovered()
+            valued()
             // Error to compile: only a 'bool' can be checked, because nothing else could fail.
             // nya 1 + 1
         }
@@ -54,15 +62,33 @@ class NyaSample() {
             println(box.value)               // Should print '4', with no '?.' needed
         }
 
-        // A failed check throws a real 'java.lang.AssertionError', so 'try' can catch it. That is
-        // what makes a check usable where a failure should become a value.
-        fun caught() {
-            try {
-                nya 1 == 2                   // Fails, and says which condition failed
-            } catch (e: AssertionError) {
-                println(e)                   // Should print 'java.lang.AssertionError: 1 == 2'
+        // A failure block replaces the throw: the reader has said what a false condition means, so
+        // the block runs and the statement after the check runs too. This is what stands in for the
+        // 'try'/'catch' a language with exceptions would reach for.
+        fun recovered() {
+            nya 1 == 2 {
+                println("handled: 1 == 2 was false")
             }
-            println("caught")                // Should print 'caught'
+            println("recovered")             // Should print 'recovered'
+        }
+
+        // With both blocks the construct is worth a value: each block says what it is worth on its own
+        // reading of the condition, and the two answers have to agree in type. Here the blocks are the
+        // two possible answers to "did these agree?", so the expression is a whole answer by itself.
+        fun valued() {
+            println(difference(1, 1))        // Should print '0'
+            println(difference(1, 2))        // Should print '1'
+        }
+
+        fun difference(a: int, b: int): int {
+            // The failure block is the reading where the condition did not hold, so it is the one that
+            // answers "they differ"; 'else' is the reading where it did, and answers "they match".
+            v: int = nya a == b {
+                yield 1
+            } else {
+                yield 0
+            }
+            return v
         }
 
         fun ready(): bool {

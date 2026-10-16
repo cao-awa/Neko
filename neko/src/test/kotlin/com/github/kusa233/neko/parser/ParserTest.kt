@@ -239,31 +239,6 @@ class ParserTest {
     }
 
     @Test
-    fun `parses a try with catch and finally`() {
-        val function = function(
-            """
-            class Sample {
-                fun method() {
-                    try {
-                        println("body")
-                    } catch (e: CustomException) {
-                        println("caught")
-                    } finally {
-                        println("finally")
-                    }
-                }
-            }
-            """.trimIndent() + "\n",
-            "method",
-        )
-        val statement = function.statements
-            .filterIsInstance<com.github.kusa233.neko.ast.TryCatchStatement>()
-            .single()
-        assertEquals("e", statement.catches.single().parameterName)
-        assertTrue(statement.finallyBlock != null, "the finally block should be recorded")
-    }
-
-    @Test
     fun `parses a class header with a superclass and an interface`() {
         val declaration = classOf(
             """

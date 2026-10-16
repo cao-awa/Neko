@@ -86,10 +86,12 @@ data object ObjectType : NekoType {
 }
 
 /**
- * `Throwable` — the root of everything `catch` can name.
+ * `Throwable` — the type of anything the JVM can throw, and what a `try` handler catches.
  *
- * A `catch` clause names a class that extends this, and the analyzer checks that by looking at the
- * resolved class hierarchy rather than at the name.
+ * Nothing in the language names it as a catch type any more: the `try`/`catch` statement was removed.
+ * It survives as the declared type of a throwable that crosses a frame boundary — the standard
+ * library's carrier for `raise` is declared as one — and as the erased type of the local a generated
+ * handler stores its exception in.
  */
 data object ThrowableType : NekoType {
     override val displayName: String get() = "Throwable"

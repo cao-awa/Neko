@@ -66,6 +66,35 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private var currentExtractor: ExtractorTry? = null
 
     /**
+     * Non-null while analysing the two blocks of a `nya` that is used as a value.
+     *
+     * Only the value form sets this. In the two forms that are worth nothing — bare, and with a lone
+     * failure block — a `yield` inside the block still means what it means outside it, so a lambda
+     * wrapping `nya a == b { yield 1 }` keeps its own result; here it would be a second, invisible
+     * home for the same word. Both blocks of a value form are analysed under one of these, which is
+     * what lets the first `yield` in *either* of them fix the type the other must match: the two are
+     * two answers to one question, so they are worth the same type or the construct means nothing.
+     */
+    private var currentNya: NyaValue? = null
+
+    /**
+     * The `nya` in value position whose blocks are being analysed, and the type they are being asked
+     * for.
+     *
+     * [expected] is the type the construct was used where — `v: int = ...` — and is a hint the first
+     * `yield` may be inferred from rather than a requirement, exactly as it is for a lambda. The type
+     * actually produced is recorded on the node itself, because that is what code generation reads.
+     *
+     * [inFailureBlock] is what tells the two blocks' `yield`s apart, since both belong to this one
+     * `nya` and the difference only matters when reporting which of them never produced anything.
+     */
+    private class NyaValue(val expression: NyaExpression, val expected: NekoType?) {
+        var inFailureBlock = true
+        var failureYielded = false
+        var elseYielded = false
+    }
+
+    /**
      * What the tests passed so far have proved, keyed by the declaration each fact is about.
      *
      * A `T?` is a value that may be absent, and every read of one has to be guarded. Writing the guard
@@ -256,7 +285,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      *
      * A superclass and an interface both become [ClassType]s, and the analyzer records the symbol
      * behind each when it is declared in this file — which is what lets member lookup walk up the
-     * hierarchy and what `catch` consults to decide whether a type is throwable.
+     * hierarchy.
      */
     private fun resolveSupertypes(declaration: ClassDeclaration, classSymbol: ClassSymbol) {
         val superclass = declaration.superclass
@@ -826,10 +855,8 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             is IfStatement -> analyzeIf(statement)
             is WhileStatement -> analyzeWhile(statement)
             is WhenStatement -> analyzeWhen(statement)
-            is NyaStatement -> analyzeNya(statement)
             is RaiseStatement -> analyzeRaise(statement)
             is TryStatement -> analyzeTry(statement)
-            is TryCatchStatement -> analyzeTryCatch(statement)
             is IndexAssignmentStatement -> analyzeIndexAssignment(statement)
         }
     }
@@ -926,20 +953,109 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     }
 
     /**
-     * `nya condition` — checks the condition, and stops the program when it does not hold.
+     * `nya condition`, `nya condition { ... }`, `nya condition { ... } else { ... }` — checks the
+     * condition, and says what a false one means.
      *
-     * The condition is an ordinary `bool` expression, so the only rule the analyzer adds is that it
-     * *is* one: a `nya` whose operand is not a `bool` could never fail, which means it is not a check
-     * at all and the reader wrote something other than what they meant.
+     * The condition is an ordinary `bool` expression, so the only rule added here is that it *is* one:
+     * a `nya` whose operand is not a `bool` could never fail, which means it is not a check at all and
+     * the reader wrote something other than what they meant.
      *
-     * Everything after a `nya` runs only when its condition held, so the statement narrows exactly as
-     * a guard does — `nya h != null` makes the rest of the block a place where `h` is there. The fact
-     * is applied here rather than joined back at the end of the block because the statement cannot
-     * fail and continue: control reaches the next statement only on the reading where it held.
+     * What a false condition means is the writer's choice, and the three writings differ in what they
+     * are worth rather than in how the test itself is compiled:
+     *
+     *  * **Bare.** The failure path throws. Only the reading where the condition held reaches the next
+     *    statement, so the fact is applied to what follows and the check narrows exactly as a guard
+     *    does — `nya h != null` makes the rest of the block a place where `h` is there.
+     *  * **With a failure block.** Control reaches the next statement *either* way: on the reading
+     *    where the condition held, and on the reading where it did not and the block recovered. So
+     *    nothing is narrowed afterwards — whatever the block did, the reader has already said the
+     *    false case is not an error, and the join of the two readings proves nothing about either.
+     *  * **With both blocks.** The construct is worth a value. Each block `yield`s it, on its own
+     *    reading of the condition, and the two must agree: they are two answers to one question, so a
+     *    disagreement means the expression means nothing. Each block is analysed under what its own
+     *    reading proves — the failure block under what a false condition proves, the `else` block
+     *    under what a true one does.
      */
-    private fun analyzeNya(statement: NyaStatement) {
-        requireBool(analyzeExpression(statement.condition), statement.condition.span, "nya")
-        applyFacts(factsTrue(statement.condition))
+    private fun analyzeNyaExpression(expression: NyaExpression, expectedType: NekoType?): NekoType {
+        requireBool(analyzeExpression(expression.condition), expression.condition.span, "nya")
+
+        val failureBlock = expression.failureBlock
+        val elseBlock = expression.elseBlock
+
+        if (elseBlock == null) {
+            if (failureBlock == null) {
+                applyFacts(factsTrue(expression.condition))
+                return VoidType
+            }
+            analyzeNyaBlock(expression, failureBlock, holds = false)
+            return VoidType
+        }
+
+        // From here the construct is worth a value, so both blocks are analysed under one shared
+        // state: the first `yield` in either of them fixes the type the other has to match.
+        val saved = currentNya
+        val state = NyaValue(expression, expectedType)
+        currentNya = state
+        try {
+            failureBlock?.let { analyzeNyaBlock(expression, it, holds = false, state = state) }
+            analyzeNyaBlock(expression, elseBlock, holds = true, state = state)
+        } finally {
+            currentNya = saved
+        }
+
+        if (failureBlock == null) {
+            // The parser already reported this, but the node still exists and generation would read a
+            // result type off it, so the answer stops here rather than guessing at what is missing.
+            return ErrorType
+        }
+
+        if (expression.yieldedType == null) {
+            // Neither block produced a value, so the expression would answer nothing.
+            diagnostics.error(
+                "this 'nya' is used as a value, so both of its blocks must 'yield' the value it " +
+                    "is worth",
+                expression.span,
+            )
+            return ErrorType
+        }
+
+        if (!state.failureYielded) {
+            diagnostics.error(
+                "the failure block of this 'nya' never 'yield's, so there is no value for the " +
+                    "case where the condition is false",
+                failureBlock.span,
+            )
+        }
+        if (!state.elseYielded) {
+            diagnostics.error(
+                "the 'else' block of this 'nya' never 'yield's, so there is no value for the " +
+                    "case where the condition holds",
+                elseBlock.span,
+            )
+        }
+
+        return expression.yieldedType!!
+    }
+
+    /**
+     * Analyzes one of a `nya`'s blocks under what its own reading of the condition proves.
+     *
+     * The facts are saved and restored around the block for the same reason an `if` arm's are: what a
+     * test proves is true *inside* the code it guards, never after it. [holds] says which reading this
+     * block belongs to, which is what makes `nya h != null { recover() } else { h.use() }` legal —
+     * the `else` block is a place where `h` is known to be there.
+     */
+    private fun analyzeNyaBlock(
+        expression: NyaExpression,
+        block: BlockStatement,
+        holds: Boolean,
+        state: NyaValue? = null,
+    ) {
+        val incoming = saveNarrowings()
+        applyFacts(if (holds) factsTrue(expression.condition) else factsFalse(expression.condition))
+        if (state != null) state.inFailureBlock = !holds
+        analyzeBlock(block)
+        restoreNarrowings(incoming)
     }
 
     /**
@@ -1090,8 +1206,12 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // enclosing variables are all still in scope, and a `raise` inside it behaves as usual.
         val savedFunction = currentFunction
         val savedExtractor = currentExtractor
+        // It is its own home for a `yield`, though: a `yield` written here produces the extractor's
+        // value, not that of a `nya` value form the `try` happens to be written inside.
+        val savedNya = currentNya
         pushScope(identifier = statement)
         currentExtractor = statement
+        currentNya = null
 
         for ((index, parameter) in statement.extractorParameters.withIndex()) {
             val type = expected.getOrNull(index) ?: ErrorType
@@ -1124,6 +1244,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         currentExtractor = savedExtractor
         popScope()
         currentFunction = savedFunction
+        currentNya = savedNya
     }
 
     /**
@@ -1620,21 +1741,23 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     }
 
     /**
-     * `yield x + y` — the value of the lambda it appears in, or of the `try` expression whose
-     * extractor it is written in.
+     * `yield x + y` — the value of the lambda it appears in, of the `try` expression whose extractor
+     * it is written in, or of the `nya` value form whose block it is written in.
      *
-     * Both produce a value the same way, and in both the first `yield` fixes the result type that
-     * later ones must match. Only the home of the value differs: a lambda's `yield` returns from the
-     * generated `invoke`, a `try` extractor's from the extractor class the compiler emits for it.
+     * All three produce a value the same way, and in all three the first `yield` fixes the result type
+     * that later ones must match. Only the home of the value differs: a lambda's `yield` returns from
+     * the generated `invoke`, a `try` extractor's from the extractor class the compiler emits for it,
+     * and a `nya`'s from the branch the block is.
      */
     private fun analyzeYield(statement: YieldStatement) {
         val lambda = currentLambda
         val extractor = currentExtractor
+        val nya = currentNya
 
-        if (lambda == null && extractor == null) {
+        if (lambda == null && extractor == null && nya == null) {
             diagnostics.error(
-                "'yield' can only be used inside a lambda or a 'try' expression; use 'return' to " +
-                    "return from a function",
+                "'yield' can only be used inside a lambda, a 'try' expression or the blocks of a " +
+                    "'nya' used as a value; use 'return' to return from a function",
                 statement.keywordSpan,
             )
         }
@@ -1650,39 +1773,58 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             )
         }
 
-        // A `try` extractor takes precedence: `yield` inside one belongs to that extractor, not to a
-        // lambda the extractor might itself be nested in.
-        val expected = extractor?.yieldedType ?: lambda?.expectedReturnType
+        // A `try` extractor takes precedence over a lambda, and a `nya` value form takes precedence
+        // over both: a `yield` inside one belongs to the innermost construct that is waiting for a
+        // value, which is the one whose block the statement is written in.
+        val expected = nya?.expected ?: extractor?.yieldedType ?: lambda?.expectedReturnType
         val valueType = analyzeExpression(statement.value, expected)
 
-        if (extractor != null && extractor.acceptsYield) {
-            val alreadyYielded = extractor.yieldedType
-            if (alreadyYielded == null) {
-                extractor.yieldedType = valueType // The first `yield` fixes the result type.
-            } else if (!isAssignable(valueType, alreadyYielded)) {
-                diagnostics.error(
-                    "this 'yield' produces ${valueType.displayName} but an earlier 'yield' in the " +
-                        "same 'try' extractor produces ${alreadyYielded.displayName}",
-                    statement.value.span,
-                )
+        when {
+            nya != null -> {
+                if (nya.inFailureBlock) nya.failureYielded = true else nya.elseYielded = true
+                val alreadyYielded = nya.expression.yieldedType
+                if (alreadyYielded == null) {
+                    nya.expression.yieldedType = valueType // The first `yield` fixes the result type.
+                } else if (!isAssignable(valueType, alreadyYielded)) {
+                    diagnostics.error(
+                        "this 'yield' produces ${valueType.displayName} but the other block of the " +
+                            "same 'nya' produces ${alreadyYielded.displayName}",
+                        statement.value.span,
+                    )
+                }
             }
-        } else if (lambda != null) {
-            if (expected == null) {
-                lambda.expectedReturnType = valueType // The first `yield` fixes the result type.
-            } else if (!isAssignable(valueType, expected)) {
-                // The type being violated may come from an earlier `yield` or from the function type
-                // the lambda is being used as, and the two are worth telling apart: one is a
-                // disagreement inside this lambda, the other a disagreement with its destination.
-                diagnostics.error(
-                    if (lambda.returnTypeIsDeclared) {
-                        "this 'yield' produces ${valueType.displayName} but the function type this " +
-                            "lambda is used as returns ${expected.displayName}"
-                    } else {
+
+            extractor != null && extractor.acceptsYield -> {
+                val alreadyYielded = extractor.yieldedType
+                if (alreadyYielded == null) {
+                    extractor.yieldedType = valueType // The first `yield` fixes the result type.
+                } else if (!isAssignable(valueType, alreadyYielded)) {
+                    diagnostics.error(
                         "this 'yield' produces ${valueType.displayName} but an earlier 'yield' in " +
-                            "the same lambda produces ${expected.displayName}"
-                    },
-                    statement.value.span,
-                )
+                            "the same 'try' extractor produces ${alreadyYielded.displayName}",
+                        statement.value.span,
+                    )
+                }
+            }
+
+            lambda != null -> {
+                if (expected == null) {
+                    lambda.expectedReturnType = valueType // The first `yield` fixes the result type.
+                } else if (!isAssignable(valueType, expected)) {
+                    // The type being violated may come from an earlier `yield` or from the function
+                    // type the lambda is being used as, and the two are worth telling apart: one is a
+                    // disagreement inside this lambda, the other a disagreement with its destination.
+                    diagnostics.error(
+                        if (lambda.returnTypeIsDeclared) {
+                            "this 'yield' produces ${valueType.displayName} but the function type " +
+                                "this lambda is used as returns ${expected.displayName}"
+                        } else {
+                            "this 'yield' produces ${valueType.displayName} but an earlier 'yield' " +
+                                "in the same lambda produces ${expected.displayName}"
+                        },
+                        statement.value.span,
+                    )
+                }
             }
         }
     }
@@ -1758,124 +1900,6 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     }
 
     /**
-     * `try { ... } catch (e: CustomException) { ... } finally { ... }`
-     *
-     * This is how a program handles a throwable produced outside the language — a call into a class
-     * some other JVM language compiled. Each `catch` names a type that must be throwable, and a
-     * clause the JVM could never select is reported rather than left to fail at run time.
-     */
-    private fun analyzeTryCatch(statement: TryCatchStatement) {
-        val seen = mutableListOf<NekoType>()
-
-        analyzeBlock(statement.body)
-
-        for (clause in statement.catches) {
-            val caughtType = resolveType(clause.declaredType)
-            clause.resolvedType = caughtType
-            checkCatchable(caughtType, clause.declaredType.span, clause.parameterName)
-
-            // A later clause that names a supertype of an earlier one can never run, because the
-            // earlier clause already caught everything the later one would accept. That is dead
-            // code the author cannot see, so it is reported.
-            val unreachable = seen.firstOrNull { earlier -> isSubtype(caughtType, earlier) }
-            if (unreachable != null) {
-                diagnostics.error(
-                    "this 'catch' clause can never run: an earlier clause already catches " +
-                        "${unreachable.displayName}, which every ${caughtType.displayName} is",
-                    clause.declaredType.span,
-                )
-            }
-            seen += caughtType
-
-            pushScope(identifier = clause)
-            val local = LocalSymbol(
-                name = clause.parameterName,
-                type = caughtType,
-                span = clause.parameterNameSpan,
-                kind = VariableKind.VAL,
-                isParameter = true,
-            )
-            clause.symbol = local
-            scopes.last().symbols[clause.parameterName] = local
-            analyzeBlock(clause.body)
-            popScope()
-        }
-
-        if (statement.finallyBlock != null) {
-            // A `finally` runs whatever happened, including when no exception was thrown, so it is
-            // just a block. It is deliberately not exempt from the "must not return" question: a
-            // `return` inside `finally` discards a pending exception, which the analyzer reports.
-            analyzeBlock(statement.finallyBlock)
-        }
-    }
-
-    /**
-     * Rejects a `catch` clause naming something the JVM could never throw into it.
-     *
-     * The test is the class hierarchy, not the name: `CustomException` is only a legal catch type
-     * because it extends `Exception`. A class the program declares says so itself; one the platform
-     * provides is checked against the platform.
-     */
-    private fun checkCatchable(type: NekoType, span: Span, name: String) {
-        if (type.isError) return
-        if (type === ThrowableType) return
-        if (type !is ClassType) {
-            diagnostics.error(
-                "a 'catch' clause must name a throwable type but '$name' has type " +
-                    type.displayName,
-                span,
-            )
-            return
-        }
-
-        // A class declared in the program must actually descend from Throwable. One from outside the
-        // program is checked by loading it, so `catch (e: ArithmeticException)` is accepted because
-        // the JDK says it is throwable, and a class that cannot be loaded is taken on trust rather
-        // than reported — it may simply not be on the compiler's own classpath.
-        val symbol = classes[type.simpleName]
-        val isThrowable = if (symbol != null) {
-            extendsThrowable(symbol)
-        } else {
-            platformIsThrowable(type.simpleName)
-        }
-
-        if (!isThrowable) {
-            diagnostics.error(
-                "a 'catch' clause cannot name '${type.displayName}': it is not a throwable, so no " +
-                    "exception could ever be caught by it",
-                span,
-            )
-        }
-    }
-
-    /** Whether [symbol], or something it extends, is a throwable the analyzer can see. */
-    private fun extendsThrowable(symbol: ClassSymbol): Boolean {
-        var current: ClassSymbol? = symbol
-        val visited = mutableSetOf<ClassSymbol>()
-        while (current != null && visited.add(current)) {
-            val superclass = current.superclass ?: return false
-            val simple = superclass.simpleName
-            // A supertype declared in the program is walked; one the platform provides is asked
-            // about directly, which is what makes `RuntimeException` and anything below it work.
-            if (platformIsThrowable(simple)) return true
-            current = current.superclassSymbol
-        }
-        return false
-    }
-
-    /**
-     * Whether a class named [simpleName] exists and descends from `Throwable`.
-     *
-     * `false` covers both "the platform has no such class" and "it is not throwable"; a class the
-     * compiler cannot load at all is treated as *not* throwable only when it is also absent from the
-     * program, which the caller has already established.
-     */
-    private fun platformIsThrowable(simpleName: String): Boolean {
-        val loaded = loadPlatformClass(simpleName) ?: return false
-        return Throwable::class.java.isAssignableFrom(loaded)
-    }
-
-    /**
      * Loads `java.lang.[simpleName]` without running its static initializer, or `null` when it does
      * not exist.
      *
@@ -1894,6 +1918,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private fun isSubtype(sub: NekoType, supertype: NekoType): Boolean {
         if (sub.isError || supertype.isError) return false
         if (sub == supertype) return true
+        // `Throwable` is a type from outside the program, so its symbol cannot be walked: the one
+        // fact available about it is that everything below it is named by a class the program
+        // declares, which is what this arm answers for an explicitly `Throwable`-typed slot.
         if (supertype === ThrowableType) return sub === ThrowableType
         val subSymbol = (sub as? ClassType)?.let { classes[it.simpleName] } ?: return false
         val superSymbol = (supertype as? ClassType)?.let { classes[it.simpleName] } ?: return false
@@ -1962,6 +1989,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         is LambdaExpression -> analyzeLambda(expression, expectedType)
         is MemberAccessExpression -> analyzeMemberAccess(expression)
         is IndexExpression -> analyzeIndexRead(expression)
+        is NyaExpression -> analyzeNyaExpression(expression, expectedType)
         is TryExpression -> analyzeTryExpression(expression)
     }
 
@@ -3026,10 +3054,16 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         expression.identity = state.identity
         val outerLambda = currentLambda
         val outerFunction = currentFunction
+        // The body runs later, from a place of its own, so a `yield` written in it belongs to *this*
+        // lambda rather than to a `nya` value form the lambda happens to be written inside. A `nya`
+        // inside the body sets its own state while that `nya`'s blocks are analysed, so nesting the
+        // other way round still works.
+        val outerNya = currentNya
         // A lambda body runs on a different object, so it has no `this`: naming an instance member
         // bare would silently read the wrong object, so the implicit receiver is withdrawn here.
         val outerImplicitThis = implicitThisClass
         currentLambda = state
+        currentNya = null
         // `return` inside a lambda is an error (reported by `analyzeReturn`), so the enclosing
         // function must not stay visible here.
         currentFunction = null
@@ -3072,6 +3106,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         restoreNarrowings(enclosingFacts)
         currentLambda = outerLambda
         currentFunction = outerFunction
+        currentNya = outerNya
         implicitThisClass = outerImplicitThis
 
         val returnType = state.expectedReturnType ?: when {
@@ -3899,13 +3934,10 @@ private fun Statement.alwaysReturns(): Boolean = when (this) {
     is IfStatement -> elseBranch != null && thenBranch.alwaysReturns() && elseBranch.alwaysReturns()
     is WhenStatement -> hasElseBranch && branches.all { it.body.alwaysReturns() }
     is WhileStatement -> false
-    // A `nya` throws only when its condition fails, so control can reach whatever follows it — it is
-    // a check on the way past, not a way out.
-    is NyaStatement -> false
-    // A `try` with a `finally` returns only if every path out of it does, which is more than a
-    // conservative test can tell; reporting "maybe falls through" is the safe answer.
+    // A `try` returns only if every path out of it does, which is more than a conservative test can
+    // tell; reporting "maybe falls through" is the safe answer.
     is YieldStatement, is VariableDeclarationStatement, is AssignmentStatement,
-    is ExpressionStatement, is TryStatement, is TryCatchStatement, is IndexAssignmentStatement,
+    is ExpressionStatement, is TryStatement, is IndexAssignmentStatement,
     -> false
 }
 
@@ -3920,8 +3952,6 @@ private fun Statement.terminatesFlow(): Boolean = when (this) {
     is BlockStatement -> statements.any { it.terminatesFlow() }
     is IfStatement -> elseBranch != null && thenBranch.terminatesFlow() && elseBranch.terminatesFlow()
     is WhenStatement -> hasElseBranch && branches.all { it.body.terminatesFlow() }
-    // `nya` lets control through when it holds, so it never makes the next statement unreachable.
-    is NyaStatement -> false
     else -> false
 }
 
@@ -3949,9 +3979,19 @@ private fun Statement.containsRaise(): Boolean = when (this) {
     // A `raise` in a `try` body belongs to that body's own function; the values it carries are
     // handed to this statement's extractor instead.
     is TryStatement -> extractorBody.statements.any { it.containsRaise() }
-    is TryCatchStatement ->
-        body.statements.any { it.containsRaise() } ||
-            catches.any { clause -> clause.body.statements.any { it.containsRaise() } } ||
-            finallyBlock?.statements?.any { it.containsRaise() } == true
+    // A `raise` written inside a `nya`'s blocks belongs to the function those blocks are emitted in,
+    // which is the enclosing one — so it counts here even though the `nya` itself cannot raise.
+    is ExpressionStatement -> expression.containsRaise()
+    else -> false
+}
+
+/**
+ * Whether this expression contains a `raise`, which only a [`NyaExpression`] can: the blocks of a
+ * `nya` are the one expression-shaped place a statement may be written.
+ */
+private fun Expression.containsRaise(): Boolean = when (this) {
+    is NyaExpression ->
+        failureBlock?.statements?.any { it.containsRaise() } == true ||
+            elseBlock?.statements?.any { it.containsRaise() } == true
     else -> false
 }

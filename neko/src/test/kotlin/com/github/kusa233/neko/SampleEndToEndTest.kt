@@ -217,7 +217,7 @@ class SampleEndToEndTest {
     }
 
     @Test
-    fun `the nya sample runs every check and prints the failing condition`() {
+    fun `the nya sample runs every check and shows what a false one means`() {
         val directory = Files.createTempDirectory("neko-nya-sample")
         val result = compileSample(nyaSamplePath(), outputDirectory = directory)
         assertTrue(!result.hasErrors, "the nya sample must compile before it can be run")
@@ -235,10 +235,10 @@ class SampleEndToEndTest {
             System.setOut(original)
         }
 
-        // Every check in the sample holds except the one inside the `try`, which is caught. The
-        // message it prints is the condition's own source text, and it is the sample's whole point:
-        // the compiler quotes back the expression rather than making the reader write it twice. The
-        // `4` before it is the narrow read `nya box != null` is what allows.
+        // Every check that must hold does, so the run reaches the end. The `4` is the narrow read
+        // `nya box != null` is what allows; the two lines after it are the failure block of the check
+        // that does not hold — which no longer ends the call — and the two numbers at the end are the
+        // value form answering by which block ran.
         assertEquals(
             listOf(
                 "3",
@@ -246,11 +246,13 @@ class SampleEndToEndTest {
                 "ready",
                 "flag",
                 "4",
-                "java.lang.AssertionError: 1 == 2",
-                "caught",
+                "handled: 1 == 2 was false",
+                "recovered",
+                "0",
+                "1",
             ),
             buffer.toString(Charsets.UTF_8).replace("\r\n", "\n").trim().lines(),
-            "the sample should run every check and print the caught failure's own condition",
+            "the sample should run every check and show what a false condition means",
         )
     }
 

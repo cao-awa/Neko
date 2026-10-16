@@ -928,10 +928,8 @@ class BytecodeGenerator(
             is IfStatement -> emitIf(statement, scope)
             is WhileStatement -> emitWhile(statement, scope)
             is WhenStatement -> emitWhen(statement, scope)
-            is NyaStatement -> emitNya(statement, scope)
             is RaiseStatement -> emitRaise(statement, scope)
             is TryStatement -> emitTry(statement, scope)
-            is TryCatchStatement -> emitTryCatch(statement, scope)
             is IndexAssignmentStatement -> emitIndexAssignment(statement, scope)
         }
     }
@@ -1078,15 +1076,28 @@ class BytecodeGenerator(
     }
 
     /**
-     * `yield x + y` produces the value of the construct it appears in —the lambda's, or the `try`
-     * expression's whose extractor it is written in —i.e. it returns from the generated `invoke`.
+     * `yield x + y` produces the value of the construct it appears in —the lambda's, the `try`
+     * expression's whose extractor it is written in, or the `nya` value form's whose block it is
+     * written in.
      *
-     * An extractor's `invoke` answers the interface's erased `R`, which is `Object`, so the value is
-     * boxed on the way out; a lambda's answers its own return type and is converted to it exactly as a
-     * `return` would be —narrowed for a `byte`, and boxed for a nullable one.
+     * A lambda's `yield` returns from the generated `invoke`, and an extractor's answers the
+     * interface's erased `R`, which is `Object`, so the value is boxed on the way out. A `nya`'s
+     * cannot do either: its block is emitted *inline*, in the same method as the construct, so there
+     * is no call to return from — it writes into the slot the two blocks share and jumps to the label
+     * where the value is picked up. That is also why the value is boxed here: the slot is one `Object`
+     * wide whatever the `nya` is worth.
      */
     private fun emitYield(statement: YieldStatement, scope: MethodScope) {
         emitExpression(statement.value, scope)
+
+        val nya = scope.nyaResult
+        if (nya != null) {
+            emitStoreValue(statement.value.type, ObjectType, scope.mv)
+            scope.mv.visitVarInsn(ASTORE, nya.slot)
+            scope.mv.visitJumpInsn(GOTO, nya.end)
+            return
+        }
+
         if (scope.extractorResult) {
             emitBox(statement.value.type, scope.mv)
             scope.mv.visitInsn(ARETURN)
@@ -1185,88 +1196,115 @@ class BytecodeGenerator(
     }
 
     /**
-     * `try { ... } catch (e: T) { ... } finally { ... }` —lowered to the JVM's exception table.
+     * `nya condition`, `nya condition { ... }`, `nya condition { ... } else { ... }` — jumps over the
+     * failure when the condition holds, and says what a false one means otherwise.
      *
-     * The layout is the one `javac` produces for the same source, and the two protected ranges are
-     * what make it correct:
+     * The check is the two instructions a guard already compiles to — evaluate, then branch on zero —
+     * so a `nya` that passes costs exactly the comparison it names and nothing else. What the branch
+     * lands on is the whole of the difference between the three forms:
      *
      * ```
-     *   start:         body                 │explicit `catch` ranges
-     *   endBody:       handler_i:  astore e; catchBody
-     *   endAll:                              │catch-all range, so an exception thrown *inside* a
-     *   finallyNormal: finallyBody; goto after   catch body still reaches the `finally`
-     *   catchAll:      astore pending; finallyBody; aload pending; athrow
-     *   after:
+     *   cond; ifeq failure
+     *   else body                              │ or nothing, when there is no `else`
+     *   goto end
+     *   failure:  failure body, or the throw
+     *   end:
      * ```
      *
-     * The explicit entries are added first and cover only the body, so the JVM —which tests the
-     * table in order —matches them exactly as the source reads, and never re-enters a handler that
-     * threw. The `finally` body is emitted once per path out of the region, which is the duplication
-     * `javac` performs and what makes it run on normal completion, on a caught exception and on an
-     * uncaught one alike.
+     * A bare `nya` puts the throw where the failure body would be, so reaching it is one instruction
+     * after the branch that got there. The message is the condition's own source text, taken from its
+     * span: the compiler already has the exact expression the reader wrote, and quoting it back is
+     * more accurate than a message they would have had to write twice. `AssertionError`'s `String`
+     * constructor is private, so the text goes in as an `Object` — the public constructor that takes
+     * one — which is also the one Java's own `assert` uses.
+     *
+     * A block instead of a throw means the false case is handled rather than fatal, which is why the
+     * other two forms have no `athrow`: the reader has said what should happen, so control carries on
+     * at `end` — this is what replaced `try`/`catch` as the way a program recovers.
+     *
+     * The value form is the one with something to put on the stack at `end`, and both blocks meet
+     * there through **one slot** rather than through the stack: a block can end in a `yield`, but it
+     * can also fall off its own end, and the two paths would then leave different stack shapes. The
+     * slot is seeded with the default of the result type so that even the falling-off path leaves the
+     * verifier something defined to find, and `yield` writes into it — see [emitYield] — so a block's
+     * answer and the `end` label agree whatever route control took to get there.
      */
-    private fun emitTryCatch(statement: TryCatchStatement, scope: MethodScope) {
+    private fun emitNyaExpression(expression: NyaExpression, scope: MethodScope) {
         val mv = scope.mv
-        val start = Label()
-        val endBody = Label()
-        val endAll = Label()
-        val finallyNormal = Label()
-        val catchAll = Label()
-        val after = Label()
-        val finallyBlock = statement.finallyBlock
+        val failure = expression.failureBlock
+        val elseBlock = expression.elseBlock
+        val yieldedType = expression.yieldedType
 
-        val handlerLabels = statement.catches.map { Label() }
-        // A `finally` needs somewhere to park the exception it is running on top of, so that it can
-        // rethrow it once its body finishes.
-        val pendingSlot = if (finallyBlock != null) scope.allocateTemp(ThrowableType) else null
+        val failureLabel = Label()
+        val endLabel = Label()
 
-        mv.visitLabel(start)
-        emitStatement(statement.body, scope)
-        mv.visitLabel(endBody)
+        markLine(mv, expression)
 
-        val normalExit = if (finallyBlock != null) finallyNormal else after
-        mv.visitJumpInsn(GOTO, normalExit)
-
-        statement.catches.forEachIndexed { index, clause ->
-            val type = (clause.resolvedType as? ClassType)?.internalName ?: "java/lang/Throwable"
-            mv.visitTryCatchBlock(start, endBody, handlerLabels[index], type)
-
-            mv.visitLabel(handlerLabels[index])
-            val symbol = clause.symbol
-            if (symbol != null) {
-                mv.visitVarInsn(ASTORE, scope.allocate(symbol))
-            } else {
-                mv.visitInsn(POP)
-            }
-            emitBlockStatements(clause.body, scope)
-            mv.visitJumpInsn(GOTO, normalExit)
+        // Only the value form needs a slot: the other two are worth nothing, so there is nothing for
+        // the blocks to agree about.
+        val result = if (elseBlock != null && failure != null && yieldedType != null) {
+            // The slot holds an erased value from either block, so it is one `Object` wide whatever
+            // the `nya` is worth — the same representation a `try` expression's result uses.
+            val slot = scope.allocateTemp(ObjectType)
+            pushDefault(yieldedType, mv)
+            emitStoreValue(yieldedType, ObjectType, mv)
+            mv.visitVarInsn(ASTORE, slot)
+            slot
+        } else {
+            null
         }
 
-        mv.visitLabel(endAll)
+        emitExpression(expression.condition, scope)
+        mv.visitJumpInsn(IFEQ, failureLabel)
 
-        if (finallyBlock != null && pendingSlot != null) {
-            mv.visitLabel(finallyNormal)
-            emitBlockStatements(finallyBlock, scope)
-            mv.visitJumpInsn(GOTO, after)
+        // The blocks are emitted while their `yield` knows which slot to fill and which label to jump
+        // to. Saved and restored rather than cleared because a `nya` may be written inside another
+        // one's block, and there the inner construct's `yield` is the one being written.
+        val enclosingNya = scope.nyaResult
+        if (result != null) scope.nyaResult = NyaResult(result, endLabel)
 
-            // Covers the body *and* every handler, so an exception thrown while handling one still
-            // runs the `finally` before it propagates.
-            mv.visitTryCatchBlock(start, endAll, catchAll, null)
-            mv.visitLabel(catchAll)
-            mv.visitVarInsn(ASTORE, pendingSlot)
-            emitBlockStatements(finallyBlock, scope)
-            mv.visitVarInsn(ALOAD, pendingSlot)
-            mv.visitInsn(ATHROW)
+        if (elseBlock != null) {
+            emitStatement(elseBlock, scope)
+            mv.visitJumpInsn(GOTO, endLabel)
+        } else {
+            // Nothing to do when the condition held, so control goes straight past the failure.
+            mv.visitJumpInsn(GOTO, endLabel)
         }
 
-        mv.visitLabel(after)
+        mv.visitLabel(failureLabel)
+        if (failure == null) {
+            emitNyaThrow(expression, mv)
+        } else {
+            emitStatement(failure, scope)
+            mv.visitJumpInsn(GOTO, endLabel)
+        }
+
+        scope.nyaResult = enclosingNya
+        mv.visitLabel(endLabel)
+
+        if (result != null && yieldedType != null) {
+            mv.visitVarInsn(ALOAD, result)
+            emitUnbox(yieldedType, mv)
+        }
     }
 
-    /** Emits the statements of [block] without opening a scope of its own. */
-    private fun emitBlockStatements(block: BlockStatement, scope: MethodScope) {
-        markLine(scope.mv, block)
-        for (statement in block.statements) emitStatement(statement, scope)
+    /** `throw new AssertionError(<the condition's source text>)` for a bare `nya`. */
+    private fun emitNyaThrow(expression: NyaExpression, mv: MethodVisitor) {
+        mv.visitTypeInsn(NEW, ASSERTION_ERROR_CLASS)
+        mv.visitInsn(DUP)
+        mv.visitLdcInsn(expression.condition.span.text)
+        mv.visitMethodInsn(
+            INVOKESPECIAL,
+            ASSERTION_ERROR_CLASS,
+            "<init>",
+            "(Ljava/lang/Object;)V",
+            false,
+        )
+        mv.visitInsn(ATHROW)
     }
+
+    /** The slot and end label a `nya` value form's blocks leave their answer in and jump to. */
+    private class NyaResult(val slot: Int, val end: Label)
 
     /** `array[index]` —an `*aload` after the array and the index are on the stack. */
     private fun emitIndex(expression: IndexExpression, scope: MethodScope) {
@@ -1289,44 +1327,6 @@ class BytecodeGenerator(
         // an element of a nullable element type is boxed, for the same reason a nullable local is.
         if (element != null) emitStoreValue(statement.value.type, element, mv)
         mv.visitInsn(arrayStoreOpcode(element ?: ErrorType))
-    }
-
-    /**
-     * `nya condition` — jumps over the failure when the condition holds, and throws from here when
-     * it does not.
-     *
-     * The check is the two instructions a guard already compiles to — evaluate, then branch on
-     * zero — so a `nya` that passes costs exactly the comparison it names and nothing else. The
-     * failure path is straight-line code that is normally never run, which is why it is emitted
-     * inline rather than as a helper: falling into it from the branch above is one jump.
-     *
-     * The message is the condition's own source text, taken from its span. That is the reason the
-     * text is not an operand of the statement: the compiler already has the exact expression the
-     * reader wrote, and quoting it back is more accurate than any message they would have written
-     * twice. `AssertionError`'s `String` constructor is private, so the text goes in as an `Object`
-     * — the public constructor that takes one — which is also the one Java's own `assert` uses.
-     */
-    private fun emitNya(statement: NyaStatement, scope: MethodScope) {
-        val mv = scope.mv
-        val passed = Label()
-
-        markLine(mv, statement)
-        emitExpression(statement.condition, scope)
-        mv.visitJumpInsn(IFNE, passed)
-
-        mv.visitTypeInsn(NEW, ASSERTION_ERROR_CLASS)
-        mv.visitInsn(DUP)
-        mv.visitLdcInsn(statement.condition.span.text)
-        mv.visitMethodInsn(
-            INVOKESPECIAL,
-            ASSERTION_ERROR_CLASS,
-            "<init>",
-            "(Ljava/lang/Object;)V",
-            false,
-        )
-        mv.visitInsn(ATHROW)
-
-        mv.visitLabel(passed)
     }
 
     /**
@@ -1846,6 +1846,7 @@ class BytecodeGenerator(
             is LambdaExpression -> emitLambda(expression, scope)
             is MemberAccessExpression -> emitMemberAccess(expression, scope)
             is IndexExpression -> emitIndex(expression, scope)
+            is NyaExpression -> emitNyaExpression(expression, scope)
             is TryExpression -> emitTryExpression(expression, scope)
         }
     }
@@ -3232,7 +3233,14 @@ class BytecodeGenerator(
             is ExpressionStatement -> collectLocalReferences(node.expression, into)
             is ReturnStatement -> node.value?.let { collectLocalReferences(it, into) }
             is YieldStatement -> collectLocalReferences(node.value, into)
-            is NyaStatement -> collectLocalReferences(node.condition, into)
+            // A `nya`'s blocks are emitted inline, in whatever method the construct is written in, so
+            // whatever they read from an enclosing scope has to travel as far as the construct does —
+            // which is the same reason a nested block's reads are collected.
+            is NyaExpression -> {
+                collectLocalReferences(node.condition, into)
+                node.failureBlock?.let { collectLocalReferences(it, into) }
+                node.elseBlock?.let { collectLocalReferences(it, into) }
+            }
             is IfStatement -> {
                 collectLocalReferences(node.condition, into)
                 collectLocalReferences(node.thenBranch, into)
@@ -3250,12 +3258,6 @@ class BytecodeGenerator(
                     branch.condition?.let { collectLocalReferences(it, into) }
                     collectLocalReferences(branch.body, into)
                 }
-            }
-
-            is TryCatchStatement -> {
-                collectLocalReferences(node.body, into)
-                for (clause in node.catches) collectLocalReferences(clause.body, into)
-                node.finallyBlock?.let { collectLocalReferences(it, into) }
             }
 
             is IndexAssignmentStatement -> {
@@ -3344,6 +3346,17 @@ class BytecodeGenerator(
          * `Object`, so the `int` a `yield` names has to be boxed on the way out.
          */
         val extractorResult: Boolean = false,
+        /**
+         * The `nya` value form currently being emitted inside this method, if any.
+         *
+         * Unlike a lambda or a `try` extractor, whose body becomes a method of its own, a `nya`'s
+         * blocks are emitted inline — so the `yield` that appears in one is emitted while this very
+         * scope is current, and this is how it finds the slot to fill and the label to jump to. It is
+         * part of the scope rather than a generator field because a `nya` inside a lambda is in a
+         * different method from a `nya` outside it, and only the innermost enclosing one is the home
+         * of a given `yield`.
+         */
+        var nyaResult: NyaResult? = null,
     ) {
         private var nextSlot = firstSlot
         private val slots = LinkedHashMap<LocalSymbol, Int>()

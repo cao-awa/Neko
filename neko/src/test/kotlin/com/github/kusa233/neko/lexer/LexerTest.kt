@@ -39,7 +39,7 @@ class LexerTest {
         val keywords = listOf(
             "locate", "import", "meow", "class", "interface", "constructor", "fun", "val", "var",
             "private", "public", "protected", "static", "return", "yield", "if", "else", "while",
-            "when", "nya", "try", "catch", "finally", "raise", "emit", "this", "true", "false",
+            "when", "nya", "try", "raise", "emit", "this", "true", "false",
         )
         for (keyword in keywords) {
             val scanned = types(keyword).single()
@@ -51,11 +51,13 @@ class LexerTest {
     }
 
     @Test
-    fun `throw and throws are no longer keywords`() {
-        // Both were removed: raising is `raise` plus an `emit` clause, and catching what another JVM
-        // language throws is `try`/`catch`/`finally`. Scanning them as identifiers is what makes a
-        // stale program fail with "there is no function named 'throw'" rather than a syntax error.
-        for (removed in listOf("throw", "throws")) {
+    fun `removed keywords scan as ordinary identifiers`() {
+        // `throw` and `throws` went first: raising is `raise` plus an `emit` clause. `catch` and
+        // `finally` followed when the `try`/`catch` statement was removed — a false `nya` condition
+        // is now answered by a block rather than by a handler. Scanning each as an identifier is what
+        // makes a stale program fail with "there is no function named 'throw'" rather than a syntax
+        // error, and it keeps the words usable as ordinary names.
+        for (removed in listOf("throw", "throws", "catch", "finally")) {
             assertEquals(
                 TokenType.IDENTIFIER,
                 types(removed).single(),

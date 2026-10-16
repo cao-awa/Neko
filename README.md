@@ -32,7 +32,7 @@ Tasks are module-qualified now that there is more than one module.
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # Tests.
-./gradlew :neko:test                     # the compiler: 340 tests
+./gradlew :neko:test                     # the compiler: 350 tests
 ./gradlew :plugin:idea:test              # the plugin: 37 tests, in a real IDE instance
 ```
 
@@ -145,7 +145,7 @@ The list is the compiler's own symbol table, not a hand-written catalogue, so a 
 when it exists:
 
 - **Locals in scope** — the variables declared above the caret in the enclosing blocks, and the
-  parameters of the enclosing function, lambda, `catch` clause or `try` extractor. A variable
+  parameters of the enclosing function, lambda or `try` extractor. A variable
   declared *below* the caret is not offered, because writing it there would not compile.
 - **The enclosing class' own members** — the static ones in a static body, and the instance ones as
   well in an instance body. Members of other classes are not offered bare, because reaching one
@@ -524,23 +524,48 @@ class Neko() {
 
 ```neko
 count: int = 3
-nya count > 0            // carries on
-nya count == 4           // AssertionError: count == 4
+nya count > 0                              // carries on
+nya count == 4                             // AssertionError: count == 4
+
+nya count == 5 {                           // the failure is handled, and the program carries on
+  println("count was not 5")
+}
+
+v: int = nya count == 3 {                  // worth a value: one block per reading of the condition
+  yield 0                                  // the condition did not hold
+} else {
+  yield 1                                  // the condition held
+}
 ```
 
-`nya <condition>` checks that the condition holds and stops the program with a
-`java.lang.AssertionError` when it does not. The condition is an ordinary `bool` expression — a
-comparison, a `bool` variable, a call — so `nya` only ever adds "and this must be true" to whatever
-you already wrote.
+`nya <condition>` writes down something the program believes, and says what a false belief means. The
+condition is an ordinary `bool` expression — a comparison, a `bool` variable, a call — so `nya` only
+ever adds "and this must be true" to whatever you already wrote.
 
-- **The message is the condition's own source text.** A failure reads `count == 4` rather than a
-  message written out again, so the report cannot drift from the check.
+The three forms differ in what a false condition is worth, not in how the test is compiled:
+
+- **`nya condition`** — a false condition throws `java.lang.AssertionError`. **The message is the
+  condition's own source text**, so a failure reads `count == 4` rather than a message written out
+  again, and the report cannot drift from the check.
+- **`nya condition { ... }`** — the block runs instead of throwing, and **control carries on after
+  it**. This is what the language uses in place of `try`/`catch`: a failure that can be dealt with is
+  dealt with where it happened, and the program continues.
+- **`nya condition { ... } else { ... }`** — the construct is worth a value. The `else` block yields
+  it when the condition held and the failure block yields it when it did not; both must yield, and
+  both must yield the same type. A lone failure block in value position is refused, because there
+  would be nothing to say what the expression is worth when the condition holds.
+
+Everything else follows from the condition:
+
 - **The check is always on.** Unlike Java's `assert` there is no `-ea` flag to remember; a `nya` that
   silently did nothing would be worse than no `nya` at all.
-- **It narrows like a guard.** A `nya h != null` proves `h` is there for everything after it, exactly
-  as `if (h == null) { return }` does, so `h.value` needs no `?.` afterwards.
-- **It throws a real error.** A `try { ... } catch (e: AssertionError) { ... }` catches it like any
-  other throwable from outside the language, which is how a check can be turned into a value.
+- **A bare check narrows like a guard.** Only the reading where the condition held reaches the next
+  statement, so `nya h != null` proves `h` is there for everything after it — exactly as
+  `if (h == null) { return }` does, so `h.value` needs no `?.` afterwards. A check *with* a failure
+  block does not narrow afterwards: control gets there either way, so nothing is proved by then.
+- **Each block is analysed under its own reading.** The failure block is the place a false condition
+  is known, and the `else` block the place a true one is, so
+  `nya h != null { ... } else { h.value }` needs no `?.` in the `else` block.
 
-`nya` is deliberately not a function call: what it lowers to is not a call but a branch that throws
-from the statement itself, which is why it reads as grammar alongside `if` and `raise`.
+`nya` is deliberately not a function call: what it lowers to is not a call but a branch that either
+throws or runs a block, which is why it reads as grammar alongside `if` and `raise`.
