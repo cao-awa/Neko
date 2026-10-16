@@ -132,7 +132,7 @@ object TestSupport {
         fun typeOf(typeName: String): Class<*> = Class.forName(typeName, false, loader)
 
         /** Invokes a static method with no parameters and no result, e.g. `Sample.main`. */
-        fun invoke(typeName: String, methodName: String, vararg arguments: Any?): Any? {
+        fun invoke(typeName: String, methodName: String = "main", vararg arguments: Any?): Any? {
             val type = typeOf(typeName)
             val method = type.methods.single { candidate ->
                 candidate.name == methodName &&
@@ -147,6 +147,13 @@ object TestSupport {
             } catch (failure: java.lang.reflect.InvocationTargetException) {
                 throw failure.targetException
             }
+        }
+
+        fun invoke(): Any? {
+            val main = result.classes.entries.singleOrNull {
+                it.key.substringAfterLast("/") == "Main"
+            }!!.key.replace('/', '.')
+            return invoke(main)
         }
 
         /** Captures everything the program writes to standard output while [body] runs. */
