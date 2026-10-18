@@ -1196,31 +1196,52 @@ class BytecodeGenerator(
     }
 
     /**
-     * `nya condition`, `nya condition { ... }`, `nya condition { ... } else { ... }` — jumps over the
-     * failure when the condition holds, and says what a false one means otherwise.
+     * `nya condition`, `nya condition { ... }`, `nya condition { ... } else { ... }` — runs the block
+     * when the condition fails, and says what a false one means otherwise.
      *
-     * The check is the two instructions a guard already compiles to — evaluate, then branch on zero —
-     * so a `nya` that passes costs exactly the comparison it names and nothing else. What the branch
-     * lands on is the whole of the difference between the three forms:
+     * A `bool` condition is the two instructions a guard already compiles to — evaluate, then branch
+     * on zero — so a `nya` that passes costs exactly the comparison it names and nothing else. What
+     * the branch lands on is the whole of the difference between the three forms.
+     *
+     * The bare form is a test and a throw and nothing else, so it is compiled the way Java's own
+     * `assert` is: branch *past* the throw, and let the throw follow the branch.
      *
      * ```
-     *   cond; ifeq failure
-     *   else body                              │ or nothing, when there is no `else`
-     *   goto end
-     *   failure:  failure body, or the throw
-     *   end:
+     *   cond; ifne passed
+     *   throw new AssertionError("cond")
+     *   passed:
      * ```
      *
-     * A bare `nya` puts the throw where the failure body would be, so reaching it is one instruction
-     * after the branch that got there. The message is the condition's own source text, taken from its
+     * That shape is what makes a bare `nya` cost one branch on the path where the check holds. The
+     * opposite nesting — branch *to* the throw and `goto` around it — needs a jump and a label to
+     * spare, which is the two extra instructions a statement that is merely supposed to disappear
+     * when it passes cannot afford. The message is the condition's own source text, taken from its
      * span: the compiler already has the exact expression the reader wrote, and quoting it back is
      * more accurate than a message they would have had to write twice. `AssertionError`'s `String`
      * constructor is private, so the text goes in as an `Object` — the public constructor that takes
      * one — which is also the one Java's own `assert` uses.
      *
-     * A block instead of a throw means the false case is handled rather than fatal, which is why the
-     * other two forms have no `athrow`: the reader has said what should happen, so control carries on
-     * at `end` — this is what replaced `try`/`catch` as the way a program recovers.
+     * The two forms with a block cannot keep that shape, because there is more than a throw and a
+     * label waiting on the far side: the `else` body, the failure block and the handler all converge
+     * on one point afterwards, and that point is what both ways in have to reach.
+     *
+     * ```
+     *   cond; ifeq failure
+     *   else body                              │ or nothing, when there is no `else`
+     *   goto end
+     *   failure:  failure body
+     *   end:
+     * ```
+     *
+     * When there *is* a block, the condition is evaluated inside a handler for `AssertionError`
+     * covering the condition and nothing else, so a bare `nya` — this one's own or one inside a
+     * function it called — lands in that block instead of unwinding the stack. That is the second way
+     * into the same block, and it is why the block is written for a condition of any type: `void`
+     * cannot be false, so `nya close() { ... }` can only ever mean "if close() fails". The region ends
+     * at the condition, before the branch, so a `nya` in the `else` block or in the failure block
+     * belongs to *that* code rather than being caught here; and both entries leave the stack empty —
+     * the caught error is discarded, since the block is written about the failure, not about the
+     * object carrying it — which is what makes the two paths meet cleanly at one label.
      *
      * The value form is the one with something to put on the stack at `end`, and both blocks meet
      * there through **one slot** rather than through the stack: a block can end in a `yield`, but it
@@ -1234,6 +1255,14 @@ class BytecodeGenerator(
         val failure = expression.failureBlock
         val elseBlock = expression.elseBlock
         val yieldedType = expression.yieldedType
+        val conditionType = expression.condition.type
+
+        // A `bool` condition keeps the meaning it always had, so a false answer is a failure. Any
+        // other type has no false to test — which is exactly the case a block is there for, and the
+        // only way into it is the throw below. A `bool?` is in that second group rather than being
+        // unboxed to test it: the branch itself would throw on a null, and a `nya` that can fail
+        // before it has checked anything is not the construct the reader wrote.
+        val testsForFalse = conditionType == BoolType
 
         val failureLabel = Label()
         val endLabel = Label()
@@ -1254,8 +1283,32 @@ class BytecodeGenerator(
             null
         }
 
+        // The bare form is the only one that fits Java's `assert` shape, so it is emitted on its own
+        // and returns here: a test, a throw, and the label the test jumps to, with no failure block
+        // and no `else` body to reconcile.
+        if (failure == null) {
+            emitBareNya(expression, scope)
+            return
+        }
+
+        // The handler is only needed when there is a block for the throw to reach. Somewhere to put
+        // the exception is not: nothing in the language can name it from inside the block, so it is
+        // dropped where it landed rather than given a slot the way a `try`'s extractor needs one.
+        val guarded = Label()
+        val guardEnd = Label()
+        val handlerLabel = Label()
+        mv.visitTryCatchBlock(guarded, guardEnd, handlerLabel, ASSERTION_ERROR_CLASS)
+        mv.visitLabel(guarded)
         emitExpression(expression.condition, scope)
-        mv.visitJumpInsn(IFEQ, failureLabel)
+        mv.visitLabel(guardEnd)
+
+        if (testsForFalse) {
+            mv.visitJumpInsn(IFEQ, failureLabel)
+        } else {
+            // Nothing to test, so the condition is only watched for a throw: its answer is dropped
+            // and the `else` block — the reading on which it produced one — runs unconditionally.
+            popIfValue(conditionType, mv)
+        }
 
         // The blocks are emitted while their `yield` knows which slot to fill and which label to jump
         // to. Saved and restored rather than cleared because a `nya` may be written inside another
@@ -1265,19 +1318,20 @@ class BytecodeGenerator(
 
         if (elseBlock != null) {
             emitStatement(elseBlock, scope)
-            mv.visitJumpInsn(GOTO, endLabel)
-        } else {
-            // Nothing to do when the condition held, so control goes straight past the failure.
-            mv.visitJumpInsn(GOTO, endLabel)
         }
+        // Nothing to do when the condition held, so control goes straight past the failure. Without
+        // an `else` block that is also the only path, which is why the jump is unconditional.
+        mv.visitJumpInsn(GOTO, endLabel)
+
+        // Reached only from the exception table. The error is on the stack because that is how a
+        // handler is entered; dropping it here leaves the frame the same shape the branch above
+        // produces, so both ways into the block arrive with an empty stack.
+        mv.visitLabel(handlerLabel)
+        mv.visitInsn(POP)
 
         mv.visitLabel(failureLabel)
-        if (failure == null) {
-            emitNyaThrow(expression, mv)
-        } else {
-            emitStatement(failure, scope)
-            mv.visitJumpInsn(GOTO, endLabel)
-        }
+        emitStatement(failure, scope)
+        mv.visitJumpInsn(GOTO, endLabel)
 
         scope.nyaResult = enclosingNya
         mv.visitLabel(endLabel)
@@ -1286,6 +1340,35 @@ class BytecodeGenerator(
             mv.visitVarInsn(ALOAD, result)
             emitUnbox(yieldedType, mv)
         }
+    }
+
+    /**
+     * `nya condition` — the condition is evaluated, and the throw sits on the far side of a branch
+     * that is taken when the check passes.
+     *
+     * ```
+     *   cond; ifne passed
+     *   throw new AssertionError("cond")
+     *   passed:
+     * ```
+     *
+     * This is the shape `javac` gives `assert`, and it is the shape a bare `nya` wants for the same
+     * reason: the passing path is one branch and no label is reached from anywhere but the fall
+     * through. Nesting it the other way — branch to the throw, `goto` past it — costs a jump and a
+     * label so that nothing at all happens, which is the trap a check written throughout a program
+     * cannot afford.
+     *
+     * Nothing is left on the stack, because the condition's `bool` is consumed by the branch. The
+     * analyzer has already made sure the condition *is* a `bool`, so the branch is the whole of the
+     * use it gets.
+     */
+    private fun emitBareNya(expression: NyaExpression, scope: MethodScope) {
+        val mv = scope.mv
+        val passed = Label()
+        emitExpression(expression.condition, scope)
+        mv.visitJumpInsn(IFNE, passed)
+        emitNyaThrow(expression, mv)
+        mv.visitLabel(passed)
     }
 
     /** `throw new AssertionError(<the condition's source text>)` for a bare `nya`. */

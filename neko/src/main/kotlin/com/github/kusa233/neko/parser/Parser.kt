@@ -1381,7 +1381,10 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
      *
      * The condition is a whole expression rather than a comparison: `nya isReady()` and `nya a == b`
      * are both checks, and the second needs no special reading because `==` is already an operator.
-     * That also means a comma here is not a message — there is no second operand.
+     * That also means a comma here is not a message — there is no second operand. Its *type* is not
+     * this layer's business either: with a block the condition is watched for a throw as well as for a
+     * false answer, so `nya close() { ... }` parses whatever `close` returns, and the analyzer is what
+     * insists on a `bool` for the bare form that has only the throw to describe it.
      *
      * A `{` after the condition is *never* a lambda, which is what lets the three shapes be told
      * apart without brackets around the condition. A lambda is only read where an operand is

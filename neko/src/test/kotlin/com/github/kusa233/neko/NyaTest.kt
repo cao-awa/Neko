@@ -2,13 +2,14 @@ package com.github.kusa233.neko
 
 import java.io.ByteArrayOutputStream
 import java.io.PrintStream
+import org.objectweb.asm.Opcodes
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 import kotlin.test.fail
 
 /**
- * Tests for `nya condition` — a check that says what a false condition means.
+ * Tests for `nya condition` — a check that says what a failure means.
  *
  * The point of the construct is what a *run* does, so these tests call the compiled program and read
  * what comes back. It has three forms, and each is tested for its own behaviour:
@@ -17,8 +18,11 @@ import kotlin.test.fail
  *    source text. Asserting on the message matters as much as on the throw: a check that fails without
  *    saying what was being checked is a worse diagnostic than no check at all.
  *  * `nya a == b { ... }` — the block handles the failure and **control carries on after it**, which is
- *    what replaced `try`/`catch` as the way a program recovers.
- *  * `nya a == b { ... } else { ... }` — worth a value, one block per reading of the condition.
+ *    what replaced `try`/`catch` as the way a program recovers. It is entered two ways: a condition
+ *    that came back false, and an `AssertionError` thrown while the condition was being evaluated —
+ *    so `nya method() { ... }` catches a failed check inside `method`, and the condition need not be a
+ *    `bool` at all when a block says what failing means.
+ *  * `nya a == b { ... } else { ... }` — worth a value, one block per outcome of the condition.
  */
 class NyaTest {
 
@@ -392,6 +396,315 @@ class NyaTest {
         assertEquals("recovered\ndone\n", output)
     }
 
+    // ------------------------------------------------- the block as a catcher
+
+    @Test
+    fun `a failure block answers a check that threw inside the condition`() {
+        // The second way into the block. `method` ends in a failed check of its own, and a bare `nya`
+        // throws — so without the catcher the call would unwind instead of reaching the block.
+        val program = TestSupport.load(
+            file(
+                "class Main {",
+                "    static {",
+                "        fun method() {",
+                "            nya 1 == 2",
+                "        }",
+                "",
+                "        fun main() {",
+                "            nya method() {",
+                "                println(\"assert error\")",
+                "            }",
+                "            println(\"carried on\")",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput { program.invoke("com.github.kusa233.test.Main", "main") }
+        assertEquals("assert error\ncarried on\n", output)
+    }
+
+    @Test
+    fun `a block catches a check that failed deeper down the call`() {
+        // The error travels out of `inner` and through `outer` to the block that answers it, so the
+        // catcher is about the call failing, not about where in the call the check was written.
+        val program = TestSupport.load(
+            file(
+                "class Main {",
+                "    static {",
+                "        fun inner() {",
+                "            nya false",
+                "        }",
+                "",
+                "        fun outer() {",
+                "            inner()",
+                "        }",
+                "",
+                "        fun main() {",
+                "            nya outer() {",
+                "                println(\"caught\")",
+                "            }",
+                "            println(\"done\")",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput { program.invoke("com.github.kusa233.test.Main", "main") }
+        assertEquals("caught\ndone\n", output)
+    }
+
+    @Test
+    fun `a block may take a condition that answers nothing`() {
+        // `void` cannot be false, so there is no first way in — the block can only ever mean "if this
+        // fails". That is why a condition with a block is not required to be a `bool`.
+        val program = TestSupport.load(
+            file(
+                "class Main {",
+                "    static {",
+                "        fun close() {",
+                "            println(\"closing\")",
+                "        }",
+                "",
+                "        fun main() {",
+                "            nya close() {",
+                "                println(\"failed\")",
+                "            }",
+                "            println(\"done\")",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput { program.invoke("com.github.kusa233.test.Main", "main") }
+        // The call succeeded, so only its own output and the code after it are printed.
+        assertEquals("closing\ndone\n", output)
+    }
+
+    @Test
+    fun `a block takes a condition of any other type too`() {
+        // An `int` answering condition is a compile error for a bare `nya` and fine with a block: the
+        // block is only ever entered by a throw, so the value the call produced is simply dropped.
+        val lines = file(
+            "class Main {",
+            "    static {",
+            "        fun count(): int {",
+            "            return 7",
+            "        }",
+            "",
+            "        fun main() {",
+            "            nya count() {",
+            "                println(\"failed\")",
+            "            }",
+            "            println(\"done\")",
+            "        }",
+            "    }",
+            "}",
+        )
+        assertTrue(
+            TestSupport.errors(TestSupport.compile(lines)).isEmpty(),
+            "a block makes any condition type legal",
+        )
+        val program = TestSupport.load(lines)
+        val output = program.capturingOutput { program.invoke("com.github.kusa233.test.Main", "main") }
+        // The call succeeded, so only the code after it is printed.
+        assertEquals("done\n", output)
+    }
+
+    @Test
+    fun `a failed check in a value form's condition takes the failure block`() {
+        // The value form is entered the same two ways, and the answer still comes from the block that
+        // ran: a throw is the failure reading, so it yields what the failure block yields.
+        val program = TestSupport.load(
+            file(
+                "class Main {",
+                "    static {",
+                "        fun method(): int {",
+                "            nya false",
+                "            return 1",
+                "        }",
+                "",
+                "        fun main() {",
+                "            v: int = nya method() {",
+                "                yield 0",
+                "            } else {",
+                "                yield 1",
+                "            }",
+                "            println(v)",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput { program.invoke("com.github.kusa233.test.Main", "main") }
+        assertEquals("0\n", output)
+    }
+
+    @Test
+    fun `a throw from somewhere else is not caught`() {
+        // The catcher is for a failed check, which is what the block describes. Anything else on its
+        // way out is not this construct's to answer, so it keeps travelling: dividing by zero is an
+        // `ArithmeticException`, and the block must not swallow it.
+        val program = TestSupport.load(
+            file(
+                "class Main {",
+                "    static {",
+                "        fun divide(n: int): int {",
+                "            return 1 / n",
+                "        }",
+                "",
+                "        fun main() {",
+                "            nya divide(0) {",
+                "                println(\"caught\")",
+                "            }",
+                "            println(\"done\")",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        // The output and the throwable are both wanted here, and [printedBeforeFailure] swallows the
+        // throw, so the capture is written out for this one case.
+        val original = System.out
+        val buffer = ByteArrayOutputStream()
+        System.setOut(PrintStream(buffer, true, Charsets.UTF_8))
+        val error = try {
+            program.invoke("com.github.kusa233.test.Main", "main")
+            null
+        } catch (failure: Throwable) {
+            failure
+        } finally {
+            System.setOut(original)
+        }
+        val output = buffer.toString(Charsets.UTF_8).replace("\r\n", "\n")
+        assertEquals("", output, "only an AssertionError should reach the block")
+        assertTrue(
+            error is ArithmeticException,
+            "the block must not catch another throwable, got $error",
+        )
+    }
+
+    @Test
+    fun `a failed check inside a failure block is not caught by that block`() {
+        // The catcher covers the condition and nothing else, so a `nya` written inside the block is
+        // the block's own problem — otherwise the block would catch its own failure and run twice.
+        val program = TestSupport.load(
+            file(
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            nya 1 == 2 {",
+                "                println(\"first\")",
+                "                nya 1 == 2",
+                "                println(\"second\")",
+                "            }",
+                "            println(\"done\")",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        var output = ""
+        assertionErrorFrom { output = printedBeforeFailure { program.invoke("com.github.kusa233.test.Main", "main") } }
+        // The block ran once and its own failed check escaped: neither `second` nor `done` is reached.
+        assertEquals("first\n", output)
+    }
+
+    @Test
+    fun `a failed check inside an else block is not caught either`() {
+        // The other side of the same boundary. The condition held, so the handler is already behind
+        // us; a `nya` written in the `else` block is that block's own failure and must escape.
+        val program = TestSupport.load(
+            file(
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            v: int = nya 1 == 1 {",
+                "                yield 0",
+                "            } else {",
+                "                println(\"in else\")",
+                "                yield 1",
+                "            }",
+                "            println(v)",
+                "            v2: int = nya 1 == 1 {",
+                "                yield 0",
+                "            } else {",
+                "                nya 1 == 2",
+                "                yield 2",
+                "            }",
+                "            println(v2)",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        var output = ""
+        assertionErrorFrom { output = printedBeforeFailure { program.invoke("com.github.kusa233.test.Main", "main") } }
+        // The first construct answered 1, and the `else`-block check that failed ended the call rather
+        // than being swallowed by the handler it had already passed.
+        assertEquals("in else\n1\n", output)
+    }
+
+    @Test
+    fun `a failure block does not trust what the throw path could break`() {
+        // The soundness rule, and the reason the block is not simply "the false reading". `h == null`
+        // failing proves `h` is there — but only if the check ran to an answer. `ready()` can throw
+        // instead, and it gets to the same block with `h` still null, so reading `h.value` there is
+        // exactly the null dereference the analyzer exists to prevent.
+        val result = TestSupport.compile(
+            file(
+                "class Holder {",
+                "    val value: int = 4",
+                "}",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun ready(): bool {",
+                "            return true",
+                "        }",
+                "",
+                "        fun main() {",
+                "            h: Holder? = null",
+                "            nya h == null || ready() {",
+                "                println(h.value)",
+                "            }",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        assertTrue(
+            TestSupport.errors(result).any { it.message.contains("nullable") },
+            "the block must not assume a fact the throw path never proved: ${TestSupport.messages(result)}",
+        )
+    }
+
+    @Test
+    fun `a failure block still narrows on a condition that cannot throw`() {
+        // The other half of the rule: with nothing in the condition that can throw, a false answer is
+        // the only way in, so the false reading's facts are sound and the block may use them.
+        val program = TestSupport.load(
+            file(
+                "class Holder {",
+                "    val value: int? = 4",
+                "}",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            h: Holder? = Holder()",
+                "            nya h == null {",
+                "                println(h.value == null)",
+                "            }",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val output = program.capturingOutput { program.invoke("com.github.kusa233.test.Main", "main") }
+        assertEquals("false\n", output)
+    }
+
     @Test
     fun `a check with a block does not narrow after it`() {
         // Control reaches the next statement either way, so nothing is proved by then: on the reading
@@ -497,6 +810,205 @@ class NyaTest {
         assertTrue(
             TestSupport.errors(result).isNotEmpty(),
             "a lone failure block in value position should be reported",
+        )
+    }
+
+    @Test
+    fun `a bare check compiles to a branch past the throw, the way assert does`() {
+        // The requirement is on the *shape*, so this reads the emitted bytecode rather than running
+        // it. Java's own `assert` branches past its throw; the opposite nesting — branch to the
+        // throw, then jump over it — would need a `goto` so that nothing at all happens when the
+        // check passes, which is what a construct written throughout a program cannot afford.
+        //
+        // The condition is a bare `bool` variable rather than a comparison: a comparison materialises
+        // its answer through a `goto` of its own, and that instruction belongs to the comparison
+        // rather than to the check, so it would make this assertion read the wrong thing.
+        assertEquals(
+            listOf(
+                "ICONST_1",
+                "ISTORE",
+                "ILOAD",
+                "IFNE", // past the throw: the assert shape
+                "NEW",
+                "DUP",
+                "LDC",
+                "INVOKESPECIAL",
+                "ATHROW",
+            ),
+            instructionsOf("            flag: bool = true", "            nya flag"),
+            "a bare check is a load, a branch past the throw, and the throw itself",
+        )
+    }
+
+    @Test
+    fun `a check with a block keeps the branch to the failure and the jump over it`() {
+        // The counterpart: a block gives the two paths somewhere to meet, so it keeps the branch to
+        // the failure and the jump over it, and the caught error is dropped where it landed. The
+        // condition is again a bare `bool` so nothing but the check contributes instructions, which
+        // is what makes the exact sequence assertable.
+        assertEquals(
+            listOf(
+                "ICONST_0",
+                "ISTORE",
+                "ILOAD",
+                "IFEQ", // → the failure block
+                "GOTO", // over it, when the check passed
+                "POP", // the handler drops the caught AssertionError
+                "ICONST_1",
+                "ISTORE", // the failure block's body
+                "GOTO", // → end
+            ),
+            instructionsOf(
+                "            flag: bool = false",
+                "            nya flag {",
+                "                flag = true",
+                "            }",
+            ),
+            "a block form branches to the failure and jumps past it",
+        )
+    }
+
+    @Test
+    fun `a check that passes carries on and a failed one names its condition`() {
+        // The two runs the assert shape has to get right: the passing path costs the branch and
+        // nothing else, and the failing path still reports the condition's own text. A shape change
+        // that inverted the branch would swap these two and this catches it.
+        val program = TestSupport.load(
+            file(
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            nya 1 == 1",
+                "            println(\"after pass\")",
+                "            nya 1 == 2",
+                "            println(\"after failure\")",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        // The output and the throwable are both wanted, and [printedBeforeFailure] swallows the
+        // throw, so the capture is written out for this one case.
+        val original = System.out
+        val buffer = ByteArrayOutputStream()
+        System.setOut(PrintStream(buffer, true, Charsets.UTF_8))
+        val error = try {
+            program.invoke("com.github.kusa233.test.Main", "main")
+            null
+        } catch (failure: Throwable) {
+            failure
+        } finally {
+            System.setOut(original)
+        }
+        val output = buffer.toString(Charsets.UTF_8).replace("\r\n", "\n")
+        assertEquals("after pass\n", output, "the first check passes and the second does not")
+        assertTrue(error is AssertionError, "the second check should have thrown, got $error")
+        assertEquals("1 == 2", error.message, "the message is the condition's own source text")
+    }
+
+    /**
+     * The instructions of the `main` method [bodyLines] produce, in order, by opcode name.
+     *
+     * A shape assertion cannot be made by calling the program: a `goto` that lands on the next
+     * instruction runs exactly like no `goto` at all. Reading the instructions is the only way to
+     * tell the two nestings apart, so the class is compiled here and walked with ASM.
+     *
+     * Every visit hook is recorded rather than only `visitInsn`, because the instructions that
+     * matter most here arrive through `visitVarInsn` and `visitTypeInsn` — a visitor that skipped
+     * them would make the expected lists lie by omission. The method's own `RETURN` and the static
+     * initialiser's following `INVOKESTATIC` are dropped, so the assertion stays about the check
+     * rather than about how the method happens to end.
+     */
+    private fun instructionsOf(vararg bodyLines: String): List<String> {
+        val program = TestSupport.load(
+            file(
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                *bodyLines,
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        val bytes = java.nio.file.Files.readAllBytes(
+            program.directory.resolve("com/github/kusa233/test/Main.class"),
+        )
+        val names = mutableListOf<String>()
+        org.objectweb.asm.ClassReader(bytes).accept(
+            object : org.objectweb.asm.ClassVisitor(Opcodes.ASM9) {
+                override fun visitMethod(
+                    access: Int,
+                    name: String,
+                    descriptor: String,
+                    signature: String?,
+                    exceptions: Array<out String>?,
+                ): org.objectweb.asm.MethodVisitor? {
+                    if (name != "main") return null
+                    return object : org.objectweb.asm.MethodVisitor(Opcodes.ASM9) {
+                        override fun visitInsn(opcode: Int) {
+                            names += OPCODE_NAMES.getValue(opcode)
+                        }
+
+                        override fun visitVarInsn(opcode: Int, index: Int) {
+                            names += OPCODE_NAMES.getValue(opcode)
+                        }
+
+                        override fun visitTypeInsn(opcode: Int, type: String?) {
+                            names += OPCODE_NAMES.getValue(opcode)
+                        }
+
+                        override fun visitJumpInsn(opcode: Int, label: org.objectweb.asm.Label?) {
+                            names += OPCODE_NAMES.getValue(opcode)
+                        }
+
+                        override fun visitLdcInsn(value: Any?) {
+                            names += "LDC"
+                        }
+
+                        override fun visitMethodInsn(
+                            opcode: Int,
+                            owner: String,
+                            name: String,
+                            descriptor: String,
+                            isInterface: Boolean,
+                        ) {
+                            names += OPCODE_NAMES.getValue(opcode)
+                        }
+                    }
+                }
+            },
+            0,
+        )
+        // The generated method closes with `RETURN`, and the static initialiser that ran it with an
+        // `INVOKESTATIC`; both are the method's ending rather than anything about the check.
+        return names.dropLastWhile { it == "RETURN" || it == "INVOKESTATIC" }
+    }
+
+    /**
+     * The opcode names these tests assert on, mapped from the constants ASM reports.
+     *
+     * Named rather than numeric so a failure reads `IFNE` instead of `154`: the assertion says what
+     * it is about, and a reader comparing the expected list with the documentation above can tell at
+     * a glance whether the branch is the one the shape calls for.
+     */
+    private companion object {
+        val OPCODE_NAMES: Map<Int, String> = mapOf(
+            Opcodes.ICONST_0 to "ICONST_0",
+            Opcodes.ICONST_1 to "ICONST_1",
+            Opcodes.ISTORE to "ISTORE",
+            Opcodes.ILOAD to "ILOAD",
+            Opcodes.IFEQ to "IFEQ",
+            Opcodes.IFNE to "IFNE",
+            Opcodes.GOTO to "GOTO",
+            Opcodes.POP to "POP",
+            Opcodes.NEW to "NEW",
+            Opcodes.DUP to "DUP",
+            Opcodes.ATHROW to "ATHROW",
+            Opcodes.INVOKESPECIAL to "INVOKESPECIAL",
+            Opcodes.INVOKESTATIC to "INVOKESTATIC",
+            Opcodes.INVOKEVIRTUAL to "INVOKEVIRTUAL",
+            Opcodes.RETURN to "RETURN",
         )
     }
 

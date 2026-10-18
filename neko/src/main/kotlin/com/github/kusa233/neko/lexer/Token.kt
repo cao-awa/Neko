@@ -41,16 +41,18 @@ enum class TokenType(val display: String) {
     WHEN("'when'"),
     /**
      * `'nya'` — checks that a condition holds, and either runs a recovery block or is worth a value
-     * when it does not.
+     * when it fails.
      *
-     * `nya a == b` throws an `AssertionError` when the condition fails; `nya a == b { ... }` runs the
-     * block instead of throwing, and `nya a == b { ... } else { ... }` is worth whatever the `else`
-     * yields when the condition holds. Written as a word rather than a function because it is not a
-     * call: the branch it lowers to belongs to the statement it appears in, the way `if`'s does.
-     *
-     * It is deliberately *not* gated on the JVM's `-ea` flag, which is what separates it from Java's
-     * `assert`: a check that silently does nothing is worse than no check, and Neko has no flag to
-     * turn one on with.
+     * `nya a == b` throws an `AssertionError` when the condition fails. `nya a == b { ... }` runs the
+     * block instead, and the block catches an `AssertionError` the condition *threw* as well as a
+     * condition that came back false — so `nya method() { ... }` is a call whose failure is handled,
+     * and the condition is not required to be a `bool` when a block spells out what failing means.
+     * `nya a == b { ... } else { ... }` is worth whatever the `else` yields when the condition holds.
+     * Written as a word rather than a function because it is not a call: the branch it lowers to
+     * belongs to the statement it appears in, the way `if`'s does. A bare `nya` is compiled to the
+     * shape Java's `assert` uses — a branch past the throw — but it is deliberately *not* gated on the
+     * JVM's `-ea` flag, which is the one thing it does differ in: a check that silently does nothing
+     * is worse than no check, and Neko has no flag to turn one on with.
      */
     NYA("'nya'"),
     RAISE("'raise'"),
@@ -59,8 +61,8 @@ enum class TokenType(val display: String) {
      * `'try'` — now only the extractor form, `try f(...) { a -> ... }`, which receives a `raise`.
      *
      * The `try { ... } catch ...` statement that handled a JVM throwable was removed: `nya`'s block
-     * form replaces it for the case a Neko program can actually name, because the failure it
-     * describes is one the program itself asserted rather than one arriving from outside.
+     * form replaces it for the failure a Neko program can actually name, because a bare `nya` is what
+     * raises one and a block is what answers it.
      */
     TRY("'try'"),
 

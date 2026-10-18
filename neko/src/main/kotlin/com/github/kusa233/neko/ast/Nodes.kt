@@ -460,21 +460,27 @@ class WhenBranch(
  * `nya condition`, `nya condition { ... }`, `nya condition { ... } else { ... }` — states what the
  * program believes, and says what to do when it is wrong.
  *
- * This is where a program writes down a fact it relies on rather than a fact it computes. The
- * condition is an ordinary `bool` expression, and what a false one means is chosen by the writer:
+ * This is where a program writes down a fact it relies on rather than a fact it computes. What going
+ * wrong means is chosen by the writer:
  *
  * - Bare, `nya a == b` throws a `java.lang.AssertionError` whose message is the condition's own
  *   source text. The program stops where the belief was broken rather than somewhere later where the
- *   damage surfaces.
+ *   damage surfaces. Because the throw is the only outcome there is, the condition has to be a `bool`
+ *   — anything else would be a check that could never fail.
  * - With a block, `nya a == b { ... }`, the block runs instead and control carries on after it. The
- *   check has been handled, so it is not an error any more — this is what replaced `try`/`catch`.
+ *   block answers a condition that came back false **and** an `AssertionError` raised while the
+ *   condition was being evaluated — by a bare `nya` of its own, or by one inside a function it
+ *   called. That second way in is why the condition may be of any type at all: `nya method() { ... }`
+ *   is a call whose failure is handled, and `void` has no false for the first way to test. This is
+ *   what replaced `try`/`catch`.
  * - With a block and an `else`, `nya a == b { ... } else { ... }`, the construct is also worth a
- *   value: the `else` block yields the value for the case where the condition *held*, and the
- *   failure block yields it for the case where it did not. That is the whole of the expression form
- *   — `count: int = nya cached != null { yield load() } else { yield cached }` — and it is why the
- *   two blocks are the two answers to one question rather than an error path and a normal path.
+ *   value: the `else` block yields the value for the case where the condition *ran to a true answer*,
+ *   and the failure block yields it for the case where it was false or threw. That is the whole of
+ *   the expression form — `count: int = nya cached != null { yield load() } else { yield cached }` —
+ *   and it is why the two blocks are the two answers to one question rather than an error path and a
+ *   normal path.
  *
- * A bare `nya` in expression position is refused: with nothing to say what the false case is worth,
+ * A bare `nya` in expression position is refused: with nothing to say what the failure is worth,
  * there would be no value to give. That is a question about the *use*, not about this node — the very
  * same construct is a statement when it is written on its own — which is why the parser demands the
  * `else` only where a value is expected and the analyzer is what reports the rest.
@@ -488,14 +494,16 @@ class NyaExpression(
      *
      * This is the `else`-less block: `nya a == b { recover() }`. When [elseBlock] is present this
      * block is the failure arm of the value, and when it is absent the block is the whole of the
-     * recovery — control continues after it either way, because the failure has been handled.
+     * recovery — control continues after it either way, because the failure has been handled. It is
+     * reached both by a false condition and by an `AssertionError` thrown out of [condition].
      */
     val failureBlock: BlockStatement?,
     /**
      * The block that produces the value when the condition held, or `null`.
      *
      * Present only in the value form. Its `yield` fixes the type the expression is worth, and the
-     * failure block's `yield` must agree with it.
+     * failure block's `yield` must agree with it. Unlike [failureBlock] it is reached only on the
+     * reading where the condition ran to an answer, because a throw never gets this far.
      */
     val elseBlock: BlockStatement?,
     override val span: Span,

@@ -954,51 +954,74 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
     /**
      * `nya condition`, `nya condition { ... }`, `nya condition { ... } else { ... }` — checks the
-     * condition, and says what a false one means.
+     * condition, and says what happens when it does not hold.
      *
-     * The condition is an ordinary `bool` expression, so the only rule added here is that it *is* one:
-     * a `nya` whose operand is not a `bool` could never fail, which means it is not a check at all and
-     * the reader wrote something other than what they meant.
+     * The condition is an ordinary expression, and the three writings differ in what they do when it
+     * goes wrong:
      *
-     * What a false condition means is the writer's choice, and the three writings differ in what they
-     * are worth rather than in how the test itself is compiled:
+     *  * **Bare.** `nya a == b` is a `bool` test and nothing else: a false condition throws an
+     *    `AssertionError`, so the only way past the statement is the reading where the condition held.
+     *    The fact is therefore applied to what follows, and the check narrows exactly as a guard does
+     *    — `nya h != null` makes the rest of the block a place where `h` is there. It is also why the
+     *    condition has to *be* a `bool`: a check with no other outcome to describe could never fail,
+     *    so a reader who wrote one meant something else.
+     *  * **With a failure block.** The block runs when the condition does not hold and control carries
+     *    on after it. "Does not hold" is deliberately wider than "is false": the block also catches an
+     *    `AssertionError` the condition *threw* — its own bare `nya`, or one inside a function it
+     *    called — which is what makes `nya connect() { ... }` a call whose failure is handled, and is
+     *    why the condition may be of any type at all, `void` included. There is no `bool` to demand of
+     *    an expression whose failure is already described.
+     *  * **With both blocks.** The construct is worth a value. Each block `yield`s it and the two must
+     *    agree: they are two answers to one question, so a disagreement means the expression means
+     *    nothing.
      *
-     *  * **Bare.** The failure path throws. Only the reading where the condition held reaches the next
-     *    statement, so the fact is applied to what follows and the check narrows exactly as a guard
-     *    does — `nya h != null` makes the rest of the block a place where `h` is there.
-     *  * **With a failure block.** Control reaches the next statement *either* way: on the reading
-     *    where the condition held, and on the reading where it did not and the block recovered. So
-     *    nothing is narrowed afterwards — whatever the block did, the reader has already said the
-     *    false case is not an error, and the join of the two readings proves nothing about either.
-     *  * **With both blocks.** The construct is worth a value. Each block `yield`s it, on its own
-     *    reading of the condition, and the two must agree: they are two answers to one question, so a
-     *    disagreement means the expression means nothing. Each block is analysed under what its own
-     *    reading proves — the failure block under what a false condition proves, the `else` block
-     *    under what a true one does.
+     * Each block is analysed under what its own reading proves. The `else` block is reached only when
+     * the condition ran to a value, so the true reading's facts hold there. The failure block is
+     * reached either by a false condition or by a throw, so it gets only the facts that survive both
+     * — see [failureFacts].
      */
     private fun analyzeNyaExpression(expression: NyaExpression, expectedType: NekoType?): NekoType {
-        requireBool(analyzeExpression(expression.condition), expression.condition.span, "nya")
+        val conditionType = analyzeExpression(expression.condition)
 
         val failureBlock = expression.failureBlock
         val elseBlock = expression.elseBlock
+
+        // Only the bare form has to answer a `bool`. With a failure block the condition is watched for
+        // a throw as well as for a false answer, and an expression that throws has no type it had to
+        // be — so `nya close() { ... }` is a call whose failure is handled, whatever it answers.
+        if (failureBlock == null) {
+            requireBool(conditionType, expression.condition.span, "nya")
+        }
 
         if (elseBlock == null) {
             if (failureBlock == null) {
                 applyFacts(factsTrue(expression.condition))
                 return VoidType
             }
-            analyzeNyaBlock(expression, failureBlock, holds = false)
+            analyzeNyaBlock(expression, failureBlock, holds = false, facts = failureFacts(expression))
             return VoidType
         }
 
         // From here the construct is worth a value, so both blocks are analysed under one shared
         // state: the first `yield` in either of them fixes the type the other has to match.
+        //
+        // The `else` block is the easy one: a throw never reaches it, so it is entered only on the
+        // reading where the condition ran to a value, and the true facts hold there. The failure
+        // block is the one a throw shares with a false answer, so it gets [failureFacts] instead.
         val saved = currentNya
         val state = NyaValue(expression, expectedType)
         currentNya = state
         try {
-            failureBlock?.let { analyzeNyaBlock(expression, it, holds = false, state = state) }
-            analyzeNyaBlock(expression, elseBlock, holds = true, state = state)
+            failureBlock?.let {
+                analyzeNyaBlock(expression, it, holds = false, facts = failureFacts(expression), state = state)
+            }
+            analyzeNyaBlock(
+                expression,
+                elseBlock,
+                holds = true,
+                facts = factsTrue(expression.condition),
+                state = state,
+            )
         } finally {
             currentNya = saved
         }
@@ -1041,22 +1064,45 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * Analyzes one of a `nya`'s blocks under what its own reading of the condition proves.
      *
      * The facts are saved and restored around the block for the same reason an `if` arm's are: what a
-     * test proves is true *inside* the code it guards, never after it. [holds] says which reading this
-     * block belongs to, which is what makes `nya h != null { recover() } else { h.use() }` legal —
-     * the `else` block is a place where `h` is known to be there.
+     * test proves is true *inside* the code it guards, never after it. [facts] is what this block gets
+     * to assume — see [analyzeNyaExpression] for why the `else` block can take the true reading's
+     * facts and the failure block often cannot.
      */
     private fun analyzeNyaBlock(
         expression: NyaExpression,
         block: BlockStatement,
         holds: Boolean,
+        facts: Map<Any, NekoType>,
         state: NyaValue? = null,
     ) {
         val incoming = saveNarrowings()
-        applyFacts(if (holds) factsTrue(expression.condition) else factsFalse(expression.condition))
+        applyFacts(facts)
         if (state != null) state.inFailureBlock = !holds
         analyzeBlock(block)
         restoreNarrowings(incoming)
     }
+
+    /**
+     * What a `nya`'s failure block may assume, given that it is entered two different ways.
+     *
+     * The block runs when the condition answers `false` *and* when the condition throws an
+     * `AssertionError`, so a fact may only be applied if it holds on **both** of those runs. What a
+     * false condition proves is a fact about the second run only: in
+     * `nya h == null || load() { ... }` the block is a place where `h` is known to be there *if* the
+     * check ran to an answer, but a throw out of `load()` gets there with `h` still null — so
+     * believing the fact would let the block call `h.value` and crash, which is exactly the failure
+     * the analyzer exists to catch.
+     *
+     * So the question is only whether the throw path is reachable at all: a condition built from
+     * literals, names and comparisons cannot throw an `AssertionError` itself, so the false reading
+     * is the only way in and its facts are sound. One that calls anything, or contains a `nya` of its
+     * own, can — and then the block is analysed with no new facts, so a nullable `h` stays nullable
+     * there and must still be tested before use rather than trusted below a `!= null` that may never
+     * have been reached. Facts from *around* the `nya` are untouched either way: those were proved
+     * before the condition ran, so both entry paths share them.
+     */
+    private fun failureFacts(expression: NyaExpression): Map<Any, NekoType> =
+        if (canThrowAssertion(expression.condition)) emptyMap() else factsFalse(expression.condition)
 
     /**
      * `raise 1 * multiplier, multiplier`
@@ -3994,4 +4040,52 @@ private fun Expression.containsRaise(): Boolean = when (this) {
         failureBlock?.statements?.any { it.containsRaise() } == true ||
             elseBlock?.statements?.any { it.containsRaise() } == true
     else -> false
+}
+
+/**
+ * Whether evaluating this expression can throw an `AssertionError` before it answers anything.
+ *
+ * This is what decides whether a `nya`'s failure block may believe the false reading's facts. The
+ * block is entered by a false condition *and* by a throw out of the condition, so a fact is only
+ * sound there if the throw cannot happen — see `Analyzer.failureFacts`. The walk therefore has to
+ * find every way an `AssertionError` can be raised, which in this language means every bare `nya`
+ * that might run, including ones inside functions the expression calls.
+ *
+ * Two answers are deliberately conservative:
+ *
+ *  * **A call may throw.** The bare `nya` might be inside the callee, or inside something the callee
+ *    called; following that would mean analysing the whole program before this one expression. Since
+ *    the cost of a wrong "no" is a null dereference the analyzer promised to prevent, the cheap answer
+ *    is the safe one.
+ *  * **An inner `nya` may throw.** Either it is bare, and so throws by construction, or it has blocks
+ *    of its own, which are places a bare `nya` can be written. Chasing that through the statement
+ *    tree would buy very little for a question whose honest answer is already "it may".
+ *
+ * Everything else is settled by its operands: arithmetic, comparisons and `!` check nothing
+ * themselves, but `h == null || load()` is a throw away from being false. A lambda is a value being
+ * built rather than a body being run, so its own `nya`s are not this expression's problem.
+ */
+private fun canThrowAssertion(expression: Expression): Boolean = when (expression) {
+    is CallExpression, is NyaExpression, is TryExpression -> true
+
+    is BinaryExpression -> canThrowAssertion(expression.left) || canThrowAssertion(expression.right)
+    is UnaryExpression -> canThrowAssertion(expression.operand)
+    is ChainedComparisonExpression -> expression.operands.any { canThrowAssertion(it) }
+
+    // Neither reading a member nor indexing an array checks anything, but the receiver and the index
+    // are expressions in their own right and may call.
+    is MemberAccessExpression -> canThrowAssertion(expression.receiver)
+    is IndexExpression -> canThrowAssertion(expression.array) || canThrowAssertion(expression.index)
+
+    // Values already in hand, and a value being built.
+    is IntegerLiteral,
+    is DoubleLiteral,
+    is CharLiteral,
+    is StringLiteral,
+    is BoolLiteral,
+    is NullLiteral,
+    is NameExpression,
+    is ThisExpression,
+    is LambdaExpression,
+    -> false
 }

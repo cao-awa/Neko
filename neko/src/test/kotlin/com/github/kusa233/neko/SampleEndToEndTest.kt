@@ -238,7 +238,8 @@ class SampleEndToEndTest {
         // Every check that must hold does, so the run reaches the end. The `4` is the narrow read
         // `nya box != null` is what allows; the two lines after it are the failure block of the check
         // that does not hold — which no longer ends the call — and the two numbers at the end are the
-        // value form answering by which block ran.
+        // value form answering by which block ran. `caught`/`continued` are the block answering a
+        // check that failed inside the call it was watching, rather than one that came back false.
         assertEquals(
             listOf(
                 "3",
@@ -248,6 +249,8 @@ class SampleEndToEndTest {
                 "4",
                 "handled: 1 == 2 was false",
                 "recovered",
+                "caught: the check inside guarded failed",
+                "continued",
                 "0",
                 "1",
             ),
