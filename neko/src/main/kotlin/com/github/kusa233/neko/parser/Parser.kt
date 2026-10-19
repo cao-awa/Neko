@@ -1048,7 +1048,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         TokenType.IF -> parseIfStatement()
         TokenType.WHILE -> parseWhileStatement()
         TokenType.WHEN -> parseWhenStatement()
-        TokenType.NYA -> parseNyaStatement()
+        TokenType.NYA -> parseNyaStatementForm()
         TokenType.RAISE -> parseRaiseStatement()
         TokenType.TRY -> parseTryStatement()
         TokenType.SEMICOLON -> {
@@ -1362,14 +1362,43 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
     }
 
     /**
-     * `nya condition` — checks the condition and stops the program when it does not hold.
+     * `nya ...` on a line of its own — the same node as the expression form, wrapped as a statement.
+     *
+     * Nothing distinguishes the two at the syntax level; the difference is only whether the value is
+     * used, and that is the analyzer's question rather than the parser's. What the parser does have
+     * to decide is whether the `else` that would make the construct worth a value is *demanded*, and
+     * here it is not: the failure block on its own is a complete statement.
+     */
+    private fun parseNyaStatementForm(): Statement? {
+        val expression = parseNyaExpression(requireValue = false) ?: return null
+        expectStatementEnd("nya statement")
+        return ExpressionStatement(expression, expression.span)
+    }
+
+    /**
+     * Parses the three shapes of `nya`: bare, with a failure block, and with a failure block plus an
+     * `else`.
      *
      * The condition is a whole expression rather than a comparison: `nya isReady()` and `nya a == b`
      * are both checks, and the second needs no special reading because `==` is already an operator.
-     * That also means a comma here is not a message — there is no second operand — so the statement
-     * ends after the expression and anything else is reported against what it wrote.
+     * That also means a comma here is not a message — there is no second operand. Its *type* is not
+     * this layer's business either: with a block the condition is watched for a throw as well as for a
+     * false answer, so `nya close() { ... }` parses whatever `close` returns, and the analyzer is what
+     * insists on a `bool` for the bare form that has only the throw to describe it.
+     *
+     * A `{` after the condition is *never* a lambda, which is what lets the three shapes be told
+     * apart without brackets around the condition. A lambda is only read where an operand is
+     * expected, and by the time the condition has been parsed `parsePostfix` has stopped looking for
+     * anything that could continue it — `.`, `(`, `[` and `?` are the whole list, and none of them
+     * is a brace. So the brace here belongs to this keyword.
+     *
+     * [requireValue] is the difference between the two places a `nya` can be written, and it is
+     * passed in by the caller rather than guessed at here: in statement position a lone failure block
+     * is the whole point (`nya a == b { recover() }`, which then carries on), while in value position
+     * something has to say what the value is when the check *passes* — and only an `else` block can.
+     * The same node serves both, exactly as the two `try` forms share one.
      */
-    private fun parseNyaStatement(): NyaStatement? {
+    private fun parseNyaExpression(requireValue: Boolean): NyaExpression? {
         val keyword = advance()
         if (atStatementEnd()) {
             error("'nya' requires a condition to check", keyword.span)
@@ -1379,11 +1408,72 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             synchronizeToStatement()
             return null
         }
-        expectStatementEnd("nya statement")
-        return NyaStatement(
+
+        skipNestedNewlines()
+        var end = condition.span.end
+        var failureBlock: BlockStatement? = null
+        var elseBlock: BlockStatement? = null
+
+        if (at(TokenType.LEFT_BRACE)) {
+            failureBlock = parseBlock() ?: run {
+                synchronizeToStatement()
+                return null
+            }
+            end = failureBlock.span.end
+
+            // As with `if`, the `else` may sit on the same line or the following one.
+            val mark = index
+            skipNewlines()
+            if (at(TokenType.ELSE)) {
+                advance()
+                skipNewlines()
+                val block = if (at(TokenType.LEFT_BRACE)) {
+                    parseBlock()
+                } else {
+                    error(
+                        "expected '{' to start the 'else' block but found ${current().describe()}",
+                        current().span,
+                    )
+                    null
+                }
+                if (block == null) {
+                    synchronizeToStatement()
+                    return null
+                }
+                elseBlock = block
+                end = block.span.end
+            } else {
+                index = mark
+            }
+        }
+
+        if (requireValue) {
+            // A `nya` in value position owes a value on *both* readings. The bare form throws instead
+            // of producing one, and the lone failure block covers only the reading where the
+            // condition was false, so neither can be the source of the value that was asked for.
+            if (failureBlock == null) {
+                error(
+                    "this 'nya' is used as a value, so it needs both blocks: write " +
+                        "'nya condition { yield ... } else { yield ... }' — the failure block gives " +
+                        "the value when the condition is false, and the 'else' block gives it when " +
+                        "the condition holds",
+                    keyword.span,
+                )
+            } else if (elseBlock == null) {
+                error(
+                    "this 'nya' is used as a value but has only a failure block: add " +
+                        "'else { yield ... }' to say what the value is when the condition holds",
+                    keyword.span,
+                )
+            }
+        }
+
+        return NyaExpression(
             keywordSpan = keyword.span,
             condition = condition,
-            span = Span(source, keyword.span.start, condition.span.end),
+            failureBlock = failureBlock,
+            elseBlock = elseBlock,
+            span = Span(source, keyword.span.start, end),
         )
     }
 
@@ -1419,12 +1509,13 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
     }
 
     /**
-     * Parses a `try` statement, which has two forms that share a keyword.
+     * `try call(args) { a, b -> ... }` — the one remaining `try`, in statement position.
      *
-     * `try call(args) { a, b -> ... }` calls a function that may `raise` and receives its values.
-     * `try { ... } catch (e: T) { ... } finally { ... }` runs a block and handles a throwable that
-     * came from code outside this language. They are told apart by what follows the keyword: a brace
-     * begins the block form, anything else must be the call of the extractor form.
+     * The other form this keyword used to introduce, `try { ... } catch (e: T) { ... }`, is gone:
+     * `nya condition { ... }` handles a broken belief and lets the program carry on, and a JVM
+     * exception that nothing catches already propagates on its own, so a block plus a handler for it
+     * was a second way to say what the language no longer needs said. A `{` after the keyword is
+     * therefore only ever a mistake, and it is reported as one rather than parsed.
      */
     private fun parseTryStatement(): Statement? {
         val keyword = advance()
@@ -1432,124 +1523,20 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         skipNewlines()
 
         if (at(TokenType.LEFT_BRACE)) {
-            return parseTryCatchStatement(keyword)
-        }
-
-        // Not a block, so this must be the extractor form. Parsing is restarted from just after the
-        // keyword so that a malformed call is reported against the call itself.
-        index = mark
-        return parseExtractorTry(keyword)
-    }
-
-    /** `try { ... } catch (e: T) { ... } finally { ... }` */
-    private fun parseTryCatchStatement(keyword: Token): TryCatchStatement? {
-        val body = parseBlock() ?: run {
+            error(
+                "a 'try' block no longer exists: 'try' only receives the values a function " +
+                    "'raise's, written 'try call(...) { values -> ... }', and an exception nothing " +
+                    "catches already propagates",
+                keyword.span,
+            )
             synchronizeToStatement()
             return null
         }
 
-        val catches = mutableListOf<CatchClause>()
-        var finallyBlock: BlockStatement? = null
-        var finallySpan: Span? = null
-        var end = body.span.end
-
-        while (true) {
-            val mark = index
-            skipNewlines()
-            when (current().type) {
-                TokenType.CATCH -> {
-                    val clause = parseCatchClause() ?: run {
-                        synchronizeToStatement()
-                        return null
-                    }
-                    catches += clause
-                    end = clause.span.end
-                }
-
-                TokenType.FINALLY -> {
-                    val finallyKeyword = advance()
-                    if (finallyBlock != null) {
-                        error("this 'try' already has a 'finally' block", finallyKeyword.span)
-                    }
-                    skipNewlines()
-                    val block = if (at(TokenType.LEFT_BRACE)) {
-                        parseBlock()
-                    } else {
-                        error(
-                            "expected '{' to start the 'finally' block but found ${current().describe()}",
-                            current().span,
-                        )
-                        null
-                    } ?: run {
-                        synchronizeToStatement()
-                        return null
-                    }
-                    finallyBlock = block
-                    val span = Span(source, finallyKeyword.span.start, block.span.end)
-                    finallySpan = span
-                    end = block.span.end
-                }
-
-                else -> {
-                    index = mark
-                    break
-                }
-            }
-        }
-
-        if (catches.isEmpty() && finallyBlock == null) {
-            error(
-                "a 'try' block must be followed by 'catch' or 'finally': without one there is " +
-                    "nothing to handle",
-                keyword.span,
-            )
-        }
-
-        return TryCatchStatement(
-            keywordSpan = keyword.span,
-            body = body,
-            catches = catches,
-            finallyBlock = finallyBlock,
-            finallySpan = finallySpan,
-            span = Span(source, keyword.span.start, end),
-        )
-    }
-
-    /** `catch (e: CustomException) { ... }` */
-    private fun parseCatchClause(): CatchClause? {
-        val keyword = advance() // `catch`
-        skipNewlines()
-
-        if (!expectLeftParen("'catch' clause")) {
-            return null
-        }
-
-        val nameToken = expect(
-            TokenType.IDENTIFIER,
-            "expected a name for the caught exception but found ${current().describe()}",
-        ) ?: return null
-
-        if (!expectColon("caught exception '${nameToken.text}'")) {
-            return null
-        }
-
-        val type = parseType() ?: return null
-
-        skipNewlines()
-        if (expectRightParen("'catch' clause") == null) {
-            return null
-        }
-
-        skipNewlines()
-        val body = parseBlock() ?: return null
-
-        return CatchClause(
-            parameterName = nameToken.text,
-            parameterNameSpan = nameToken.span,
-            declaredType = type,
-            body = body,
-            span = Span(source, keyword.span.start, body.span.end),
-        )
+        // The extractor form. Parsing is restarted from just after the keyword so that a malformed
+        // call is reported against the call itself rather than against the newline that follows it.
+        index = mark
+        return parseExtractorTry(keyword)
     }
 
     /**
@@ -2017,18 +2004,20 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
 
             TokenType.LEFT_BRACE -> parseLambdaExpression()
 
+            // `result: int = nya a == b { yield 2 } else { yield 1 }` asks for a value, so the parser
+            // demands both blocks here and refuses the two forms that would leave one answer missing.
+            TokenType.NYA -> parseNyaExpression(requireValue = true)
+
             // `try f(...) { a -> yield 1 }` is an expression when what it is worth is used, as in
-            // `result: int = try f(...) { a -> yield 1 }`. The brace form `try { ... } catch ...`
-            // catches a thrown exception instead and is never worth a value, so it stays a
-            // statement and is rejected here.
+            // `result: int = try f(...) { a -> yield 1 }`. The brace form that caught a thrown
+            // exception is gone and is reported as such rather than silently accepted.
             TokenType.TRY -> {
                 val keyword = advance()
                 skipNestedNewlines()
                 if (at(TokenType.LEFT_BRACE)) {
                     error(
-                        "'try' is worth a value only with an extractor: write " +
-                            "'try call(...) { values -> yield ... }', or use the statement form " +
-                            "'try { ... } catch ...' on a line of its own",
+                        "a 'try' block no longer exists: 'try' is worth a value only with an " +
+                            "extractor — write 'try call(...) { values -> yield ... }'",
                         keyword.span,
                     )
                     null

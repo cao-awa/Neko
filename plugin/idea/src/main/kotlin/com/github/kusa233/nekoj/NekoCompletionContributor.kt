@@ -177,8 +177,8 @@ private class NekoCompletionProvider : CompletionProvider<CompletionParameters>(
  *
  * Two positions count, and between them they cover every place Neko names a type:
  *
- *  * after a `:` — a local's or a field's type, a parameter's, a return type, a `catch` clause's,
- *    and a supertype after `class X:`;
+ *  * after a `:` — a local's or a field's type, a parameter's, a return type, and a supertype after
+ *    `class X:`;
  *  * inside an `emit` clause's brackets, as in `} emit [int, <caret>]`.
  *
  * The name being typed is dropped first, since `x: in<caret>` is as much a type position as

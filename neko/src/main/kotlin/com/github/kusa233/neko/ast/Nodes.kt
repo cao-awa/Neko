@@ -457,25 +457,66 @@ class WhenBranch(
 ) : Node
 
 /**
- * `nya condition` — checks that the condition holds, and throws an `AssertionError` when it does not.
+ * `nya condition`, `nya condition { ... }`, `nya condition { ... } else { ... }` — states what the
+ * program believes, and says what to do when it is wrong.
  *
- * This is where a program states what it believes rather than what it computes: the condition is an
- * ordinary `bool` expression, and a run that reaches this statement with it false ends there.
+ * This is where a program writes down a fact it relies on rather than a fact it computes. What going
+ * wrong means is chosen by the writer:
  *
- * The failure message is the condition's own source text, read from [condition]'s span at generation
- * time rather than carried as a string here. That keeps the message in step with the expression it
- * describes without the text being written twice, and it is why there is no message operand.
+ * - Bare, `nya a == b` throws a `java.lang.AssertionError` whose message is the condition's own
+ *   source text. The program stops where the belief was broken rather than somewhere later where the
+ *   damage surfaces. Because the throw is the only outcome there is, the condition has to be a `bool`
+ *   — anything else would be a check that could never fail.
+ * - With a block, `nya a == b { ... }`, the block runs instead and control carries on after it. The
+ *   block answers a condition that came back false **and** an `AssertionError` raised while the
+ *   condition was being evaluated — by a bare `nya` of its own, or by one inside a function it
+ *   called. That second way in is why the condition may be of any type at all: `nya method() { ... }`
+ *   is a call whose failure is handled, and `void` has no false for the first way to test. This is
+ *   what replaced `try`/`catch`.
+ * - With a block and an `else`, `nya a == b { ... } else { ... }`, the construct is also worth a
+ *   value: the `else` block yields the value for the case where the condition *ran to a true answer*,
+ *   and the failure block yields it for the case where it was false or threw. That is the whole of
+ *   the expression form — `count: int = nya cached != null { yield load() } else { yield cached }` —
+ *   and it is why the two blocks are the two answers to one question rather than an error path and a
+ *   normal path.
  *
- * The check is unconditional — unlike Java's `assert`, no flag turns it off — so a `nya` always costs
- * the comparison it names. That is deliberate: a check that silently does nothing is worse than no
- * check, and Neko has no flag to enable one with.
+ * A bare `nya` in expression position is refused: with nothing to say what the failure is worth,
+ * there would be no value to give. That is a question about the *use*, not about this node — the very
+ * same construct is a statement when it is written on its own — which is why the parser demands the
+ * `else` only where a value is expected and the analyzer is what reports the rest.
  */
-class NyaStatement(
+class NyaExpression(
     /** Span of the `nya` keyword, used when reporting a missing or mistyped condition. */
     val keywordSpan: Span,
     val condition: Expression,
+    /**
+     * The block run when the condition fails, or `null` for the bare form that throws instead.
+     *
+     * This is the `else`-less block: `nya a == b { recover() }`. When [elseBlock] is present this
+     * block is the failure arm of the value, and when it is absent the block is the whole of the
+     * recovery — control continues after it either way, because the failure has been handled. It is
+     * reached both by a false condition and by an `AssertionError` thrown out of [condition].
+     */
+    val failureBlock: BlockStatement?,
+    /**
+     * The block that produces the value when the condition held, or `null`.
+     *
+     * Present only in the value form. Its `yield` fixes the type the expression is worth, and the
+     * failure block's `yield` must agree with it. Unlike [failureBlock] it is reached only on the
+     * reading where the condition ran to an answer, because a throw never gets this far.
+     */
+    val elseBlock: BlockStatement?,
     override val span: Span,
-) : Statement
+) : Expression() {
+    /**
+     * The type the `yield`s in [failureBlock] and [elseBlock] produce, fixed by the first one seen.
+     *
+     * Stays `null` for the forms that are worth nothing, and for a value form whose blocks never
+     * `yield` — the latter is reported by the analyzer rather than left to produce a null value.
+     * Code generation reads it to know what to unbox the result into.
+     */
+    var yieldedType: NekoType? = null
+}
 
 /**
  * `raise e1, e2` — leaves the enclosing `emit`-declaring function early, handing the values to the
@@ -498,45 +539,6 @@ class RaiseStatement(
 
     /** Filled in by the code generator: the class that declares [builderName]. */
     var builderOwner: String? = null
-}
-
-/**
- * `try { ... } catch (e: T) { ... } finally { ... }`.
- *
- * This is how an Neko program handles a throwable raised by code the language did not compile —
- * another JVM language's library method, or an exception the JVM itself throws. Neko has no
- * `throw` of its own: the only way this language transfers control abnormally is `raise`, which is
- * caught by the extractor form of `try` rather than by a `catch` clause.
- *
- * Both `catch` and `finally` are optional, but a `try` must have at least one of them — a bare
- * `try { ... }` protects nothing and is rejected by the analyzer.
- */
-class TryCatchStatement(
-    val keywordSpan: Span,
-    val body: BlockStatement,
-    /** One or more `catch` clauses, in the order they were written. */
-    val catches: List<CatchClause>,
-    /** The `finally` block, or `null` when none was written. */
-    val finallyBlock: BlockStatement?,
-    /** Span of the whole finally clause, used when reporting a malformed one. */
-    val finallySpan: Span?,
-    override val span: Span,
-) : Statement
-
-/** One `catch (e: T) { ... }` clause of a [TryCatchStatement]. */
-class CatchClause(
-    val parameterName: String,
-    val parameterNameSpan: Span,
-    /** The throwable type this clause handles. */
-    val declaredType: TypeReference,
-    val body: BlockStatement,
-    override val span: Span,
-) : Node {
-    /** Filled in by the analyzer: the resolved throwable type, which must extend `Throwable`. */
-    var resolvedType: NekoType? = null
-
-    /** Filled in by the analyzer: the local that names the caught value inside [body]. */
-    var symbol: LocalSymbol? = null
 }
 
 /**

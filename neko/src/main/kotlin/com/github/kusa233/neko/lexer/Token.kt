@@ -40,22 +40,31 @@ enum class TokenType(val display: String) {
     WHILE("'while'"),
     WHEN("'when'"),
     /**
-     * `'nya'` — checks that a condition holds, and stops the program with an `AssertionError` when
-     * it does not.
+     * `'nya'` — checks that a condition holds, and either runs a recovery block or is worth a value
+     * when it fails.
      *
-     * It is spelled as a word rather than as a function because what it lowers to is not a call: a
-     * `nya` that fails throws from the statement itself, so it reads as part of the grammar the way
-     * `if` does. It sits beside [RAISE] for that reason — both are statements that leave by throwing
-     * — but it is deliberately *not* gated on the JVM's `-ea` flag, which is what separates it from
-     * Java's `assert`: a check that silently does nothing is worse than no check, and Neko has no
-     * flag to turn it on with.
+     * `nya a == b` throws an `AssertionError` when the condition fails. `nya a == b { ... }` runs the
+     * block instead, and the block catches an `AssertionError` the condition *threw* as well as a
+     * condition that came back false — so `nya method() { ... }` is a call whose failure is handled,
+     * and the condition is not required to be a `bool` when a block spells out what failing means.
+     * `nya a == b { ... } else { ... }` is worth whatever the `else` yields when the condition holds.
+     * Written as a word rather than a function because it is not a call: the branch it lowers to
+     * belongs to the statement it appears in, the way `if`'s does. A bare `nya` is compiled to the
+     * shape Java's `assert` uses — a branch past the throw — but it is deliberately *not* gated on the
+     * JVM's `-ea` flag, which is the one thing it does differ in: a check that silently does nothing
+     * is worse than no check, and Neko has no flag to turn one on with.
      */
     NYA("'nya'"),
     RAISE("'raise'"),
     EMIT("'emit'"),
+    /**
+     * `'try'` — now only the extractor form, `try f(...) { a -> ... }`, which receives a `raise`.
+     *
+     * The `try { ... } catch ...` statement that handled a JVM throwable was removed: `nya`'s block
+     * form replaces it for the failure a Neko program can actually name, because a bare `nya` is what
+     * raises one and a block is what answers it.
+     */
     TRY("'try'"),
-    CATCH("'catch'"),
-    FINALLY("'finally'"),
 
     // Expressions.
     THIS("'this'"),
@@ -190,8 +199,6 @@ internal val KEYWORDS: Map<String, TokenType> = mapOf(
     "raise" to TokenType.RAISE,
     "emit" to TokenType.EMIT,
     "try" to TokenType.TRY,
-    "catch" to TokenType.CATCH,
-    "finally" to TokenType.FINALLY,
     "this" to TokenType.THIS,
     "true" to TokenType.TRUE,
     "false" to TokenType.FALSE,

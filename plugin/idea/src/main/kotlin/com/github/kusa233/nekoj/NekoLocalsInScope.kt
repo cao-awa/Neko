@@ -1,15 +1,15 @@
 package com.github.kusa233.nekoj
 
 import com.github.kusa233.neko.ast.BlockStatement
-import com.github.kusa233.neko.ast.CatchClause
 import com.github.kusa233.neko.ast.ClassDeclaration
 import com.github.kusa233.neko.ast.ConstructorDeclaration
+import com.github.kusa233.neko.ast.ExpressionStatement
 import com.github.kusa233.neko.ast.FunctionDeclaration
 import com.github.kusa233.neko.ast.IfStatement
 import com.github.kusa233.neko.ast.LambdaExpression
 import com.github.kusa233.neko.ast.NekoFile
+import com.github.kusa233.neko.ast.NyaExpression
 import com.github.kusa233.neko.ast.Statement
-import com.github.kusa233.neko.ast.TryCatchStatement
 import com.github.kusa233.neko.ast.TryStatement
 import com.github.kusa233.neko.ast.VariableDeclarationStatement
 import com.github.kusa233.neko.ast.WhenStatement
@@ -22,8 +22,8 @@ class LocalName(
     val name: String,
     /** `null` when the analyzer could not work the type out, e.g. because the program has errors. */
     val type: NekoType?,
-    /** `true` for a parameter — of a function, a lambda, an extractor or a `catch` — rather than a
-     * variable the reader declared in the body. */
+    /** `true` for a parameter — of a function, a lambda or an extractor — rather than a variable the
+     * reader declared in the body. */
     val isParameter: Boolean,
 )
 
@@ -139,10 +139,14 @@ private fun collectStatements(
                 descend(branch.body, offset, into)
             }
 
-            is TryCatchStatement -> {
-                descend(statement.body, offset, into)
-                for (clause in statement.catches) collectFromCatch(clause, offset, into)
-                descend(statement.finallyBlock, offset, into)
+            // `nya c { ... } else { ... }` — the blocks are ordinary blocks, so a variable declared
+            // in one is visible in that one alone, exactly as it would be inside an `if`.
+            is ExpressionStatement -> {
+                val expression = statement.expression
+                if (expression is NyaExpression) {
+                    descend(expression.failureBlock, offset, into)
+                    descend(expression.elseBlock, offset, into)
+                }
             }
 
             is TryStatement -> {
@@ -172,17 +176,6 @@ private fun descend(
     } else {
         collectStatements(listOf(statement), offset, into)
     }
-}
-
-private fun collectFromCatch(
-    clause: CatchClause,
-    offset: Int,
-    into: MutableMap<String, LocalName>,
-) {
-    if (!clause.span.holds(offset)) return
-    into[clause.parameterName] =
-        LocalName(clause.parameterName, clause.resolvedType, isParameter = true)
-    collectStatements(clause.body.statements, offset, into)
 }
 
 private fun collectFromLambda(
