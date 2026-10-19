@@ -42,5 +42,11 @@
                                 implementationClass="com.github.kusa233.nekoj.NekoCompletionContributor"/>
 
         <colorSettingsPage implementation="com.github.kusa233.nekoj.NekoColorSettingsPage"/>
+
+        <!-- Support click-to-run in the ide-->
+        <runLineMarkerContributor language="Neko"
+            implementationClass="com.github.kusa233.nekoj.clickToRun.NekoRunLineMarkerContributor"/>
+        <configurationType implementation="com.github.kusa233.nekoj.clickToRun.NekoRunConfigurationType"/>
+        <runConfigurationProducer implementation="com.github.kusa233.nekoj.clickToRun.NekoRunConfigurationProducer"/>
     </extensions>
 </idea-plugin>
