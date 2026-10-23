@@ -75,20 +75,36 @@ enum class TokenType(val display: String) {
      */
     TRY("'try'"),
     /**
-     * `'purr'` — a critical section, backed by a `java.util.concurrent.locks.StampedLock`.
+     * The four locking keywords, backed by a `java.util.concurrent.locks.StampedLock`.
      *
-     * `purr { ... }` runs the block holding the *instance* lock, taken in write mode, so it is what
-     * `synchronized (this)` would be. `purr class { ... }` holds the *class* lock instead, one per
-     * class, the way `synchronized (Cls.class)` is. `purr read { ... }` takes a read lock rather than
-     * a write one, which is what makes a read-mostly field worth guarding this way: many threads can
-     * be inside at once, and only a writer is exclusive.
+     * They are two independent choices — *which* lock, and *which* mode — spelled as four words:
      *
-     * A keyword rather than a function because it is not a call: the lock has to be released on every
-     * way out of the block — falling off the end, `return`, `raise`, and a thrown exception — and only
-     * the compiler can emit that. `StampedLock` makes the compiler's involvement unavoidable anyway:
+     * | Written | Lock | Mode |
+     * | --- | --- | --- |
+     * | `purr { ... }` | instance | write |
+     * | `purred { ... }` | instance | read |
+     * | `purrcls { ... }` | class | write |
+     * | `purredcls { ... }` | class | read |
+     *
+     * The instance lock is what `synchronized (this)` would be, taken in write mode by default; the
+     * class lock is the one-per-class lock `synchronized (Cls.class)` gives. A read lock lets many
+     * threads in at once, which is what makes a read-mostly field worth guarding this way: only a
+     * writer is exclusive.
+     *
+     * Words rather than a call because this is not a call: the lock has to be released on every way
+     * out of the block — falling off the end, `return`, `raise`, and a thrown exception — and only the
+     * compiler can emit that. `StampedLock` makes the compiler's involvement unavoidable anyway:
      * unlocking requires the *stamp* the acquisition answered, and it is not reentrant.
+     *
+     * Four keywords rather than one keyword plus modifiers because `read` and `class` are ordinary
+     * identifiers in this language — `purr class { ... }` would have to read `class` as a keyword in
+     * that one position and as a name everywhere else, which is the kind of context-dependent lexing
+     * a reader cannot see. A single word per form has no such ambiguity.
      */
     PURR("'purr'"),
+    PURRED("'purred'"),
+    PURRCLS("'purrcls'"),
+    PURREDCLS("'purredcls'"),
 
     // Expressions.
     THIS("'this'"),
@@ -225,6 +241,9 @@ internal val KEYWORDS: Map<String, TokenType> = mapOf(
     "emit" to TokenType.EMIT,
     "try" to TokenType.TRY,
     "purr" to TokenType.PURR,
+    "purred" to TokenType.PURRED,
+    "purrcls" to TokenType.PURRCLS,
+    "purredcls" to TokenType.PURREDCLS,
     "this" to TokenType.THIS,
     "true" to TokenType.TRUE,
     "false" to TokenType.FALSE,

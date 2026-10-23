@@ -32,7 +32,7 @@ Tasks are module-qualified now that there is more than one module.
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # Tests.
-./gradlew :neko:test                     # the compiler: 400 tests
+./gradlew :neko:test                     # the compiler: 403 tests
 ./gradlew :plugin:idea:test              # the plugin: 37 tests, in a real IDE instance
 ```
 
@@ -67,7 +67,8 @@ output. It is the closest thing to a reference for [nullable types](#nullable-ty
 
 `NyaSample` does the same for [`nya`](#checking-what-the-program-believes), and `ExceptionSample` for
 `raise` and `try`. `EnumSample` shows [`miao class`](#enum-miao) — the constants, the values they can
-carry, and `values()`/`valueOf()` — and `PurrSample` shows [`purr`](#locking-purr):
+carry, and `values()`/`valueOf()` — and `PurrSample` shows
+[locking](#locking-purr-purred-purrcls-purredcls):
 
 ```bash
 ./gradlew :neko:runNeko -Pneko.program=NyaSample
@@ -299,7 +300,7 @@ already its superclass. It cannot override `name`, `ordinal`, `equals`, `hashCod
 which `java.lang.Enum` declares `final`; `toString` is left open. The list must name at least one
 constant.
 
-### Locking (`purr`)
+### Locking (`purr`, `purred`, `purrcls`, `purredcls`)
 
 `purr` guards a block of statements with a lock, and gives that lock back however the block is left:
 
@@ -322,29 +323,39 @@ a `return`, a `raise`, and an exception thrown by anything called inside — and
 stamp the acquisition answered, which is a `long` the source cannot carry. A `synchronized` block
 would need neither, but it also cannot offer a read lock.
 
-Three forms:
+There are two independent choices — *which* lock, and *which* mode — and each combination has its own
+word:
 
-| Written | Holds |
-| --- | --- |
-| `purr { ... }` | the lock belonging to `this`, exclusively |
-| `purr class { ... }` | the lock belonging to the class, exclusively — shared by every object and every `static` function |
-| `purr read { ... }` | the same lock as `purr { }`, but for reading: readers do not wait for each other |
+| Written | Lock | Mode |
+| --- | --- | --- |
+| `purr { ... }` | the object's (`this`) | exclusive |
+| `purred { ... }` | the object's (`this`) | shared with other readers |
+| `purrcls { ... }` | the class' | exclusive |
+| `purredcls { ... }` | the class' | shared with other readers |
 
-- `purr { }` needs a `this`, so a `static` function cannot use it; `purr class { }` is what it wants.
-- `purr read { }` lets several threads in at once, so it is for reading a value nobody may change
-  meanwhile. A read-modify-write belongs under `purr { }` — two readers hold a read lock at the same
+The class lock is one lock for the whole class, shared by every object and every `static` function, so
+`purrcls { }` is what `synchronized (Cls.class)` would be and what a `static` function must use — it
+has no `this` for an instance lock to belong to.
+
+- `purred` and `purredcls` let several threads in at once, so they are for reading a value nobody may
+  change meanwhile. A read-modify-write belongs under `purr`: two readers hold a read lock at the same
   time by design, so such a block is not exclusive and its updates can be lost.
 - **A thread cannot take the same lock twice.** `StampedLock` is not reentrant in any mode, so
-  `purr { purr { ... } }` would block forever. The mode does not help either: a write lock excludes
-  even the thread that already holds it. Both are rejected when the program is analyzed rather than
-  left to hang at run time.
-- The two locks are different locks, so `purr class { purr { ... } }` is legal and is what a
-  class-wide guard around per-object work looks like.
+  `purr { purr { ... } }` would block forever. The mode does not help either: `purred` inside `purr` on
+  the same lock is still a second acquisition. All such nestings are rejected when the program is
+  analyzed rather than left to hang at run time.
+- The two locks are different locks, so `purrcls { purr { ... } }` is legal and is what a class-wide
+  guard around per-object work looks like.
 - Blocks one after another are *not* nested: the first has released before the second is entered.
 
-The locks are created on demand — a class that never writes `purr` carries no lock field at all. The
-instance lock is a field of each object and the class lock is a `static` field, both compiler-created
-because `StampedLock` lives in `java.util.concurrent.locks`, which a Neko source file cannot name.
+Four words rather than one keyword plus a modifier, because `class` and `read` are ordinary
+identifiers in this language — reading them as modifiers in one position and as names everywhere else
+would be context-dependent lexing a reader cannot see.
+
+The locks are created on demand — a class that never writes one of these keywords carries no lock field
+at all. The instance lock is a field of each object and the class lock is a `static` field, both
+compiler-created because `StampedLock` lives in `java.util.concurrent.locks`, which a Neko source file
+cannot name.
 
 The nesting rule is checked *within one method body*, since that is what the analyzer can see. A
 method that takes a lock and calls another method which takes the same one will hang; keeping that

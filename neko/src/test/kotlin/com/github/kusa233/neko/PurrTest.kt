@@ -7,11 +7,11 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
- * Tests for `purr` — a critical section backed by a `java.util.concurrent.locks.StampedLock`.
+ * Tests for `purr` —a critical section backed by a `java.util.concurrent.locks.StampedLock`.
  *
  * The interesting failures here are not type errors but *silent* ones: a lock left held, or two
  * threads writing without seeing each other. So these run the compiled program and check what it did,
- * and the concurrency ones use real threads — a single-threaded test cannot tell a working lock from a
+ * and the concurrency ones use real threads —a single-threaded test cannot tell a working lock from a
  * missing one.
  */
 class PurrTest {
@@ -96,8 +96,8 @@ class PurrTest {
     @Test
     fun `a read lock excludes writers`() {
         // The mode is what separates the two: readers share, but a writer excludes them. Counting is
-        // the wrong instrument here — two readers hold the lock at once, so a read-modify-write under
-        // `purr read` is *expected* to race and a stale counter would report a false overlap. What the
+        // the wrong instrument here —two readers hold the lock at once, so a read-modify-write under
+        // `purred` is *expected* to race and a stale counter would report a false overlap. What the
         // mode promises is only about meeting a writer, so each side raises its own flag and looks at
         // the other's. One thread each, so a flag is written only by its owner and the booleans say
         // exactly what they mean.
@@ -109,7 +109,7 @@ class PurrTest {
                 "    var overlap: bool = false",
                 "",
                 "    fun read() {",
-                "        purr read {",
+                "        purred {",
                 "            this.reading = true",
                 "            n: int = 0",
                 "            while (n < 2000) {",
@@ -167,8 +167,8 @@ class PurrTest {
 
     @Test
     fun `two readers hold the read lock at the same time`() {
-        // The point of `purr read`: readers do not wait for each other. Each reader waits for the
-        // other to arrive before leaving, which can only succeed if both are inside at once — a
+        // The point of `purred`: readers do not wait for each other. Each reader waits for the
+        // other to arrive before leaving, which can only succeed if both are inside at once —a
         // write lock here would deadlock and time out.
         val program = TestSupport.load(
             file(
@@ -177,7 +177,7 @@ class PurrTest {
                 "    var met: bool = false",
                 "",
                 "    fun enter() {",
-                "        purr read {",
+                "        purred {",
                 "            this.inside = this.inside + 1",
                 "            n: int = 0",
                 "            // Spin until the other reader has arrived. Bounded, so a failure ends rather",
@@ -302,8 +302,8 @@ class PurrTest {
     }
 
     @Test
-    fun `purr class and purr together take two different locks`() {
-        // The two locks are separate, so nesting them is legal — and this is the shape a class-wide
+    fun `purrcls and purr together take two different locks`() {
+        // The two locks are separate, so nesting them is legal —and this is the shape a class-wide
         // guard around a per-object one has. A single lock would deadlock here, since StampedLock is
         // not reentrant.
         val program = TestSupport.load(
@@ -312,7 +312,7 @@ class PurrTest {
                 "    var value: int = 0",
                 "",
                 "    fun update(): int {",
-                "        purr class {",
+                "        purrcls {",
                 "            purr {",
                 "                this.value = this.value + 1",
                 "                return this.value",
@@ -354,7 +354,7 @@ class PurrTest {
                 "    }",
                 "",
                 "    fun bump() {",
-                "        purr class {",
+                "        purrcls {",
                 "            current: int = Shared.total",
                 "            Shared.total = current + 1",
                 "        }",
@@ -373,7 +373,7 @@ class PurrTest {
         val bump = type.getMethod("bump")
 
         // Each thread uses its *own* object, so an instance lock would give every thread its own lock
-        // and exclude nothing — only a shared class lock makes the static count come out exact.
+        // and exclude nothing —only a shared class lock makes the static count come out exact.
         concurrently(4) { index ->
             val subject = objects[index]
             repeat(250) { bump.invoke(subject) }
@@ -417,7 +417,7 @@ class PurrTest {
                 "class Main() {",
                 "    static {",
                 "        fun helper(): int {",
-                "            purr class {",
+                "            purrcls {",
                 "                return 42",
                 "            }",
                 "        }",
@@ -473,7 +473,7 @@ class PurrTest {
                 "class Boxed() {",
                 "    fun nested() {",
                 "        purr {",
-                "            purr read {",
+                "            purred {",
                 "                println(1)",
                 "            }",
                 "        }",
@@ -595,7 +595,7 @@ class PurrTest {
             file(
                 "class Shared() {",
                 "    fun bump(): int {",
-                "        purr class {",
+                "        purrcls {",
                 "            return 1",
                 "        }",
                 "    }",
@@ -624,7 +624,7 @@ class PurrTest {
     @Test
     fun `an enum's own method can use an instance purr block`() {
         // An enum's only constructor is the private one the compiler emits, not one from
-        // `emitConstructors`, so the instance lock has to be built there too — otherwise the field is
+        // `emitConstructors`, so the instance lock has to be built there too —otherwise the field is
         // null and taking it throws a NullPointerException.
         val program = TestSupport.load(
             file(
@@ -655,7 +655,7 @@ class PurrTest {
     }
 
     @Test
-    fun `an enum's own method can use a purr class block`() {
+    fun `an enum's own method can use a purrcls block`() {
         // The class lock is built in the enum's `<clinit>`, which the compiler writes itself rather
         // than through `emitStaticInitializer`.
         val program = TestSupport.load(
@@ -665,7 +665,7 @@ class PurrTest {
                 "    GREEN;",
                 "",
                 "    fun count(): int {",
-                "        purr class {",
+                "        purrcls {",
                 "            return 2",
                 "        }",
                 "    }",
@@ -687,15 +687,16 @@ class PurrTest {
     }
 
     @Test
-    fun `purr read is accepted and purr write is the default`() {        // Both spellings of the mode have to work, and the block after `purr read` parses as the same
-        // statement rather than as a variable named `read`.
+    fun `purred takes the read lock and purr takes the write lock`() {
+        // Both modes have to work, and `purred` parses as its own keyword rather than as `purr`
+        // followed by a variable named `read`.
         val program = TestSupport.load(
             file(
                 "class Boxed() {",
                 "    var value: int = 3",
                 "",
                 "    fun look(): int {",
-                "        purr read {",
+                "        purred {",
                 "            return this.value",
                 "        }",
                 "    }",
@@ -714,5 +715,105 @@ class PurrTest {
             "3\n",
             program.capturingOutput { program.invoke("com.github.kusa233.test.Main", "main") },
         )
+    }
+
+    @Test
+    fun `purredcls holds the class lock for reading`() {
+        // The one form the four words add beyond the original three: a class lock in read mode. It has
+        // to need no instance (like `purrcls`) and to admit other readers (like `purred`), so it is
+        // exercised from a static function, which has no `this` at all.
+        val program = TestSupport.load(
+            file(
+                "class Main() {",
+                "    static {",
+                "        fun look(): int {",
+                "            purredcls {",
+                "                return 5",
+                "            }",
+                "        }",
+                "",
+                "        fun main() {",
+                "            println(look())",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        assertEquals(
+            "5\n",
+            program.capturingOutput { program.invoke("com.github.kusa233.test.Main", "main") },
+        )
+    }
+
+    @Test
+    fun `purredcls takes the static read lock and purred the instance one`() {
+        // The class lock must be the *static* field and the read mode must reach `readLock`, or the
+        // other objects of this class would not exclude each other and readers would serialize.
+        val program = TestSupport.load(
+            file(
+                "class Guarded() {",
+                "    fun look(): int {",
+                "        purred {",
+                "            return 1",
+                "        }",
+                "    }",
+                "",
+                "    static {",
+                "        fun classLook(): int {",
+                "            purredcls {",
+                "                return 2",
+                "            }",
+                "        }",
+                "    }",
+                "}",
+                "",
+                "class Main() {",
+                "    static {",
+                "        fun main() { }",
+                "    }",
+                "}",
+            ),
+        )
+        val type = program.typeOf("com.github.kusa233.test.Guarded")
+        val locks = type.declaredFields.filter {
+            it.type.name == "java.util.concurrent.locks.StampedLock"
+        }
+        assertEquals(2, locks.size, "both locks should exist, got ${locks.map { it.name }}")
+        // Exactly one of them is the shared class lock.
+        assertEquals(
+            1,
+            locks.count { java.lang.reflect.Modifier.isStatic(it.modifiers) },
+            "the class lock should be the only static one",
+        )
+    }
+
+    @Test
+    fun `the old two-word forms are gone`() {
+        // `purr class { }` and `purr read { }` were replaced by single words. They must be *errors*
+        // now, not silently accepted, or a reader following older documentation would get an
+        // instance write lock where they asked for something else.
+        for (prefix in listOf("purr class", "purr read")) {
+            val result = TestSupport.compile(
+                file(
+                    "class Boxed() {",
+                    "    fun run() {",
+                    "        $prefix {",
+                    "            println(1)",
+                    "        }",
+                    "    }",
+                    "}",
+                    "",
+                    "class Main() {",
+                    "    static {",
+                    "        fun main() { }",
+                    "    }",
+                    "}",
+                ),
+            )
+            assertTrue(
+                TestSupport.errors(result).isNotEmpty(),
+                "'$prefix' should no longer parse, but got: ${TestSupport.messages(result)}",
+            )
+        }
     }
 }

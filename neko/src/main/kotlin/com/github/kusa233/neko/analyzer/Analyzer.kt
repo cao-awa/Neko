@@ -1123,38 +1123,37 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     }
 
     /**
-     * `purr { ... }` — checks that the lock it names exists on this code path, and that the block does
-     * not take a lock this thread already holds.
-     *
-     * Two checks, both about a deadlock rather than about a type:
+     * A locking block — `purr`, `purred`, `purrcls` or `purredcls` — checked for the two mistakes that
+     * would otherwise show up as a hang rather than an error.
      *
      *  * An **instance** lock is a lock on `this`, so it only exists where `this` does. A `static`
-     *    function has no instance, which is why `purr { ... }` there is refused and the reader is told
-     *    to write `purr class { ... }` — the class lock needs no instance and is the one they meant.
+     *    function has no instance, which is why `purr`/`purred` there are refused and the reader is
+     *    told to write the `cls` spelling — the class lock needs no instance and is the one they
+     *    meant.
      *  * `StampedLock` is **not reentrant** — in either mode. Taking a lock this thread already holds
      *    blocks forever with no error, no timeout and no stack to look at, so it is worth catching at
-     *    compile time. The *mode* is deliberately not part of the identity: a `read` inside a `write`
-     *    on one lock, a `write` inside a `read`, and a `read` inside a `read` are all deadlocks, since
-     *    the JVM has no owner to notice the same thread asking twice. Only a *different* lock nests
-     *    safely, which is what makes `purr class { purr { } }` the way to wrap a per-object guard in a
+     *    compile time. The *mode* is deliberately not part of the identity: `purred` inside `purr` on
+     *    one lock, `purr` inside `purred`, and `purred` inside `purred` are all deadlocks, since the
+     *    JVM has no owner to notice the same thread asking twice. Only a *different* lock nests
+     *    safely, which is what makes `purrcls { purr { } }` the way to wrap a per-object guard in a
      *    class-wide one. Nesting is tracked through [heldPurrLocks], which has to be per-method
      *    because a lambda's body is a different method that inherits nothing.
      */
     private fun analyzePurr(statement: PurrStatement) {
         if (statement.lock == PurrLock.INSTANCE && implicitThisClass == null) {
             diagnostics.error(
-                "this 'purr' holds the lock of 'this', but this code has no instance: a 'static' " +
-                    "function belongs to the class rather than to an object, so write " +
-                    "'purr class { ... }' to hold the class lock instead",
+                "this '${statement.keyword}' holds the lock of 'this', but this code has no instance: " +
+                    "a 'static' function belongs to the class rather than to an object, so write " +
+                    "'${classLockKeyword(statement.mode)} { ... }' to hold the class lock instead",
                 statement.keywordSpan,
             )
         }
 
         if (heldPurrLocks.contains(statement.lock)) {
             diagnostics.error(
-                "this 'purr' takes the ${describePurrLock(statement.lock)} lock that is already held " +
-                    "around it, and a StampedLock cannot be taken twice by one thread — the program " +
-                    "would block forever",
+                "this '${statement.keyword}' takes the ${describePurrLock(statement.lock)} lock that " +
+                    "is already held around it, and a StampedLock cannot be taken twice by one " +
+                    "thread — the program would block forever",
                 statement.keywordSpan,
             )
         }
@@ -1167,6 +1166,15 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     /** How a [PurrStatement]'s lock is named in a diagnostic. */
     private fun describePurrLock(lock: PurrLock): String =
         if (lock == PurrLock.CLASS) "class" else "instance"
+
+    /**
+     * The keyword that holds the class lock in [mode], for a diagnostic suggesting the fix.
+     *
+     * The suggestion has to keep the mode: a reader who wrote `purred` in a `static` function wants
+     * the class lock *read*, which is `purredcls`, not `purrcls`.
+     */
+    private fun classLockKeyword(mode: PurrMode): String =
+        if (mode == PurrMode.READ) "purredcls" else "purrcls"
 
     /** `array[index] = value` */
     private fun analyzeIndexAssignment(statement: IndexAssignmentStatement) {

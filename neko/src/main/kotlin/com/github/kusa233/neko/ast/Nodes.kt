@@ -555,24 +555,25 @@ class NyaExpression(
 }
 
 /**
- * `purr { ... }` — run a block with a lock held.
+ * A locking block — `purr`, `purred`, `purrcls` or `purredcls`. Run a block with a lock held.
  *
  * The lock is a `java.util.concurrent.locks.StampedLock`, which is never reentrant: taking the same
  * lock twice on one thread deadlocks. That is why [lock] is part of the node's identity for the
  * analyzer to check nesting with, and why the release cannot be left to the block's own code — it
  * has to happen on every way out, including a `return` and a `raise`.
  *
- * Three things are chosen at the keyword:
+ * Two things are chosen, and each of the four words chooses both at once:
  *
- *  - **Which lock.** [lock] is [PurrLock.INSTANCE] for `purr { ... }`, which is one lock per object —
- *    `synchronized (this)` — and [PurrLock.CLASS] for `purr class { ... }`, which is one lock per
- *    class, `synchronized (Cls.class)`. An instance lock needs a `this`, so a static function can
- *    only use the class one; the analyzer says so.
- *  - **Read or write.** [mode] is [PurrMode.WRITE] unless the block opened with `read`, in which case
- *    several threads may be inside at once. A read lock is exclusive against writers only, which is
- *    the whole reason to reach for `StampedLock` instead of `ReentrantLock` — the latter has no
- *    shared mode, so a read-mostly field guarded by it loses the concurrency it was written for.
- *  - **Nesting.** A `purr` inside a `purr` on the *same* lock would deadlock, since the outer one
+ *  - **Which lock.** [lock] is [PurrLock.INSTANCE] for `purr`/`purred`, which is one lock per object —
+ *    `synchronized (this)` — and [PurrLock.CLASS] for `purrcls`/`purredcls`, which is one lock per
+ *    class, `synchronized (Cls.class)`. An instance lock needs a `this`, so a static function can only
+ *    use the class one; the analyzer says so.
+ *  - **Read or write.** [mode] is [PurrMode.WRITE] for `purr`/`purrcls` and [PurrMode.READ] for
+ *    `purred`/`purredcls`, in which case several threads may be inside at once. A read lock is
+ *    exclusive against writers only, which is the whole reason to reach for `StampedLock` instead of
+ *    `ReentrantLock` — the latter has no shared mode, so a read-mostly field guarded by it loses the
+ *    concurrency it was written for.
+ *  - **Nesting.** A block inside another on the *same* lock would deadlock, since the outer one
  *    already holds it; on a *different* lock it is fine. The analyzer reports the first and allows
  *    the second.
  *
@@ -581,8 +582,10 @@ class NyaExpression(
  * `return`s has already left the building, and the same reasoning applies to `yield`.
  */
 class PurrStatement(
-    /** Span of the `purr` keyword. */
+    /** Span of the locking keyword. */
     val keywordSpan: Span,
+    /** The word that was written, e.g. `purredcls`. Used to name the form in a diagnostic. */
+    val keyword: String,
     val lock: PurrLock,
     val mode: PurrMode,
     val body: BlockStatement,
@@ -591,19 +594,19 @@ class PurrStatement(
 
 /** Which `StampedLock` a `purr` block holds — see [PurrStatement.lock]. */
 enum class PurrLock {
-    /** One lock per object: `purr { ... }`. */
+    /** One lock per object: `purr { ... }` and `purred { ... }`. */
     INSTANCE,
 
-    /** One lock per class: `purr class { ... }`. */
+    /** One lock per class: `purrcls { ... }` and `purredcls { ... }`. */
     CLASS,
 }
 
 /** How a `purr` block holds its lock — see [PurrStatement.mode]. */
 enum class PurrMode {
-    /** Exclusive, against readers and other writers: the default. */
+    /** Exclusive, against readers and other writers: `purr` and `purrcls`. */
     WRITE,
 
-    /** Shared, against other readers but not writers: `purr read { ... }`. */
+    /** Shared, against other readers but not writers: `purred` and `purredcls`. */
     READ,
 }
 

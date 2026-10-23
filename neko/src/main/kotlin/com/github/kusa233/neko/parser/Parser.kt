@@ -1165,7 +1165,9 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         TokenType.NYA -> parseNyaStatementForm()
         TokenType.RAISE -> parseRaiseStatement()
         TokenType.TRY -> parseTryStatement()
-        TokenType.PURR -> parsePurrStatement()
+        TokenType.PURR, TokenType.PURRED,
+        TokenType.PURRCLS, TokenType.PURREDCLS,
+        -> parsePurrStatement()
         TokenType.SEMICOLON -> {
             advance()
             null
@@ -1624,57 +1626,28 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
     }
 
     /**
-     * `purr { ... }`, `purr read { ... }`, and `purr class { ... }` — plus the two words together.
+     * `purr { ... }`, `purred { ... }`, `purrcls { ... }` and `purredcls { ... }` — the four locking
+     * forms, one keyword each.
      *
-     * The prefix is read before the brace, so the shapes are told apart by what follows the keyword:
-     * `class` picks the lock, `read` picks the mode. Both may be written, `purr class read { ... }` and
-     * `purr read class { ... }`, and each is accepted in either order because the reader is naming two
-     * independent things and the order they come out in is not worth a correction.
-     *
-     * A word that is neither is an error rather than an identifier to be guessed at: `purr key { }`
-     * has no lock in it, and silently reading `key` as an expression would report the mistake
-     * somewhere much less helpful.
+     * The keyword alone says which lock is held and in which mode, so there is nothing to read before
+     * the brace: `purr` is the instance lock written, `purred` the same lock read, and the `cls`
+     * spellings take the class lock instead. Because each form is one word, `purr key { }` needs no
+     * special handling — `key` is simply not where a `{` was expected, and the error says so.
      */
     private fun parsePurrStatement(): Statement? {
         val keyword = advance()
-
-        var lock = PurrLock.INSTANCE
-        var mode = PurrMode.WRITE
-        var sawClass = false
-        var sawRead = false
-
-        while (at(TokenType.CLASS) || at(TokenType.IDENTIFIER) && current().text == "read") {
-            if (at(TokenType.CLASS)) {
-                advance()
-                if (sawClass) {
-                    error(
-                        "'purr' already holds the class lock; write 'purr class { ... }' once",
-                        current().span,
-                    )
-                    continue
-                }
-                sawClass = true
-                lock = PurrLock.CLASS
-            } else {
-                advance()
-                if (sawRead) {
-                    error(
-                        "'purr' is already in read mode; write 'purr read { ... }' once",
-                        current().span,
-                    )
-                    continue
-                }
-                sawRead = true
-                mode = PurrMode.READ
-            }
-            skipNewlines()
+        val lock = when (keyword.type) {
+            TokenType.PURRCLS, TokenType.PURREDCLS -> PurrLock.CLASS
+            else -> PurrLock.INSTANCE
+        }
+        val mode = when (keyword.type) {
+            TokenType.PURRED, TokenType.PURREDCLS -> PurrMode.READ
+            else -> PurrMode.WRITE
         }
 
-        // `read` is not a keyword: it is an ordinary identifier the language never gave a meaning to,
-        // so `purr read { }` reads it here, where it is unambiguous, and nowhere else.
         if (!at(TokenType.LEFT_BRACE)) {
             error(
-                "expected '{' to start the 'purr' block but found ${current().describe()}",
+                "expected '{' to start the '${keyword.text}' block but found ${current().describe()}",
                 current().span,
             )
             synchronizeToStatement()
@@ -1687,6 +1660,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         }
         return PurrStatement(
             keywordSpan = keyword.span,
+            keyword = keyword.text,
             lock = lock,
             mode = mode,
             body = body,
