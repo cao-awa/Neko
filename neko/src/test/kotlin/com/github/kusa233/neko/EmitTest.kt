@@ -66,7 +66,7 @@ class EmitTest {
     fun `a raise compiles and hands both values to the extractor`() {
         val program = loadWithSupport(raisingProgram())
         val output = program.capturingOutput {
-            program.invoke("com.github.kusa233.neko.sample.Main", "main")
+            program.invoke()
         }
         // `raise 1 * 10, 10` — the values cross the frame boundary by being thrown, and arrive in
         // the order the `raise` named them.
@@ -429,7 +429,7 @@ class EmitTest {
             ),
         )
         val output = program.capturingOutput {
-            program.invoke("com.github.kusa233.neko.sample.Main", "main")
+            program.invoke()
         }
         assertEquals("20\n10\n", output, "the raise should pass through the wrapper untouched")
     }
@@ -663,7 +663,7 @@ class EmitTest {
             ),
         )
         val output = program.capturingOutput {
-            program.invoke("com.github.kusa233.neko.sample.Main", "main")
+            program.invoke()
         }
         assertEquals("105\n", output, "the extractor should see the enclosing method's variable")
     }
