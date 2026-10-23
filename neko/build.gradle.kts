@@ -98,6 +98,8 @@ val nekoPrograms: Map<String, String> = mapOf(
     "ExceptionSample" to "com.github.kusa233.neko.sample.ExceptionSample",
     "NullableSample" to "com.github.kusa233.neko.sample.NullableSample",
     "NyaSample" to "com.github.kusa233.neko.sample.NyaSample",
+    "EnumSample" to "com.github.kusa233.neko.sample.EnumSample",
+    "PurrSample" to "com.github.kusa233.neko.sample.PurrSample",
 )
 
 /**

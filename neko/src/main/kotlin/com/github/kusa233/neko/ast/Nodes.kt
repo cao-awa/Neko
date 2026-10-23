@@ -179,10 +179,46 @@ class ClassDeclaration(
      * `equals` and `hashCode` are derived from its fields and emitted as bytecode.
      */
     val isMeow: Boolean = false,
+    /**
+     * `true` when the declaration was written `miao class`, i.e. it is an enum.
+     *
+     * The entries in [entries] are desugared by the analyzer into `static final` fields of this
+     * class' own type, each initialized in `<clinit>` from a private constructor the compiler emits.
+     * Nothing downstream needs a second notion of "constant": an entry is an ordinary static field
+     * that happens to have been created by the compiler rather than by a reader's initializer.
+     */
+    val isMiao: Boolean = false,
+    /**
+     * The constants of a `miao class`, in declaration order, and empty for every other declaration.
+     *
+     * The order is what `ordinal()` reports, so it is the source order and is never sorted.
+     */
+    val entries: List<EnumEntry> = emptyList(),
     override val span: Span,
 ) : Node {
     /** Filled in by the analyzer. */
     var symbol: ClassSymbol? = null
+}
+
+/**
+ * One constant of a `miao class`, e.g. `RED` or `RED(1)` in `miao class Color { RED, GREEN }`.
+ *
+ * The constructor arguments are expressions rather than values because they are analyzed in the
+ * enum's own scope: `miao class Code { OK(STATUS_OK) }` reads a `static` field of a class the
+ * program declares, and that name has to resolve like any other.
+ *
+ * The entry's own name is what `name()` reports and what `valueOf` matches, and the compiler uses
+ * that same string as the constant's field name, so the two can never disagree.
+ */
+class EnumEntry(
+    val name: String,
+    val nameSpan: Span,
+    /** The arguments written after the name, empty when it was written bare. */
+    val arguments: List<Expression> = emptyList(),
+    override val span: Span,
+) : Node {
+    /** Filled in by the analyzer: the entry as a static field of the enclosing enum. */
+    var symbol: FieldSymbol? = null
 }
 
 /**
@@ -516,6 +552,59 @@ class NyaExpression(
      * Code generation reads it to know what to unbox the result into.
      */
     var yieldedType: NekoType? = null
+}
+
+/**
+ * `purr { ... }` — run a block with a lock held.
+ *
+ * The lock is a `java.util.concurrent.locks.StampedLock`, which is never reentrant: taking the same
+ * lock twice on one thread deadlocks. That is why [lock] is part of the node's identity for the
+ * analyzer to check nesting with, and why the release cannot be left to the block's own code — it
+ * has to happen on every way out, including a `return` and a `raise`.
+ *
+ * Three things are chosen at the keyword:
+ *
+ *  - **Which lock.** [lock] is [PurrLock.INSTANCE] for `purr { ... }`, which is one lock per object —
+ *    `synchronized (this)` — and [PurrLock.CLASS] for `purr class { ... }`, which is one lock per
+ *    class, `synchronized (Cls.class)`. An instance lock needs a `this`, so a static function can
+ *    only use the class one; the analyzer says so.
+ *  - **Read or write.** [mode] is [PurrMode.WRITE] unless the block opened with `read`, in which case
+ *    several threads may be inside at once. A read lock is exclusive against writers only, which is
+ *    the whole reason to reach for `StampedLock` instead of `ReentrantLock` — the latter has no
+ *    shared mode, so a read-mostly field guarded by it loses the concurrency it was written for.
+ *  - **Nesting.** A `purr` inside a `purr` on the *same* lock would deadlock, since the outer one
+ *    already holds it; on a *different* lock it is fine. The analyzer reports the first and allows
+ *    the second.
+ *
+ * The block is a `BlockStatement` rather than a list because it is a scope: a local declared inside
+ * it is not visible after it, exactly as with `if`. Nothing is worth a value — a critical section that
+ * `return`s has already left the building, and the same reasoning applies to `yield`.
+ */
+class PurrStatement(
+    /** Span of the `purr` keyword. */
+    val keywordSpan: Span,
+    val lock: PurrLock,
+    val mode: PurrMode,
+    val body: BlockStatement,
+    override val span: Span,
+) : Statement
+
+/** Which `StampedLock` a `purr` block holds — see [PurrStatement.lock]. */
+enum class PurrLock {
+    /** One lock per object: `purr { ... }`. */
+    INSTANCE,
+
+    /** One lock per class: `purr class { ... }`. */
+    CLASS,
+}
+
+/** How a `purr` block holds its lock — see [PurrStatement.mode]. */
+enum class PurrMode {
+    /** Exclusive, against readers and other writers: the default. */
+    WRITE,
+
+    /** Shared, against other readers but not writers: `purr read { ... }`. */
+    READ,
 }
 
 /**

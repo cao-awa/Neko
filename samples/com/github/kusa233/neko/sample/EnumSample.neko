@@ -1,0 +1,78 @@
+locate com.github.kusa233.neko.sample
+
+/**
+ * `miao class` — a fixed set of named values, each an object the compiler creates.
+ *
+ * Two things have to be true of the answer at run time, and only one of them is visible in the source:
+ * the constants exist and can be compared, and the class really *is* a `java.lang.Enum`. The second is
+ * why `name()` and `ordinal()` work, why `println` shows the constant's own name rather than an object
+ * identity, and why `valueOf` can find a constant from a string. None of that is written here — it all
+ * comes from `java.lang.Enum`, which the generated class extends.
+ *
+ * A constant may carry values, in which case the fields are written in the header exactly as they are
+ * for a `meow class`, and each constant supplies its own.
+ */
+
+// The plainest form: a list of names, nothing else.
+miao class Color {
+    RED,
+    GREEN,
+    BLUE
+}
+
+// With values. `val status: int` in the header becomes a constructor parameter, so every constant has
+// to give one; the field is then read through the instance like any other.
+miao class Code(val status: int, val label: string) {
+    OK(200, "fine"),
+    GONE(410, "gone")
+}
+
+class EnumSample() {
+    static {
+        fun main(args: string[]) {
+            simple()
+            payloads()
+            lookup()
+        }
+        fun simple() {
+            chosen: Color = Color.GREEN
+            println(chosen.name())           // Should print 'GREEN'
+            println(chosen.ordinal())        // Should print '1' — the position in the declaration
+            println(chosen)                  // Should print 'GREEN': Enum's toString is the name
+            println(chosen == Color.GREEN)   // Should print 'true': one instance per constant
+            println(chosen == Color.RED)     // Should print 'false'
+        }
+
+        // What a constant carries is ordinary state, read the way any field is.
+        fun payloads() {
+            println(Code.OK.status)          // Should print '200'
+            println(Code.GONE.label)         // Should print 'gone'
+            println(Code.GONE.ordinal())     // Should print '1'
+        }
+
+        // `values()` answers every constant in order; `valueOf` finds one by the name it was written
+        // with. Both are static, so they are reached through the enum's own name.
+        fun lookup() {
+            all: Code[] = Code.values()
+            println(all[0].label)            // Should print 'fine'
+            println(all[1].label)            // Should print 'gone'
+
+            found: Code = Code.valueOf("GONE")
+            println(found == Code.GONE)      // Should print 'true'
+
+            // Error to compile: an enum names its own constants, and these are the only ones.
+            // miao class Empty { }
+            //
+            // Error to compile: the compiler creates the constants, so there is no second way in.
+            // miao class Other(val x: int) { A(1)
+            //     constructor(x: int) { this.x = x }
+            // }
+            //
+            // Error to compile: `java.lang.Enum` declares these final, so an override is a load-time
+            // VerifyError rather than a program.
+            // miao class Third { A
+            //     fun name(): string { return "no" }
+            // }
+        }
+    }
+}

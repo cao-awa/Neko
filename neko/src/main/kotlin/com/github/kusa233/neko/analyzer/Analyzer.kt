@@ -66,6 +66,17 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private var currentExtractor: ExtractorTry? = null
 
     /**
+     * The locks held by the `purr` blocks currently open around the statement being analysed.
+     *
+     * A `StampedLock` is not reentrant, so taking one this thread already holds is a deadlock rather
+     * than an error — which is why nesting has to be tracked here rather than left to run time. It is
+     * a stack because the blocks nest, and it is cleared when a method body starts because a lambda's
+     * body is a different method: a `purr` outside a lambda holds a lock the lambda's own body cannot
+     * see, and the reverse.
+     */
+    private val heldPurrLocks = ArrayDeque<PurrLock>()
+
+    /**
      * Non-null while analysing the two blocks of a `nya` that is used as a value.
      *
      * Only the value form sets this. In the two forms that are worth nothing — bare, and with a lone
@@ -225,6 +236,19 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 continue
             }
 
+            // An enum's constants are instances of the enum itself, so an interface — which is never
+            // instantiated — cannot be one. Reported here for the same reason as the `meow` case: the
+            // symbol below would be a class that cannot exist.
+            if (declaration.isMiao && declaration.isInterface) {
+                diagnostics.error(
+                    "'miao' cannot declare an interface: an enum's constants are instances of the " +
+                        "enum, and an interface has none to create; write 'interface " +
+                        "${declaration.name} { }'",
+                    declaration.nameSpan,
+                )
+                continue
+            }
+
             val previous = classes[declaration.name]
             if (previous != null) {
                 diagnostics.error(
@@ -248,6 +272,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 packagePrefix = packagePrefix,
                 isInterface = declaration.isInterface,
                 isMeow = declaration.isMeow,
+                isMiao = declaration.isMiao,
                 typeParameters = declaration.typeParameters,
             )
             classes[declaration.name] = symbol
@@ -271,6 +296,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             val classSymbol = classes[declaration.name] ?: continue
             currentClass = classSymbol
             declareFields(declaration, classSymbol)
+            if (declaration.isMiao) declareEnumEntries(declaration, classSymbol)
             declareFunctions(declaration, classSymbol)
             declareConstructors(declaration, classSymbol)
             currentClass = null
@@ -288,8 +314,31 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * hierarchy.
      */
     private fun resolveSupertypes(declaration: ClassDeclaration, classSymbol: ClassSymbol) {
+        // An enum always extends `java.lang.Enum`, which is what gives it `name()`, `ordinal()`,
+        // `compareTo` and the `values`-friendly behaviour the JVM expects of `ACC_ENUM`. The reader
+        // never writes it — `miao class` is the whole declaration — so it is recorded here, exactly
+        // as `Object` is implicitly the superclass of a class that names none.
+        //
+        // A named superclass is refused rather than merged: `Enum` is one class, and a second one
+        // would leave the enum's `name()` and its constants' identity answering different questions.
+        if (declaration.isMiao) {
+            if (declaration.superclass != null) {
+                diagnostics.error(
+                    "enum '${declaration.name}' cannot extend '${declaration.superclass.name}': every " +
+                        "enum extends java.lang.Enum, which is what makes its constants comparable " +
+                        "and nameable",
+                    declaration.superclass.nameSpan,
+                )
+            }
+            val enumType = ClassType("java/lang/Enum", "Enum")
+            classSymbol.superclass = enumType
+            // Left null: `java.lang.Enum` is not declared in this compilation, so there is no member
+            // table to walk. Its members are found through the platform instead.
+            classSymbol.superclassSymbol = null
+        }
+
         val superclass = declaration.superclass
-        if (superclass != null) {
+        if (superclass != null && !declaration.isMiao) {
             val type = resolveType(
                 NamedTypeReference(superclass.name, superclass.nameSpan, superclass.span),
             )
@@ -400,6 +449,99 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         }
     }
 
+    /**
+     * Declares the constants of a `miao class` as `static final` fields of the enum's own type.
+     *
+     * Nothing new is invented for them: an entry becomes an ordinary field symbol, so `Color.RED`
+     * resolves through the member lookup that already exists, and code generation reads it with the
+     * `GETSTATIC` it already emits. What is new is only where the field's *value* comes from — the
+     * compiler writes it in `<clinit>` — and that is code generation's business.
+     *
+     * The header fields are declared before this runs, which is what lets the duplicate check below
+     * catch `miao class C(val x: int) { x }`: the constant would need the same field name as the
+     * parameter it fills.
+     */
+    private fun declareEnumEntries(declaration: ClassDeclaration, classSymbol: ClassSymbol) {
+        if (declaration.entries.isEmpty()) {
+            diagnostics.error(
+                "'${declaration.name}' is an enum, so it must name at least one constant; write " +
+                    "'miao class ${declaration.name} { FIRST }'",
+                declaration.nameSpan,
+            )
+            return
+        }
+
+        val enumType = ClassType(classSymbol.jvmInternalName, classSymbol.name)
+        // The parameter types the constants are called with, which is the header's fields in order.
+        // Every constant must supply them, because they are one constructor's parameters.
+        val parameterTypes = declaration.fields
+            .filterNot { it.isStatic }
+            .map { it.resolvedType ?: ErrorType }
+
+        for (entry in declaration.entries) {
+            val existing = classSymbol.fields[entry.name]
+            if (existing != null) {
+                diagnostics.error(
+                    "constant '${entry.name}' is already declared in enum '${declaration.name}'",
+                    entry.nameSpan,
+                    notes = listOf(
+                        diagnostics.note(
+                            "previous declaration of '${entry.name}' is here",
+                            existing.span,
+                        ),
+                    ),
+                )
+                continue
+            }
+
+            // The constant is an instance of its own enum, so its type is the enum itself — which is
+            // what makes `Color.RED` assignable to a `Color` and nothing else.
+            val symbol = FieldSymbol(
+                name = entry.name,
+                type = enumType,
+                span = entry.nameSpan,
+                kind = VariableKind.VAL,
+                modifier = "public",
+                enclosingClass = classSymbol,
+                isStatic = true,
+            )
+            classSymbol.fields[entry.name] = symbol
+            entry.symbol = symbol
+
+            // The arguments are analyzed in the enum's own scope, after all of its fields exist, so a
+            // constant may be built from a `static` field: `miao class Code { OK(MIN) }`. A scope has
+            // to be pushed for that, because a bare name resolves through the scope stack rather than
+            // through `currentClass` — this runs during signature resolution, where no class scope is
+            // open yet.
+            val enclosingClass = currentClass
+            currentClass = classSymbol
+            pushScope(identifier = classSymbol)
+            for (field in classSymbol.fields.values) scopes.last().symbols[field.name] = field
+            val analyzed = entry.arguments.map { analyzeExpression(it) }
+            popScope()
+            currentClass = enclosingClass
+            if (analyzed.size != parameterTypes.size) {
+                diagnostics.error(
+                    "constant '${entry.name}' takes ${parameterTypes.size} " +
+                        "${if (parameterTypes.size == 1) "argument" else "arguments"} but was given " +
+                        analyzed.size,
+                    entry.span,
+                )
+                continue
+            }
+            for ((index, actual) in analyzed.withIndex()) {
+                val expected = parameterTypes[index]
+                if (!isAssignable(actual, expected)) {
+                    diagnostics.error(
+                        "argument ${index + 1} of constant '${entry.name}' is " +
+                            "'${actual.displayName}' but '${expected.displayName}' was expected",
+                        entry.arguments[index].span,
+                    )
+                }
+            }
+        }
+    }
+
     private fun declareFunctions(declaration: ClassDeclaration, classSymbol: ClassSymbol) {
         for (function in declaration.functions) {
             val parameterTypes = function.parameters.map { resolveType(it.declaredType) }
@@ -421,6 +563,19 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             }
 
             checkEmitDeclaration(function, returnType)
+
+            // `java.lang.Enum` declares `name()` and `ordinal()` final, so an enum that wrote its own
+            // would produce a class file the JVM refuses to load — `VerifyError: class overrides final
+            // method`. Rejecting it here turns a crash at run time into a message at the declaration,
+            // which is also what keeps the constant's name and position authoritative.
+            if (declaration.isMiao && function.name in ENUM_FINAL_METHODS && !function.isStatic) {
+                diagnostics.error(
+                    "enum '${declaration.name}' cannot declare '${function.name}': java.lang.Enum " +
+                        "declares it final, because a constant's name and position are what the enum " +
+                        "is",
+                    function.nameSpan,
+                )
+            }
 
             if (function.isAbstract && !declaration.isInterface) {
                 diagnostics.error(
@@ -463,6 +618,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         }
 
         if (declaration.isMeow) declareDerivedFunctions(declaration, classSymbol)
+        if (declaration.isMiao) declareEnumFunctions(declaration, classSymbol)
     }
 
     /**
@@ -525,6 +681,92 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     }
 
     /**
+     * Declares `values()` and `valueOf(string)` on a `miao class`.
+     *
+     * Both are what `java.lang.Enum` gives a Java enum, and both are emitted as bytecode for the same
+     * reason the `meow` trio is: neither has a body Neko could write. `values()` has to answer an
+     * array of a type the source never names, and `valueOf` has to compare a `string` against every
+     * constant and throw on a miss.
+     *
+     * Only the *signatures* are contributed here. Without them, `Color.values()` would be "Neko has
+     * no member named 'values'" even though the class file has the method.
+     *
+     * `name()`, `ordinal()` and `compareTo` are declared here too, even though the JVM inherits them
+     * from `java.lang.Enum`. Member lookup reads the symbol table of a class declared in this
+     * compilation, and `Enum` is not — see [classOf] — so without a signature `Color.RED.name()`
+     * would be "Color has no member named 'name'". They are not emitted: the inherited methods
+     * already do exactly the right thing, and the constants are real `Enum` instances.
+     */
+    private fun declareEnumFunctions(declaration: ClassDeclaration, classSymbol: ClassSymbol) {
+        val enumType = ClassType(classSymbol.jvmInternalName, classSymbol.name)
+
+        val derived = listOf(
+            FunctionSymbol(
+                name = "values",
+                span = declaration.nameSpan,
+                parameterTypes = emptyList(),
+                returnType = ArrayType(enumType),
+                enclosingClass = classSymbol,
+                // `declaration = null` marks a function the compiler emits rather than one the
+                // reader wrote: there is no Neko body to generate from.
+                declaration = null,
+                isStatic = true,
+            ),
+            FunctionSymbol(
+                name = "valueOf",
+                span = declaration.nameSpan,
+                parameterTypes = listOf(StringType),
+                returnType = enumType,
+                enclosingClass = classSymbol,
+                declaration = null,
+                isStatic = true,
+            ),
+            // Inherited rather than emitted: `Enum` already stores the name and the position, and
+            // the constants are built with them in `<clinit>`. `inheritedFrom` is what makes the call
+            // name `java/lang/Enum` rather than this enum, in whose class file the method does not
+            // exist.
+            FunctionSymbol(
+                name = "name",
+                span = declaration.nameSpan,
+                parameterTypes = emptyList(),
+                returnType = StringType,
+                enclosingClass = classSymbol,
+                declaration = null,
+                isStatic = false,
+                inheritedFrom = "java/lang/Enum",
+            ),
+            FunctionSymbol(
+                name = "ordinal",
+                span = declaration.nameSpan,
+                parameterTypes = emptyList(),
+                returnType = IntType,
+                enclosingClass = classSymbol,
+                declaration = null,
+                isStatic = false,
+                inheritedFrom = "java/lang/Enum",
+            ),
+            FunctionSymbol(
+                name = "compareTo",
+                span = declaration.nameSpan,
+                // `Enum.compareTo` takes an `Enum`, not this enum: a `Color` argument is accepted
+                // because it *is* one, and the erasure is what the class file actually declares.
+                parameterTypes = listOf(ClassType("java/lang/Enum", "Enum")),
+                returnType = IntType,
+                enclosingClass = classSymbol,
+                declaration = null,
+                isStatic = false,
+                inheritedFrom = "java/lang/Enum",
+            ),
+        ).filterNot { symbol ->
+            classSymbol.functions[symbol.name].orEmpty().any { it.parameterTypes == symbol.parameterTypes }
+        }
+
+        for (symbol in derived) {
+            classSymbol.functions.getOrPut(symbol.name) { mutableListOf() } += symbol
+        }
+    }
+
+    /**
      * Declares a class' constructors, keyed by parameter count.
      *
      * A class with no constructor written still gets one, so `Cls()` always works: the code generator
@@ -536,6 +778,20 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             diagnostics.error(
                 "interface '${declaration.name}' cannot declare a constructor: an interface is " +
                     "never instantiated",
+                declaration.constructors.first().span,
+            )
+        }
+
+        // An enum's only constructor is the one the compiler emits, taking the header's fields and
+        // handing them to `Enum` along with the constant's name and position. A constructor written
+        // in the body would be a second way to build a constant — which is the one thing an enum
+        // exists to rule out — and it could not call `Enum.<init>` anyway, since Neko has no
+        // `super(...)` syntax.
+        if (declaration.isMiao && declaration.constructors.isNotEmpty()) {
+            diagnostics.error(
+                "enum '${declaration.name}' cannot declare a constructor: an enum's constants are the " +
+                    "only instances it has, and the compiler creates them from the constants listed " +
+                    "in the declaration",
                 declaration.constructors.first().span,
             )
         }
@@ -658,6 +914,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // A body starts from nothing known: facts about `val` fields do not carry in from whatever
         // was analysed before this constructor.
         resetNarrowings()
+        heldPurrLocks.clear()
         pushScope(identifier = constructor)
 
         val parameterSymbols = mutableListOf<LocalSymbol>()
@@ -744,6 +1001,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // Only a non-static member has an instance to reach its instance members through.
         implicitThisClass = if (symbol.isStatic) null else classSymbol
         forwardsRaise = false
+        // A body starts holding nothing: whatever `purr` blocks surrounded the *declaration* are not
+        // around the code that runs when it is called.
+        heldPurrLocks.clear()
         // A body starts from nothing known. Pending facts about `val` fields belong to whatever was
         // analysed before this method, and none of them was proved here.
         resetNarrowings()
@@ -857,9 +1117,56 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             is WhenStatement -> analyzeWhen(statement)
             is RaiseStatement -> analyzeRaise(statement)
             is TryStatement -> analyzeTry(statement)
+            is PurrStatement -> analyzePurr(statement)
             is IndexAssignmentStatement -> analyzeIndexAssignment(statement)
         }
     }
+
+    /**
+     * `purr { ... }` — checks that the lock it names exists on this code path, and that the block does
+     * not take a lock this thread already holds.
+     *
+     * Two checks, both about a deadlock rather than about a type:
+     *
+     *  * An **instance** lock is a lock on `this`, so it only exists where `this` does. A `static`
+     *    function has no instance, which is why `purr { ... }` there is refused and the reader is told
+     *    to write `purr class { ... }` — the class lock needs no instance and is the one they meant.
+     *  * `StampedLock` is **not reentrant** — in either mode. Taking a lock this thread already holds
+     *    blocks forever with no error, no timeout and no stack to look at, so it is worth catching at
+     *    compile time. The *mode* is deliberately not part of the identity: a `read` inside a `write`
+     *    on one lock, a `write` inside a `read`, and a `read` inside a `read` are all deadlocks, since
+     *    the JVM has no owner to notice the same thread asking twice. Only a *different* lock nests
+     *    safely, which is what makes `purr class { purr { } }` the way to wrap a per-object guard in a
+     *    class-wide one. Nesting is tracked through [heldPurrLocks], which has to be per-method
+     *    because a lambda's body is a different method that inherits nothing.
+     */
+    private fun analyzePurr(statement: PurrStatement) {
+        if (statement.lock == PurrLock.INSTANCE && implicitThisClass == null) {
+            diagnostics.error(
+                "this 'purr' holds the lock of 'this', but this code has no instance: a 'static' " +
+                    "function belongs to the class rather than to an object, so write " +
+                    "'purr class { ... }' to hold the class lock instead",
+                statement.keywordSpan,
+            )
+        }
+
+        if (heldPurrLocks.contains(statement.lock)) {
+            diagnostics.error(
+                "this 'purr' takes the ${describePurrLock(statement.lock)} lock that is already held " +
+                    "around it, and a StampedLock cannot be taken twice by one thread — the program " +
+                    "would block forever",
+                statement.keywordSpan,
+            )
+        }
+
+        heldPurrLocks.addLast(statement.lock)
+        analyzeBlock(statement.body)
+        heldPurrLocks.removeLast()
+    }
+
+    /** How a [PurrStatement]'s lock is named in a diagnostic. */
+    private fun describePurrLock(lock: PurrLock): String =
+        if (lock == PurrLock.CLASS) "class" else "instance"
 
     /** `array[index] = value` */
     private fun analyzeIndexAssignment(statement: IndexAssignmentStatement) {
@@ -3108,6 +3415,13 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // A lambda body runs on a different object, so it has no `this`: naming an instance member
         // bare would silently read the wrong object, so the implicit receiver is withdrawn here.
         val outerImplicitThis = implicitThisClass
+        // A lambda's body becomes a method of its own, so the locks the enclosing `purr` blocks hold
+        // are not held *inside* it as far as nesting goes: taking the same lock there is a real
+        // deadlock at run time, but nothing here can prove the lambda is ever called, and a nested
+        // `purr` of the same lock within a lambda body is still the reader's mistake to make. What
+        // matters is that the enclosing stack is not carried in and then popped twice.
+        val enclosingPurrLocks = heldPurrLocks.toList()
+        heldPurrLocks.clear()
         currentLambda = state
         currentNya = null
         // `return` inside a lambda is an error (reported by `analyzeReturn`), so the enclosing
@@ -3154,6 +3468,8 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         currentFunction = outerFunction
         currentNya = outerNya
         implicitThisClass = outerImplicitThis
+        heldPurrLocks.clear()
+        heldPurrLocks.addAll(enclosingPurrLocks)
 
         val returnType = state.expectedReturnType ?: when {
             expectedFunction != null -> expectedFunction.returnType
@@ -3893,6 +4209,15 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
          * `EmitExtractor` is what a `try` extractor implements.
          */
         val STANDARD_LIBRARY_TYPES = listOf("EarlyEmitException", "EmitExtractor")
+
+        /**
+         * The methods `java.lang.Enum` declares `final`, which an enum therefore cannot override.
+         *
+         * The JVM refuses to load a class that overrides a final method, so a `miao class` declaring
+         * one of these would compile into a `VerifyError` at run time. `toString` is deliberately not
+         * in the list: `Enum` leaves it open, and an enum that overrides it is legal.
+         */
+        val ENUM_FINAL_METHODS = setOf("name", "ordinal", "equals", "hashCode", "compareTo")
     }
 }
 
@@ -3980,6 +4305,9 @@ private fun Statement.alwaysReturns(): Boolean = when (this) {
     is IfStatement -> elseBranch != null && thenBranch.alwaysReturns() && elseBranch.alwaysReturns()
     is WhenStatement -> hasElseBranch && branches.all { it.body.alwaysReturns() }
     is WhileStatement -> false
+    // A `purr` block always runs its body, so it can only fall through if the body can. (A `try` is
+    // different: its extractor may not run at all.)
+    is PurrStatement -> body.alwaysReturns()
     // A `try` returns only if every path out of it does, which is more than a conservative test can
     // tell; reporting "maybe falls through" is the safe answer.
     is YieldStatement, is VariableDeclarationStatement, is AssignmentStatement,
@@ -3996,6 +4324,9 @@ private fun Statement.alwaysReturns(): Boolean = when (this) {
 private fun Statement.terminatesFlow(): Boolean = when (this) {
     is ReturnStatement, is RaiseStatement -> true
     is BlockStatement -> statements.any { it.terminatesFlow() }
+    // A `purr` block runs unconditionally, so a `return` or `raise` inside it always terminates the
+    // method — the unlock the compiler inserts does not change where control ends up.
+    is PurrStatement -> body.terminatesFlow()
     is IfStatement -> elseBranch != null && thenBranch.terminatesFlow() && elseBranch.terminatesFlow()
     is WhenStatement -> hasElseBranch && branches.all { it.body.terminatesFlow() }
     else -> false
@@ -4008,6 +4339,7 @@ private fun Statement.describeTerminator(): String = when (this) {
     is BlockStatement -> "block"
     is IfStatement -> "'if'"
     is WhenStatement -> "'when'"
+    is PurrStatement -> "'purr'"
     else -> "statement"
 }
 
@@ -4025,6 +4357,9 @@ private fun Statement.containsRaise(): Boolean = when (this) {
     // A `raise` in a `try` body belongs to that body's own function; the values it carries are
     // handed to this statement's extractor instead.
     is TryStatement -> extractorBody.statements.any { it.containsRaise() }
+    // A `raise` inside a `purr` block belongs to the enclosing function: the block is emitted inline,
+    // and the generated release runs on the way out of the throw rather than absorbing it.
+    is PurrStatement -> body.statements.any { it.containsRaise() }
     // A `raise` written inside a `nya`'s blocks belongs to the function those blocks are emitted in,
     // which is the enclosing one — so it counts here even though the `nya` itself cannot raise.
     is ExpressionStatement -> expression.containsRaise()

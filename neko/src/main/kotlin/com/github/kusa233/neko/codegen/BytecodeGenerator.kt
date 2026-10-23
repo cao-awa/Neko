@@ -196,10 +196,14 @@ class BytecodeGenerator(
         // must not name a superclass. A class is `super`, and extends whatever the source named,
         // defaulting to `Object`. It is `final` only when nothing extends it, because the JVM
         // refuses to load a subclass of a final class.
-        val superName = if (declaration.isInterface) {
-            "java/lang/Object"
-        } else {
-            symbol.superclass?.internalName ?: "java/lang/Object"
+        //
+        // An enum is `final` for a stronger reason: its constants are the whole of its instances, so
+        // a subclass would be a value the enum never named. `ACC_ENUM` is what tells the JVM that, and
+        // it is also what makes `Enum.valueOf` and `values()` well behaved.
+        val superName = when {
+            declaration.isInterface -> "java/lang/Object"
+            declaration.isMiao -> "java/lang/Enum"
+            else -> symbol.superclass?.internalName ?: "java/lang/Object"
         }
         val interfaceNames = symbol.interfaces
             .map { it.internalName }
@@ -208,6 +212,7 @@ class BytecodeGenerator(
 
         val access = when {
             declaration.isInterface -> ACC_PUBLIC or ACC_ABSTRACT or ACC_INTERFACE
+            declaration.isMiao -> ACC_PUBLIC or ACC_FINAL or ACC_SUPER or ACC_ENUM
             isExtended(symbol) -> ACC_PUBLIC or ACC_SUPER
             else -> ACC_PUBLIC or ACC_FINAL or ACC_SUPER
         }
@@ -240,13 +245,34 @@ class BytecodeGenerator(
             writer.visitField(access, field.name, descriptor, null, null).visitEnd()
         }
 
+        // An enum's constants are fields of the enum's own type, `public static final`, and each
+        // carries `ACC_ENUM` so a reflective reader sees them as constants rather than as ordinary
+        // static fields. They are not in `declaration.fields` — the reader wrote a list of names, not
+        // field declarations — so they are emitted from the entries.
+        if (declaration.isMiao) emitEnumEntryFields(writer, declaration, symbol)
+
+        // A `purr` block needs a `StampedLock` to hold, and the source cannot declare one: it lives in
+        // `java.util.concurrent.locks`, which Neko cannot name. The field is created here, only for the
+        // locks the class actually uses.
+        emitPurrLockFields(writer, declaration, symbol)
+
         val staticFields = declaration.fields.filter { it.isStatic }
         val instanceFields = declaration.fields.filterNot { it.isStatic }
-        emitStaticInitializer(writer, staticFields, symbol)
+        // An enum's `<clinit>` has to do more than run field initializers — it builds every constant,
+        // and the array `values()` answers — so it is written on its own and replaces the generic
+        // one. Both are static-initialisation work, but only the enum one has to create instances.
+        if (declaration.isMiao) {
+            emitEnumInitializer(writer, declaration, symbol, instanceFields)
+        } else {
+            emitStaticInitializer(writer, staticFields, symbol, declaration)
+        }
         // Every class gets a constructor, because an instance member is only reachable through an
         // object, and this is where that object's own field initializers run. An interface is never
         // instantiated, so it gets none —the JVM rejects one that has a constructor.
-        if (!declaration.isInterface) {
+        //
+        // An enum's constructor is emitted by [emitEnumInitializer], because it is a private
+        // constructor taking the header fields plus the name and position `Enum` is handed.
+        if (!declaration.isInterface && !declaration.isMiao) {
             emitConstructors(writer, declaration, instanceFields, symbol)
         }
 
@@ -254,6 +280,10 @@ class BytecodeGenerator(
             val functionSymbol = function.symbol ?: continue
             emitFunction(writer, function, functionSymbol, internalName)
         }
+
+        // `values()` and `valueOf(string)` are what `java.lang.Enum` gives a Java enum, and what a
+        // reader of a `miao class` expects to find on it.
+        if (declaration.isMiao) emitEnumMethods(writer, declaration, symbol)
 
         // A `meow class` derives `equals`, `hashCode` and `toString` from its fields. They are emitted
         // as raw bytecode rather than lowered from a Neko body because the language cannot express any
@@ -292,9 +322,11 @@ class BytecodeGenerator(
         writer: ClassWriter,
         fields: List<FieldDeclaration>,
         symbol: ClassSymbol,
+        declaration: ClassDeclaration,
     ) {
         val initialized = fields.filter { it.initializer != null && it.symbol != null }
-        if (initialized.isEmpty()) return
+        val needsClassLock = PurrLock.CLASS in locksUsedBy(declaration)
+        if (initialized.isEmpty() && !needsClassLock) return
 
         val mv = writer.visitMethod(ACC_STATIC, "<clinit>", "()V", null, null)
         mv.visitCode()
@@ -305,6 +337,21 @@ class BytecodeGenerator(
             firstSlot = 0,
             static = true,
         )
+
+        // The class lock is built first, so a `static` initializer may use it — a `purr class` block is
+        // legal in a `static` function, and that function's body runs after this. Being first also
+        // means it is in place before any constant's arguments run in an enum's own `<clinit>`.
+        if (needsClassLock) {
+            mv.visitTypeInsn(NEW, STAMPED_LOCK_CLASS)
+            mv.visitInsn(DUP)
+            mv.visitMethodInsn(INVOKESPECIAL, STAMPED_LOCK_CLASS, "<init>", "()V", false)
+            mv.visitFieldInsn(
+                PUTSTATIC,
+                symbol.jvmInternalName,
+                purrLockFieldName(PurrLock.CLASS),
+                "L$STAMPED_LOCK_CLASS;",
+            )
+        }
 
         for (field in initialized) {
             val fieldSymbol = field.symbol!!
@@ -323,6 +370,365 @@ class BytecodeGenerator(
         mv.visitInsn(RETURN)
         mv.visitMaxs(0, 0)
         mv.visitEnd()
+    }
+
+    // ------------------------------------------------------------------- purr
+
+    /**
+     * The `StampedLock` field name for [lockType].
+     *
+     * The two locks live in separate fields because they are separate locks: one per object, one per
+     * class. One field could not serve both, since the class lock has to be `static` to be shared.
+     *
+     * The `$` prefix marks them as compiler-created, the way `$VALUES` does for an enum, so a reader
+     * of the class file can tell they were not written in the source.
+     */
+    private fun purrLockFieldName(lockType: PurrLock): String =
+        if (lockType == PurrLock.CLASS) "\$classLock" else "\$lock"
+
+    /**
+     * Emits the `StampedLock` fields a class' `purr` blocks need.
+     *
+     * A field exists only when a block uses it: a class with no `purr` gets no lock, and one that only
+     * guards instance state gets no class lock. Adding a `StampedLock` to every class would cost an
+     * allocation per object for a feature most classes never use.
+     *
+     * The naming and the reason they are two fields is in [purrLockFieldName]. Initialization happens
+     * elsewhere — the instance one in the constructor and the class one in `<clinit>` — because
+     * `StampedLock` lives in `java.util.concurrent.locks`, which a Neko source file cannot name, so
+     * neither could be written as a field initializer.
+     */
+    private fun emitPurrLockFields(
+        writer: ClassWriter,
+        declaration: ClassDeclaration,
+        symbol: ClassSymbol,
+    ) {
+        for (lockType in locksUsedBy(declaration)) {
+            val access = ACC_PRIVATE or ACC_FINAL or
+                if (lockType == PurrLock.CLASS) ACC_STATIC else 0
+            writer.visitField(access, purrLockFieldName(lockType), "L$STAMPED_LOCK_CLASS;", null, null)
+                .visitEnd()
+        }
+    }
+
+    /**
+     * Which locks [declaration] needs, from the `purr` blocks written anywhere in its bodies.
+     *
+     * A block inside a lambda counts: the lambda's own class holds the block, but it reaches the field
+     * through the enclosing instance it captures, so the field has to exist on *this* class. A `purr`
+     * inside a `nya` block counts for a different reason — those blocks are emitted inline, in this
+     * very method.
+     */
+    private fun locksUsedBy(declaration: ClassDeclaration): Set<PurrLock> {
+        val used = linkedSetOf<PurrLock>()
+        for (function in declaration.functions) collectPurrLocks(function.body, used)
+        for (constructor in declaration.constructors) collectPurrLocks(constructor.body, used)
+        for (field in declaration.fields) collectPurrLocks(field.initializer, used)
+        return used
+    }
+
+    private fun collectPurrLocks(block: BlockStatement?, used: MutableSet<PurrLock>) {
+        block?.statements?.forEach { collectPurrLocks(it, used) }
+    }
+
+    private fun collectPurrLocks(statement: Statement?, used: MutableSet<PurrLock>) {
+        when (statement) {
+            null -> Unit
+            is PurrStatement -> {
+                used += statement.lock
+                collectPurrLocks(statement.body, used)
+            }
+
+            is BlockStatement -> statement.statements.forEach { collectPurrLocks(it, used) }
+            is IfStatement -> {
+                collectPurrLocks(statement.thenBranch, used)
+                collectPurrLocks(statement.elseBranch, used)
+            }
+
+            is WhileStatement -> collectPurrLocks(statement.body, used)
+            is WhenStatement -> statement.branches.forEach { collectPurrLocks(it.body, used) }
+            is TryStatement -> collectPurrLocks(statement.extractorBody, used)
+            is ExpressionStatement -> collectPurrLocks(statement.expression, used)
+            is VariableDeclarationStatement -> collectPurrLocks(statement.initializer, used)
+            is ReturnStatement -> collectPurrLocks(statement.value, used)
+            is YieldStatement -> collectPurrLocks(statement.value, used)
+            is AssignmentStatement -> collectPurrLocks(statement.value, used)
+            is IndexAssignmentStatement -> collectPurrLocks(statement.value, used)
+            is RaiseStatement -> statement.values.forEach { collectPurrLocks(it, used) }
+        }
+    }
+
+    private fun collectPurrLocks(expression: Expression?, used: MutableSet<PurrLock>) {
+        when (expression) {
+            null -> Unit
+            is LambdaExpression -> collectPurrLocks(expression.body, used)
+            is NyaExpression -> {
+                collectPurrLocks(expression.failureBlock, used)
+                collectPurrLocks(expression.elseBlock, used)
+            }
+
+            is TryExpression -> collectPurrLocks(expression.extractorBody, used)
+            is CallExpression -> {
+                collectPurrLocks(expression.callee, used)
+                expression.arguments.forEach { collectPurrLocks(it, used) }
+            }
+
+            is BinaryExpression -> {
+                collectPurrLocks(expression.left, used)
+                collectPurrLocks(expression.right, used)
+            }
+
+            is UnaryExpression -> collectPurrLocks(expression.operand, used)
+            is MemberAccessExpression -> collectPurrLocks(expression.receiver, used)
+            is IndexExpression -> {
+                collectPurrLocks(expression.array, used)
+                collectPurrLocks(expression.index, used)
+            }
+
+            is ChainedComparisonExpression -> expression.operands.forEach { collectPurrLocks(it, used) }
+            else -> Unit
+        }
+    }
+
+    // ------------------------------------------------------------------ an enum
+
+    /**
+     * One `public static final` field per constant, each carrying `ACC_ENUM`.
+     *
+     * `ACC_ENUM` is what the JVM and reflection read to tell a constant from an ordinary static
+     * field: `EnumSet`, `values()` and a `switch` over an enum all rely on it, and a field without it
+     * would still work as a value but would not *be* an enum constant to anything outside.
+     *
+     * The descriptor is the enum's own type, so `Color.RED` has type `Color` and fits nowhere else.
+     */
+    private fun emitEnumEntryFields(
+        writer: ClassWriter,
+        declaration: ClassDeclaration,
+        symbol: ClassSymbol,
+    ) {
+        val descriptor = "L${symbol.jvmInternalName};"
+        for (entry in declaration.entries) {
+            entry.symbol?.jvmDescriptor = descriptor
+            writer.visitField(
+                ACC_PUBLIC or ACC_STATIC or ACC_FINAL or ACC_ENUM,
+                entry.name,
+                descriptor,
+                null,
+                null,
+            ).visitEnd()
+        }
+    }
+
+    /**
+     * The enum's `<clinit>`, its one private constructor, and the `$VALUES` array behind `values()`.
+     *
+     * This is the shape `javac` emits for an enum, and it is not negotiable: `java.lang.Enum`'s
+     * constructor takes the constant's name and its position, the JVM refuses an enum class whose
+     * constants are not `ACC_ENUM` fields, and `values()` has to answer a fresh copy of the array so a
+     * caller cannot write through it into the enum.
+     *
+     * ```
+     *   <clinit>:
+     *     RED   = new Color("RED",   0)
+     *     GREEN = new Color("GREEN", 1)
+     *     $VALUES = [RED, GREEN]
+     *     $VALUES.getClass()  // nothing; the array is built with ANEWARRAY
+     * ```
+     *
+     * The constructor takes the header's fields, so a constant written `RED(1)` passes `1` through to
+     * the field the header declared, exactly as a `meow class` constructor parameter would.
+     */
+    private fun emitEnumInitializer(
+        writer: ClassWriter,
+        declaration: ClassDeclaration,
+        symbol: ClassSymbol,
+        instanceFields: List<FieldDeclaration>,
+    ) {
+        val internalName = symbol.jvmInternalName
+        val headerFields = instanceFields.filter { it.symbol != null }
+        val parameterTypes = headerFields.map { it.symbol!!.type }
+        val constructorDescriptor = buildString {
+            append('(')
+            for (type in parameterTypes) append(descriptorOf(type))
+            append("Ljava/lang/String;I)V")
+        }
+
+        // The constructor. `private`, because a constant is the only instance an enum may have: a
+        // public one would let a caller build a value the enum never named, which is exactly what the
+        // declaration exists to prevent.
+        val constructor = writer.visitMethod(ACC_PRIVATE, "<init>", constructorDescriptor, null, null)
+        constructor.visitCode()
+        constructor.visitVarInsn(ALOAD, 0)
+        constructor.visitVarInsn(ALOAD, parameterTypes.size + 1)
+        constructor.visitVarInsn(ILOAD, parameterTypes.size + 2)
+        constructor.visitMethodInsn(
+            INVOKESPECIAL,
+            "java/lang/Enum",
+            "<init>",
+            "(Ljava/lang/String;I)V",
+            false,
+        )
+        // The header's fields come from the parameters, which sit after `this` and before the name
+        // and position `Enum` takes.
+        var slot = 1
+        for (field in headerFields) {
+            val fieldSymbol = field.symbol!!
+            constructor.visitVarInsn(ALOAD, 0)
+            constructor.visitVarInsn(loadOpcode(fieldSymbol.type), slot)
+            constructor.visitFieldInsn(
+                PUTFIELD,
+                internalName,
+                fieldSymbol.name,
+                descriptorOf(fieldSymbol.type),
+            )
+            slot += BuiltinTypes.slotCountOf(fieldSymbol.type)
+        }
+        // A `purr` in one of the enum's own methods still needs its lock, and this private constructor
+        // is the only one an enum has — so the instance lock is built here, exactly as
+        // `emitConstructors` would do it.
+        emitInstancePurrLockInitializer(constructor, declaration)
+        constructor.visitInsn(RETURN)
+        constructor.visitMaxs(0, 0)
+        constructor.visitEnd()
+
+        // `private static final $VALUES: Color[]`, the array `values()` copies. It is not a field the
+        // reader wrote, and it is deliberately not public: `values()` hands out a clone so that
+        // writing into the answer cannot corrupt the enum.
+        writer.visitField(
+            ACC_PRIVATE or ACC_STATIC or ACC_FINAL or ACC_SYNTHETIC,
+            VALUES_FIELD,
+            "[L$internalName;",
+            null,
+            null,
+        ).visitEnd()
+
+        val mv = writer.visitMethod(ACC_STATIC, "<clinit>", "()V", null, null)
+        mv.visitCode()
+        val scope = MethodScope(
+            owner = internalName,
+            mv = mv,
+            lambdaIdentity = null,
+            firstSlot = 0,
+            static = true,
+        )
+
+        // A `purr class` block in one of the enum's methods takes the class lock, which is built here.
+        // It goes first, before the constant arguments run, so the lock is in place if one of them
+        // reaches a method that guards on it.
+        if (PurrLock.CLASS in locksUsedBy(declaration)) {
+            mv.visitTypeInsn(NEW, STAMPED_LOCK_CLASS)
+            mv.visitInsn(DUP)
+            mv.visitMethodInsn(INVOKESPECIAL, STAMPED_LOCK_CLASS, "<init>", "()V", false)
+            mv.visitFieldInsn(
+                PUTSTATIC,
+                internalName,
+                purrLockFieldName(PurrLock.CLASS),
+                "L$STAMPED_LOCK_CLASS;",
+            )
+        }
+
+        // Any `static` fields the reader declared are initialized first, in source order, so a
+        // constant's arguments can read them: `miao class Code { OK(MIN) }` needs `MIN` set.
+        for (field in declaration.fields.filter { it.isStatic && it.initializer != null && it.symbol != null }) {
+            val fieldSymbol = field.symbol!!
+            val initializer = field.initializer!!
+            markLine(mv, initializer)
+            emitExpression(initializer, scope)
+            emitStoreValue(initializer.type, fieldSymbol.type, mv)
+            mv.visitFieldInsn(PUTSTATIC, internalName, fieldSymbol.name, descriptorOf(fieldSymbol.type))
+        }
+
+        // Each constant: `RED = new Color("RED", 0, <its arguments>)`.
+        for ((ordinal, entry) in declaration.entries.withIndex()) {
+            val entrySymbol = entry.symbol ?: continue
+            markLine(mv, entry)
+
+            mv.visitTypeInsn(NEW, internalName)
+            mv.visitInsn(DUP)
+            // The arguments come first, then the name and position: the constructor is
+            // `(header fields..., String, int)`, so `Enum` is handed its two last.
+            for (argument in entry.arguments) emitExpression(argument, scope)
+            mv.visitLdcInsn(entry.name)
+            mv.visitLdcInsn(ordinal)
+            mv.visitMethodInsn(INVOKESPECIAL, internalName, "<init>", constructorDescriptor, false)
+            mv.visitFieldInsn(
+                PUTSTATIC,
+                internalName,
+                entrySymbol.name,
+                "L$internalName;",
+            )
+        }
+
+        // `$VALUES = [RED, GREEN, ...]`, in declaration order, which is what `ordinal()` agrees with.
+        mv.visitLdcInsn(declaration.entries.size)
+        mv.visitTypeInsn(ANEWARRAY, internalName)
+        for ((ordinal, entry) in declaration.entries.withIndex()) {
+            val entrySymbol = entry.symbol ?: continue
+            mv.visitInsn(DUP)
+            mv.visitLdcInsn(ordinal)
+            mv.visitFieldInsn(GETSTATIC, internalName, entrySymbol.name, "L$internalName;")
+            mv.visitInsn(AASTORE)
+        }
+        mv.visitFieldInsn(PUTSTATIC, internalName, VALUES_FIELD, "[L$internalName;")
+
+        mv.visitInsn(RETURN)
+        mv.visitMaxs(0, 0)
+        mv.visitEnd()
+    }
+
+    /**
+     * `values()` and `valueOf(string)`, the two static methods a Java enum has.
+     *
+     * `values()` answers a **copy** of `$VALUES`. Handing out the field itself would let a caller
+     * write into the enum's own array — `Color.values()[0] = Color.GREEN` would then make every later
+     * `values()` lie — which is why the clone is not merely an optimisation.
+     *
+     * `valueOf` compares against each constant's `name()` and throws `IllegalArgumentException` on a
+     * miss, which is the behaviour a Java caller expects rather than returning `null`.
+     */
+    private fun emitEnumMethods(
+        writer: ClassWriter,
+        declaration: ClassDeclaration,
+        symbol: ClassSymbol,
+    ) {
+        val internalName = symbol.jvmInternalName
+        val arrayDescriptor = "[L$internalName;"
+
+        writer.visitMethod(ACC_PUBLIC or ACC_STATIC, "values", "()$arrayDescriptor", null, null).apply {
+            visitCode()
+            visitFieldInsn(GETSTATIC, internalName, VALUES_FIELD, arrayDescriptor)
+            visitMethodInsn(INVOKEVIRTUAL, arrayDescriptor, "clone", "()Ljava/lang/Object;", false)
+            visitTypeInsn(CHECKCAST, arrayDescriptor)
+            visitInsn(ARETURN)
+            visitMaxs(0, 0)
+            visitEnd()
+        }
+
+        writer.visitMethod(
+            ACC_PUBLIC or ACC_STATIC,
+            "valueOf",
+            "(Ljava/lang/String;)L$internalName;",
+            null,
+            null,
+        ).apply {
+            visitCode()
+            // `Enum.valueOf` already does exactly this for any enum class, so the work is delegated
+            // rather than repeated: it looks the name up and throws `IllegalArgumentException` when
+            // there is no such constant.
+            visitLdcInsn(org.objectweb.asm.Type.getObjectType(internalName))
+            visitVarInsn(ALOAD, 0)
+            visitMethodInsn(
+                INVOKESTATIC,
+                "java/lang/Enum",
+                "valueOf",
+                "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;",
+                false,
+            )
+            visitTypeInsn(CHECKCAST, internalName)
+            visitInsn(ARETURN)
+            visitMaxs(0, 0)
+            visitEnd()
+        }
     }
 
     /**
@@ -348,6 +754,7 @@ class BytecodeGenerator(
             mv.visitVarInsn(ALOAD, 0)
             mv.visitMethodInsn(INVOKESPECIAL, superName, "<init>", "()V", false)
             emitFieldInitializers(mv, fields, symbol)
+            emitInstancePurrLockInitializer(mv, declaration)
             mv.visitInsn(RETURN)
             mv.visitMaxs(0, 0)
             mv.visitEnd()
@@ -364,6 +771,7 @@ class BytecodeGenerator(
             mv.visitMethodInsn(INVOKESPECIAL, superName, "<init>", "()V", false)
 
             emitFieldInitializers(mv, fields, symbol)
+            emitInstancePurrLockInitializer(mv, declaration)
 
             val scope = MethodScope(
                 owner = symbol.jvmInternalName,
@@ -380,6 +788,21 @@ class BytecodeGenerator(
             mv.visitMaxs(0, 0)
             mv.visitEnd()
         }
+    }
+
+    /** `this.$lock = new StampedLock()`, when this class' `purr` blocks need the instance lock. */
+    private fun emitInstancePurrLockInitializer(mv: MethodVisitor, declaration: ClassDeclaration) {
+        if (PurrLock.INSTANCE !in locksUsedBy(declaration)) return
+        mv.visitVarInsn(ALOAD, 0)
+        mv.visitTypeInsn(NEW, STAMPED_LOCK_CLASS)
+        mv.visitInsn(DUP)
+        mv.visitMethodInsn(INVOKESPECIAL, STAMPED_LOCK_CLASS, "<init>", "()V", false)
+        mv.visitFieldInsn(
+            PUTFIELD,
+            currentClass!!.jvmInternalName,
+            purrLockFieldName(PurrLock.INSTANCE),
+            "L$STAMPED_LOCK_CLASS;",
+        )
     }
 
     private fun constructorAccess(constructor: ConstructorDeclaration): Int {
@@ -930,6 +1353,7 @@ class BytecodeGenerator(
             is WhenStatement -> emitWhen(statement, scope)
             is RaiseStatement -> emitRaise(statement, scope)
             is TryStatement -> emitTry(statement, scope)
+            is PurrStatement -> emitPurr(statement, scope)
             is IndexAssignmentStatement -> emitIndexAssignment(statement, scope)
         }
     }
@@ -1059,6 +1483,9 @@ class BytecodeGenerator(
     private fun emitReturn(statement: ReturnStatement, scope: MethodScope) {
         val value = statement.value
         if (value == null) {
+            // A `return` inside a `purr` block leaves the method without ever reaching the release
+            // that follows the block, so it unlocks first — the value is already off the stack here.
+            emitPurrReleaseOnExit(scope)
             scope.mv.visitInsn(RETURN)
             return
         }
@@ -1068,6 +1495,10 @@ class BytecodeGenerator(
         // `Integer` the box is — the two conversions a store makes, made to the method's own type.
         val target = scope.returnType
         emitStoreValue(value.type, target, scope.mv)
+        // Released *after* the value is ready and converted, so the unlock call cannot disturb what is
+        // about to be returned. The converted value stays on the stack through the unlock, which is
+        // exactly what a `return` from inside a `finally` does in Java bytecode.
+        emitPurrReleaseOnExit(scope)
         // The opcode follows what the *method* is declared to answer, which is what the verifier
         // checks it against; a rejected body whose method has no type worth speaking of falls back to
         // the value's own, so a class file still comes out.
@@ -1098,8 +1529,11 @@ class BytecodeGenerator(
             return
         }
 
+        // A `yield` in a lambda or an extractor is a `return` from the method it was generated in, so
+        // it leaves a `purr` block the same way a `return` does and has to unlock first.
         if (scope.extractorResult) {
             emitBox(statement.value.type, scope.mv)
+            emitPurrReleaseOnExit(scope)
             scope.mv.visitInsn(ARETURN)
             return
         }
@@ -1107,6 +1541,7 @@ class BytecodeGenerator(
         // The lambda's `invoke` answers whatever its function type says. A rejected body can leave the
         // scope without one, and then the value's own type is the only thing left to answer with.
         val target = scope.returnType
+        emitPurrReleaseOnExit(scope)
         scope.mv.visitInsn(returnOpcode(if (target === VoidType || target === ErrorType) statement.value.type else target))
     }
 
@@ -1516,6 +1951,127 @@ class BytecodeGenerator(
      */
     private fun emitTry(statement: TryStatement, scope: MethodScope) {
         emitExtractorTry(statement, scope, resultSlot = null)
+    }
+
+    // ------------------------------------------------------------------- purr
+
+    /**
+     * `purr { ... }` — take a `StampedLock`, run the block, unlock on the way out.
+     *
+     * This cannot be a library call, and the reason is the *release*. It has to happen on every way
+     * out of the block, and there are four: falling off the end, `return`, `raise`, and a thrown
+     * exception. The last two are covered by a catch-all handler, since a `raise` is an `athrow` like
+     * any other; a `return` is not covered by anything, which is why the release is also emitted
+     * inline before the `*RETURN` instruction — see `MethodScope.purr` and [emitPurrReleaseOnExit].
+     *
+     * ```
+     *   stamp = lock.writeLock()          // or readLock()
+     *   try {
+     *     ...block...
+     *   } catch (any) {
+     *     lock.unlock(stamp); athrow
+     *   }
+     *   lock.unlock(stamp)
+     * ```
+     *
+     * The stamp is a `long` the acquisition answers and `unlock` demands, so it lives in a two-slot
+     * local for the whole block. That is the other reason `StampedLock` needs the compiler: a
+     * `synchronized` block would need nothing carried.
+     */
+    private fun emitPurr(statement: PurrStatement, scope: MethodScope) {
+        val mv = scope.mv
+        val lockType = statement.lock
+        val lockField = purrLockFieldName(lockType)
+
+        val stampSlot = scope.allocateTemp(LongType)
+
+        markLine(mv, statement)
+        emitPurrLockLoad(lockType, lockField, scope)
+        mv.visitMethodInsn(
+            INVOKEVIRTUAL,
+            STAMPED_LOCK_CLASS,
+            if (statement.mode == PurrMode.READ) "readLock" else "writeLock",
+            "()J",
+            false,
+        )
+        mv.visitVarInsn(LSTORE, stampSlot)
+
+        val guarded = Label()
+        val guardEnd = Label()
+        val handler = Label()
+        val done = Label()
+
+        mv.visitTryCatchBlock(guarded, guardEnd, handler, null)
+        mv.visitLabel(guarded)
+
+        // A `return` inside the block leaves through the method, past both the handler and the
+        // release below, so it unlocks for itself. The enclosing value is saved because a `purr` may
+        // be nested in another `purr` on a different lock, and then the *inner* one's release is the
+        // one that belongs to a `return` written in the inner block.
+        val enclosingPurr = scope.purr.size
+        scope.purr.add(PurrScope(lockType, lockField, stampSlot))
+        emitStatement(statement.body, scope)
+        while (scope.purr.size > enclosingPurr) scope.purr.removeLast()
+
+        mv.visitLabel(guardEnd)
+        emitPurrUnlock(lockType, lockField, stampSlot, scope)
+        mv.visitJumpInsn(GOTO, done)
+
+        // Entered with the throwable on the stack, which has to be put somewhere for the unlock call
+        // to happen at all; it is then rethrown so the exception is not swallowed here. A `purr`
+        // releases a lock, it does not answer a failure — that is `nya`'s job.
+        mv.visitLabel(handler)
+        val thrownSlot = scope.allocateTemp(ThrowableType)
+        mv.visitVarInsn(ASTORE, thrownSlot)
+        emitPurrUnlock(lockType, lockField, stampSlot, scope)
+        mv.visitVarInsn(ALOAD, thrownSlot)
+        mv.visitInsn(ATHROW)
+
+        mv.visitLabel(done)
+    }
+
+    /**
+     * The unlock emitted immediately before a `return`, so that leaving the method does not keep the
+     * lock held.
+     *
+     * This is the one path a catch-all handler cannot cover: `return` is not a throw. `javac` copies
+     * its `finally` block in front of every `return` for the same reason, and doing it here is what
+     * makes `purr { return x }` safe rather than a permanently held lock.
+     *
+     * Every open block is released, innermost first, because a `return` leaves all of them at once.
+     */
+    private fun emitPurrReleaseOnExit(scope: MethodScope) {
+        for (purr in scope.purr.asReversed()) {
+            emitPurrUnlock(purr.lockType, purr.lockField, purr.stampSlot, scope)
+        }
+    }
+
+    /** `lock.unlock(stamp)` — the receiver read from its field, the stamp from its local. */
+    private fun emitPurrUnlock(
+        lockType: PurrLock,
+        lockField: String,
+        stampSlot: Int,
+        scope: MethodScope,
+    ) {
+        val mv = scope.mv
+        emitPurrLockLoad(lockType, lockField, scope)
+        mv.visitVarInsn(LLOAD, stampSlot)
+        mv.visitMethodInsn(INVOKEVIRTUAL, STAMPED_LOCK_CLASS, "unlock", "(J)V", false)
+    }
+
+    /**
+     * Pushes the `StampedLock` a block holds: `this.<field>` for an instance lock, and the `static`
+     * field itself for a class lock, which needs no receiver.
+     */
+    private fun emitPurrLockLoad(lockType: PurrLock, lockField: String, scope: MethodScope) {
+        val mv = scope.mv
+        val descriptor = "L$STAMPED_LOCK_CLASS;"
+        if (lockType == PurrLock.CLASS) {
+            mv.visitFieldInsn(GETSTATIC, scope.owner, lockField, descriptor)
+        } else {
+            mv.visitVarInsn(ALOAD, 0)
+            mv.visitFieldInsn(GETFIELD, scope.owner, lockField, descriptor)
+        }
     }
 
     /**
@@ -3393,13 +3949,16 @@ class BytecodeGenerator(
                 collectLocalReferences(node.extractorBody, into)
             }
 
+            // A `purr` block is emitted inline, in this very method, so whatever it reads from an
+            // enclosing scope travels exactly as far as the `purr` does.
+            is PurrStatement -> collectLocalReferences(node.body, into)
+
             else -> Unit
         }
     }
 
     /** Per-method state: local variable slots, the owner class, and lambda capture fields. */
-    private class MethodScope(
-        val owner: String,
+    private class MethodScope(        val owner: String,
         val mv: MethodVisitor,
         val lambdaIdentity: Any?,
         firstSlot: Int,
@@ -3440,6 +3999,19 @@ class BytecodeGenerator(
          * of a given `yield`.
          */
         var nyaResult: NyaResult? = null,
+        /**
+         * The `purr` blocks currently open in this method, innermost last.
+         *
+         * A `return` or a `yield` has to release every lock it is leaving, not just the innermost: a
+         * `return` inside `purr class { purr { return x } }` leaves both. So this is a stack and the
+         * releases are emitted from the top down, which is the order `javac` nests its `finally`
+         * bodies in.
+         *
+         * It lives on the scope rather than on the generator because a lambda's body is a different
+         * method, where an enclosing `purr`'s stamp is not a local at all — so a `return` there must
+         * *not* try to unlock.
+         */
+        val purr: MutableList<PurrScope> = mutableListOf(),
     ) {
         private var nextSlot = firstSlot
         private val slots = LinkedHashMap<LocalSymbol, Int>()
@@ -3505,6 +4077,13 @@ class BytecodeGenerator(
         }
     }
 
+    /** One open `purr` block: which lock it holds, where the field is, and the stamp. */
+    private class PurrScope(
+        val lockType: PurrLock,
+        val lockField: String,
+        val stampSlot: Int,
+    )
+
     /**
      * A [ClassWriter] that never needs the class loader.
      *
@@ -3541,6 +4120,25 @@ class BytecodeGenerator(
          * what makes a Neko check and a Java one fail in the way a reader already expects.
          */
         const val ASSERTION_ERROR_CLASS = "java/lang/AssertionError"
+
+        /**
+         * The synthetic field holding an enum's constants, as `javac` names it.
+         *
+         * The `$` prefix is what marks it as compiler-created rather than source-written, and the
+         * name is the one every Java decompiler and reflection helper already recognises.
+         */
+        const val VALUES_FIELD = "\$VALUES"
+
+        /**
+         * `java.util.concurrent.locks.StampedLock`, the lock a `purr` block holds.
+         *
+         * Not in `java.lang`, which is the only platform package a Neko source file can name — see
+         * `Analyzer.resolveClassType` — so a program can neither declare one nor call its methods.
+         * That is exactly why `purr` is a keyword: the acquisition and release are bytecode the
+         * compiler writes, and the stamp `unlock` needs is a local, not something the source can
+         * carry.
+         */
+        const val STAMPED_LOCK_CLASS = "java/util/concurrent/locks/StampedLock"
     }
 }
 

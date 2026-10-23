@@ -32,7 +32,7 @@ Tasks are module-qualified now that there is more than one module.
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # Tests.
-./gradlew :neko:test                     # the compiler: 363 tests
+./gradlew :neko:test                     # the compiler: 400 tests
 ./gradlew :plugin:idea:test              # the plugin: 37 tests, in a real IDE instance
 ```
 
@@ -66,10 +66,13 @@ output. It is the closest thing to a reference for [nullable types](#nullable-ty
 ```
 
 `NyaSample` does the same for [`nya`](#checking-what-the-program-believes), and `ExceptionSample` for
-`raise` and `try`:
+`raise` and `try`. `EnumSample` shows [`miao class`](#enum-miao) — the constants, the values they can
+carry, and `values()`/`valueOf()` — and `PurrSample` shows [`purr`](#locking-purr):
 
 ```bash
 ./gradlew :neko:runNeko -Pneko.program=NyaSample
+./gradlew :neko:runNeko -Pneko.program=EnumSample
+./gradlew :neko:runNeko -Pneko.program=PurrSample
 ```
 
 ## Standard library
@@ -254,6 +257,98 @@ has no `is` operator and no cast, so none of them could be written in Neko.
 
 `meow` cannot be applied to an `interface` (an interface has no fields to derive from), and a meow
 class must write its field list.
+
+### Enum (`miao`)
+
+`miao` before `class` declares a fixed set of named values:
+
+```neko
+miao class Color {
+    RED,
+    GREEN,
+    BLUE
+}
+```
+
+- The body is the constant list, one name per constant, in the order `ordinal()` reports. A comma
+  separates constants, and an optional `;` closes the list before any functions.
+- **The class file is a real enum**: it extends `java.lang.Enum`, carries `ACC_ENUM`, has a
+  `$VALUES` array, and declares `values()` and `valueOf(string)`. So `name()`, `ordinal()`,
+  `compareTo`, `equals`, `hashCode` and `toString` all come from `java.lang.Enum` and behave the way
+  a Java caller expects — `println(Color.RED)` prints `RED`, not an object identity.
+- `values()` answers a **copy** of the constant array, so writing into the result cannot corrupt the
+  enum.
+- A constant may carry values, in which case the fields are written in the header exactly as they are
+  for a `meow class`, and every constant supplies its own:
+
+  ```neko
+  miao class Code(val status: int) {
+      OK(200),
+      GONE(410)
+  }
+
+  println(Code.OK.status)    // 200
+  ```
+
+- `==` between two constants is reference identity, which is what makes an enum usable as a set of
+  tags: there is exactly one instance of each constant.
+
+An enum cannot declare a constructor — the constants are the only instances it has, and the compiler
+creates them from the constant list. It cannot extend another class, since `java.lang.Enum` is
+already its superclass. It cannot override `name`, `ordinal`, `equals`, `hashCode` or `compareTo`,
+which `java.lang.Enum` declares `final`; `toString` is left open. The list must name at least one
+constant.
+
+### Locking (`purr`)
+
+`purr` guards a block of statements with a lock, and gives that lock back however the block is left:
+
+```neko
+class Counter() {
+    var total: int = 0
+
+    fun add(amount: int) {
+        purr {
+            current: int = this.total
+            this.total = current + amount
+        }
+    }
+}
+```
+
+The lock is a `java.util.concurrent.locks.StampedLock`, which is why this is a keyword rather than a
+library call: the release has to be emitted for **every** way out of the block — falling off the end,
+a `return`, a `raise`, and an exception thrown by anything called inside — and `unlock` also needs the
+stamp the acquisition answered, which is a `long` the source cannot carry. A `synchronized` block
+would need neither, but it also cannot offer a read lock.
+
+Three forms:
+
+| Written | Holds |
+| --- | --- |
+| `purr { ... }` | the lock belonging to `this`, exclusively |
+| `purr class { ... }` | the lock belonging to the class, exclusively — shared by every object and every `static` function |
+| `purr read { ... }` | the same lock as `purr { }`, but for reading: readers do not wait for each other |
+
+- `purr { }` needs a `this`, so a `static` function cannot use it; `purr class { }` is what it wants.
+- `purr read { }` lets several threads in at once, so it is for reading a value nobody may change
+  meanwhile. A read-modify-write belongs under `purr { }` — two readers hold a read lock at the same
+  time by design, so such a block is not exclusive and its updates can be lost.
+- **A thread cannot take the same lock twice.** `StampedLock` is not reentrant in any mode, so
+  `purr { purr { ... } }` would block forever. The mode does not help either: a write lock excludes
+  even the thread that already holds it. Both are rejected when the program is analyzed rather than
+  left to hang at run time.
+- The two locks are different locks, so `purr class { purr { ... } }` is legal and is what a
+  class-wide guard around per-object work looks like.
+- Blocks one after another are *not* nested: the first has released before the second is entered.
+
+The locks are created on demand — a class that never writes `purr` carries no lock field at all. The
+instance lock is a field of each object and the class lock is a `static` field, both compiler-created
+because `StampedLock` lives in `java.util.concurrent.locks`, which a Neko source file cannot name.
+
+The nesting rule is checked *within one method body*, since that is what the analyzer can see. A
+method that takes a lock and calls another method which takes the same one will hang; keeping that
+apart is the programmer's job.
 
 ### Nullable types
 

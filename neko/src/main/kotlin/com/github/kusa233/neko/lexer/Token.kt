@@ -21,6 +21,15 @@ enum class TokenType(val display: String) {
      * class declaration; the parser reports a `meow` that introduces anything else.
      */
     MEOW("'meow'"),
+    /**
+     * `'miao'` — the prefix that turns a class declaration into an enum.
+     *
+     * `miao class Color { RED, GREEN }` declares one fixed instance per name, and the compiler emits
+     * the constant fields, the array, `values()` and `valueOf()` from that list. It sits beside
+     * [MEOW] and [CLASS] for the same reason `meow` does: it can only ever introduce a class
+     * declaration, and the parser reports a `miao` that introduces anything else.
+     */
+    MIAO("'miao'"),
     CLASS("'class'"),
     INTERFACE("'interface'"),
     FUN("'fun'"),
@@ -65,6 +74,21 @@ enum class TokenType(val display: String) {
      * raises one and a block is what answers it.
      */
     TRY("'try'"),
+    /**
+     * `'purr'` — a critical section, backed by a `java.util.concurrent.locks.StampedLock`.
+     *
+     * `purr { ... }` runs the block holding the *instance* lock, taken in write mode, so it is what
+     * `synchronized (this)` would be. `purr class { ... }` holds the *class* lock instead, one per
+     * class, the way `synchronized (Cls.class)` is. `purr read { ... }` takes a read lock rather than
+     * a write one, which is what makes a read-mostly field worth guarding this way: many threads can
+     * be inside at once, and only a writer is exclusive.
+     *
+     * A keyword rather than a function because it is not a call: the lock has to be released on every
+     * way out of the block — falling off the end, `return`, `raise`, and a thrown exception — and only
+     * the compiler can emit that. `StampedLock` makes the compiler's involvement unavoidable anyway:
+     * unlocking requires the *stamp* the acquisition answered, and it is not reentrant.
+     */
+    PURR("'purr'"),
 
     // Expressions.
     THIS("'this'"),
@@ -179,6 +203,7 @@ internal val KEYWORDS: Map<String, TokenType> = mapOf(
     "locate" to TokenType.LOCATE,
     "import" to TokenType.IMPORT,
     "meow" to TokenType.MEOW,
+    "miao" to TokenType.MIAO,
     "class" to TokenType.CLASS,
     "interface" to TokenType.INTERFACE,
     "fun" to TokenType.FUN,
@@ -199,6 +224,7 @@ internal val KEYWORDS: Map<String, TokenType> = mapOf(
     "raise" to TokenType.RAISE,
     "emit" to TokenType.EMIT,
     "try" to TokenType.TRY,
+    "purr" to TokenType.PURR,
     "this" to TokenType.THIS,
     "true" to TokenType.TRUE,
     "false" to TokenType.FALSE,

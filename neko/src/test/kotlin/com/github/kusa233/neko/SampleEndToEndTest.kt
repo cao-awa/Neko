@@ -32,6 +32,16 @@ class SampleEndToEndTest {
             "samples/com/github/kusa233/neko/sample/NyaSample.neko",
         )
 
+    private fun enumSamplePath(): Path =
+        TestSupport.projectDirectory.resolve(
+            "samples/com/github/kusa233/neko/sample/EnumSample.neko",
+        )
+
+    private fun purrSamplePath(): Path =
+        TestSupport.projectDirectory.resolve(
+            "samples/com/github/kusa233/neko/sample/PurrSample.neko",
+        )
+
     /**
      * Compiles one sample together with the Neko standard library, as the build does.
      *
@@ -256,6 +266,95 @@ class SampleEndToEndTest {
             ),
             buffer.toString(Charsets.UTF_8).replace("\r\n", "\n").trim().lines(),
             "the sample should run every check and show what a false condition means",
+        )
+    }
+
+    @Test
+    fun `the enum sample prints each constant the way java dot lang Enum does`() {
+        // The sample's expected output is its own comments, one per `println`. If `miao class` emitted
+        // static fields instead of a real enum, `name()` and the `println` of a constant would both
+        // have nothing to answer with — which is exactly what this compares.
+        val directory = Files.createTempDirectory("neko-enum-sample")
+        val result = compileSample(enumSamplePath(), outputDirectory = directory)
+        assertTrue(
+            !result.hasErrors,
+            "the enum sample must compile:\n${result.renderDiagnostics().joinToString("\n")}",
+        )
+
+        val loader = java.net.URLClassLoader(arrayOf(directory.toUri().toURL()), javaClass.classLoader)
+        val type = Class.forName("com.github.kusa233.neko.sample.EnumSample", true, loader)
+        val main = type.getMethod("main", Array<String>::class.java)
+
+        val original = System.out
+        val buffer = java.io.ByteArrayOutputStream()
+        System.setOut(java.io.PrintStream(buffer, true, Charsets.UTF_8))
+        try {
+            main.invoke(null, arrayOf<String>())
+        } finally {
+            System.setOut(original)
+        }
+
+        assertEquals(
+            listOf(
+                "GREEN",
+                "1",
+                "GREEN",
+                "true",
+                "false",
+                "200",
+                "gone",
+                "1",
+                "fine",
+                "gone",
+                "true",
+            ),
+            buffer.toString(Charsets.UTF_8).replace("\r\n", "\n").trim().lines(),
+            "the sample should print the names, positions and payloads its comments claim",
+        )
+    }
+
+    @Test
+    fun `the purr sample's blocks guard and release the way its comments claim`() {
+        // The sample's expected output is its own comments, one per `println`. What makes this worth
+        // running rather than just compiling is that a lock leak does not show up as a wrong answer
+        // until something tries to take the same lock again — which the sample does, several times
+        // over, so a missing unlock deadlocks here instead of passing quietly.
+        val directory = Files.createTempDirectory("neko-purr-sample")
+        val result = compileSample(purrSamplePath(), outputDirectory = directory)
+        assertTrue(
+            !result.hasErrors,
+            "the purr sample must compile:\n${result.renderDiagnostics().joinToString("\n")}",
+        )
+
+        val loader = java.net.URLClassLoader(arrayOf(directory.toUri().toURL()), javaClass.classLoader)
+        val type = Class.forName("com.github.kusa233.neko.sample.PurrSample", true, loader)
+        val main = type.getMethod("main", Array<String>::class.java)
+
+        val original = System.out
+        val buffer = java.io.ByteArrayOutputStream()
+        System.setOut(java.io.PrintStream(buffer, true, Charsets.UTF_8))
+        try {
+            // Joined with a timeout: the failure mode of a forgotten unlock is a deadlock, and a test
+            // that hangs says less than one that fails.
+            val thread = Thread { main.invoke(null, arrayOf<String>()) }
+            thread.isDaemon = true
+            thread.start()
+            thread.join(30_000)
+            assertTrue(!thread.isAlive, "the purr sample deadlocked: a lock was never released")
+        } finally {
+            System.setOut(original)
+        }
+
+        assertEquals(
+            listOf(
+                "5",
+                "42",
+                "2",
+                "2",
+                "1",
+            ),
+            buffer.toString(Charsets.UTF_8).replace("\r\n", "\n").trim().lines(),
+            "the sample should print the totals its comments claim",
         )
     }
 

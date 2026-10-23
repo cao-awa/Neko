@@ -13,6 +13,7 @@ import com.github.kusa233.neko.ast.Statement
 import com.github.kusa233.neko.ast.TryStatement
 import com.github.kusa233.neko.ast.VariableDeclarationStatement
 import com.github.kusa233.neko.ast.WhenStatement
+import com.github.kusa233.neko.ast.PurrStatement
 import com.github.kusa233.neko.ast.WhileStatement
 import com.github.kusa233.neko.source.Span
 import com.github.kusa233.neko.types.NekoType
@@ -134,6 +135,10 @@ private fun collectStatements(
             }
 
             is WhileStatement -> descend(statement.body, offset, into)
+
+            // `purr { ... }` holds ordinary statements, so a variable declared inside is visible in
+            // that block alone — the same rule an `if` branch follows.
+            is PurrStatement -> descend(statement.body, offset, into)
 
             is WhenStatement -> for (branch in statement.branches) {
                 descend(branch.body, offset, into)

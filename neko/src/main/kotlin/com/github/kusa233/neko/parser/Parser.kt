@@ -207,15 +207,27 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         // `meow` marks a class whose fields are declared in its header, so it is read before the
         // `class`/`interface` choice: the two words together are what the declaration is, and a
         // `meow interface` has to be told apart from a plain one in order to be reported.
-        val meowToken = if (at(TokenType.MEOW)) advance() else null
+        //
+        // `miao` is read in the same place for the same reason, and the two are mutually exclusive:
+        // a class is either described by its fields or enumerated by its constants, and asking for
+        // both would leave the header meaning two different things.
+        val prefixToken = when {
+            at(TokenType.MEOW) -> advance()
+            at(TokenType.MIAO) -> advance()
+            else -> null
+        }
+        val isMiao = prefixToken?.type == TokenType.MIAO
+        val meowToken = prefixToken?.takeIf { it.type == TokenType.MEOW }
 
         val isInterface = when {
             at(TokenType.CLASS) -> false
             at(TokenType.INTERFACE) -> true
-            meowToken != null -> {
+            prefixToken != null -> {
+                val word = prefixToken.text
                 error(
-                    "'meow' declares a class whose fields are written in its header, so it must be " +
-                        "followed by 'class'; write 'meow class Name(...)'",
+                    "'$word' declares a class whose ${if (isMiao) "constants are" else "fields are"} " +
+                        "written in its ${if (isMiao) "body" else "header"}, so it must be followed by " +
+                        "'class'; write '$word className...'",
                     current().span,
                 )
                 synchronizeToDeclaration()
@@ -235,7 +247,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         }
         // `isMeow` is carried to the analyzer rather than reported here, so that a `meow interface`
         // is still parsed as the interface it looks like and its body's own mistakes surface in the
-        // same run as the one the reader has to fix first.
+        // same run as the one the reader has to fix first. The same goes for `miao interface`.
         val isMeow = meowToken != null
         val keyword = advance()
         val kindWord = if (isInterface) "interface" else "class"
@@ -278,15 +290,18 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         }
 
         // A `meow class` states its fields here, and the list is the whole point of the form: it is
-        // parsed into the fields and a constructor below. A plain class may write an empty list — as
-        // in `class ExceptionSample()` — but any parameter in it is rejected rather than silently
-        // ignored, because its constructor is the one declared in the body.
+        // parsed into the fields and a constructor below. A `miao class` states them here for the
+        // same reason — they are the types of the arguments its constants are written with — though
+        // the constructor that takes them is emitted by the compiler rather than from a body. A
+        // plain class may write an empty list — as in `class ExceptionSample()` — but any parameter
+        // in it is rejected rather than silently ignored, because its constructor is the one
+        // declared in the body.
         val meowFields = mutableListOf<FieldDeclaration>()
         var meowConstructor: ConstructorDeclaration? = null
         val headerParameters = at(TokenType.LEFT_PAREN)
         if (headerParameters) {
             val open = advance()
-            if (isMeow) {
+            if (isMeow || isMiao) {
                 newlineInsensitiveDepth++
                 skipNestedNewlines()
                 if (!at(TokenType.RIGHT_PAREN)) {
@@ -302,13 +317,18 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
                     }
                 }
                 skipNestedNewlines()
-                val close = expectRightParen("'meow class ${nameToken.text}'")
+                val close = expectRightParen("'$kindWord ${nameToken.text}'")
                 newlineInsensitiveDepth--
-                meowConstructor = buildMeowConstructor(
-                    fields = meowFields,
-                    openOffset = open.span.start,
-                    closeOffset = close?.span?.end ?: open.span.end,
-                )
+                // An enum's fields are written by each constant's own arguments, so there is no
+                // source constructor to synthesize: only a `meow` class stores its header fields
+                // from parameters the reader passes in.
+                if (isMeow) {
+                    meowConstructor = buildMeowConstructor(
+                        fields = meowFields,
+                        openOffset = open.span.start,
+                        closeOffset = close?.span?.end ?: open.span.end,
+                    )
+                }
             } else {
                 skipNestedNewlines()
                 if (!at(TokenType.RIGHT_PAREN)) {
@@ -441,6 +461,12 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         fields += meowFields
         meowConstructor?.let { constructors += it }
 
+        // A `miao class` names its constants first, because they are what the declaration is about:
+        // everything after them is behaviour the constants share. Reading them before the member loop
+        // is also what keeps the two apart — an entry is a bare name, which the member loop would
+        // otherwise have to report as a field that forgot its `val`.
+        val entries = if (isMiao) parseEnumEntries(nameToken) else emptyList()
+
         skipNewlines()
         while (!at(TokenType.RIGHT_BRACE) && !at(TokenType.END_OF_FILE)) {
             val before = index
@@ -488,9 +514,97 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             functions = functions,
             isInterface = isInterface,
             isMeow = isMeow,
+            isMiao = isMiao,
+            entries = entries,
             span = Span(source, keyword.span.start, end),
         )
     }
+
+    /**
+     * The constants of a `miao class`: `RED, GREEN, BLUE` or `OK(200), GONE(410)`.
+     *
+     * The list runs until something that cannot be an entry begins — a `val`, a `fun`, a
+     * `constructor`, a `static` block or the closing `}`. That is what lets the constants and the
+     * members after them share one brace-delimited body without a separator between the two, which
+     * is how it reads: the constants first, then what they all share.
+     *
+     * The trailing `;` is accepted and dropped, so a reader used to writing one is not punished for
+     * it, and an empty list is accepted here so the diagnostic about an enum with no constants can
+     * be the analyzer's single message rather than a parse failure.
+     */
+    private fun parseEnumEntries(className: Token): List<EnumEntry> {
+        val entries = mutableListOf<EnumEntry>()
+
+        skipNewlines()
+        if (at(TokenType.RIGHT_BRACE) || at(TokenType.END_OF_FILE)) return entries
+
+        while (true) {
+            skipNewlines()
+            // Anything that starts a member is where the constants ended. Whether the list was empty
+            // is the analyzer's to report, since it is a fact about the declaration rather than about
+            // how the text parsed.
+            if (memberKindAhead() != MemberKind.UNKNOWN || at(TokenType.RIGHT_BRACE)) break
+
+            val nameToken = expect(
+                TokenType.IDENTIFIER,
+                "expected the name of a constant of '${className.text}' but found " +
+                    current().describe(),
+            ) ?: run {
+                synchronizeToMember()
+                break
+            }
+
+            var end = nameToken.span.end
+            val arguments = mutableListOf<Expression>()
+            if (at(TokenType.LEFT_PAREN)) {
+                advance()
+                newlineInsensitiveDepth++
+                skipNestedNewlines()
+                if (!at(TokenType.RIGHT_PAREN)) {
+                    while (true) {
+                        val argument = parseExpression() ?: break
+                        arguments += argument
+                        skipNestedNewlines()
+                        if (at(TokenType.COMMA)) {
+                            advance()
+                            skipNestedNewlines()
+                            continue
+                        }
+                        break
+                    }
+                }
+                skipNestedNewlines()
+                val close = expectRightParen("constant '$nameToken'")
+                newlineInsensitiveDepth--
+                end = close?.span?.end ?: finalArgumentEnd(arguments, nameToken)
+            }
+
+            entries += EnumEntry(
+                name = nameToken.text,
+                nameSpan = nameToken.span,
+                arguments = arguments,
+                span = Span(source, nameToken.span.start, end),
+            )
+
+            skipNewlines()
+            if (at(TokenType.COMMA)) {
+                advance()
+                continue
+            }
+            // A `;` closes the constant list explicitly, as it does in Java. Without one the members
+            // simply follow the last constant.
+            if (at(TokenType.SEMICOLON)) advance()
+            break
+        }
+
+        return entries
+    }
+
+    /** Where a constant ends when its `)` was missing, so the node still has a span to report on. */
+    private fun finalArgumentEnd(
+        arguments: List<Expression>,
+        nameToken: Token,
+    ): Int = arguments.lastOrNull()?.span?.end ?: nameToken.span.end
 
     /**
      * Reports `static` written on a single member, which is no longer how static members are
@@ -1051,6 +1165,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         TokenType.NYA -> parseNyaStatementForm()
         TokenType.RAISE -> parseRaiseStatement()
         TokenType.TRY -> parseTryStatement()
+        TokenType.PURR -> parsePurrStatement()
         TokenType.SEMICOLON -> {
             advance()
             null
@@ -1505,6 +1620,77 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             keywordSpan = keyword.span,
             values = values,
             span = Span(source, keyword.span.start, end),
+        )
+    }
+
+    /**
+     * `purr { ... }`, `purr read { ... }`, and `purr class { ... }` — plus the two words together.
+     *
+     * The prefix is read before the brace, so the shapes are told apart by what follows the keyword:
+     * `class` picks the lock, `read` picks the mode. Both may be written, `purr class read { ... }` and
+     * `purr read class { ... }`, and each is accepted in either order because the reader is naming two
+     * independent things and the order they come out in is not worth a correction.
+     *
+     * A word that is neither is an error rather than an identifier to be guessed at: `purr key { }`
+     * has no lock in it, and silently reading `key` as an expression would report the mistake
+     * somewhere much less helpful.
+     */
+    private fun parsePurrStatement(): Statement? {
+        val keyword = advance()
+
+        var lock = PurrLock.INSTANCE
+        var mode = PurrMode.WRITE
+        var sawClass = false
+        var sawRead = false
+
+        while (at(TokenType.CLASS) || at(TokenType.IDENTIFIER) && current().text == "read") {
+            if (at(TokenType.CLASS)) {
+                advance()
+                if (sawClass) {
+                    error(
+                        "'purr' already holds the class lock; write 'purr class { ... }' once",
+                        current().span,
+                    )
+                    continue
+                }
+                sawClass = true
+                lock = PurrLock.CLASS
+            } else {
+                advance()
+                if (sawRead) {
+                    error(
+                        "'purr' is already in read mode; write 'purr read { ... }' once",
+                        current().span,
+                    )
+                    continue
+                }
+                sawRead = true
+                mode = PurrMode.READ
+            }
+            skipNewlines()
+        }
+
+        // `read` is not a keyword: it is an ordinary identifier the language never gave a meaning to,
+        // so `purr read { }` reads it here, where it is unambiguous, and nowhere else.
+        if (!at(TokenType.LEFT_BRACE)) {
+            error(
+                "expected '{' to start the 'purr' block but found ${current().describe()}",
+                current().span,
+            )
+            synchronizeToStatement()
+            return null
+        }
+
+        val body = parseBlock() ?: run {
+            synchronizeToStatement()
+            return null
+        }
+        return PurrStatement(
+            keywordSpan = keyword.span,
+            lock = lock,
+            mode = mode,
+            body = body,
+            span = Span(source, keyword.span.start, body.span.end),
         )
     }
 

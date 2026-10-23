@@ -51,6 +51,14 @@ class ClassSymbol(
      */
     val isMeow: Boolean = false,
     /**
+     * `true` when the declaration was written `miao class`, i.e. it is an enum.
+     *
+     * Carried on the symbol as well as the declaration because code generation asks questions of the
+     * resolved *type* — how `==` compares two values, how a constant is read — and a type names a
+     * symbol rather than the declaration behind it.
+     */
+    val isMiao: Boolean = false,
+    /**
      * Type parameter names, erased to `Object`.
      *
      * A parameter name is accepted anywhere a type may be written inside the declaring class, and
@@ -250,6 +258,17 @@ class FunctionSymbol(
      * provide it, which the JVM verifies at load time.
      */
     val isAbstract: Boolean = false,
+    /**
+     * The JVM class that actually declares this method, when it is not [enclosingClass].
+     *
+     * A member a class *inherits* is reachable through the class without being declared in its class
+     * file, so `invokevirtual` has to name the class the JVM will really find the method in.
+     * `java.lang.Enum`'s `name()` and `ordinal()` are the case this exists for: an enum's symbol table
+     * lists them — member lookup reads that table — but the code belongs to `Enum`.
+     *
+     * `null` when the method is declared in [enclosingClass] itself, which is the ordinary case.
+     */
+    val inheritedFrom: String? = null,
 ) : Symbol {
     /** The function's own type, e.g. `[] -> [int, int] -> int`. */
     override val type: NekoType = FunctionType(parameterTypes, returnType)
@@ -266,7 +285,7 @@ class FunctionSymbol(
 
     /** How the call appears in the class file. */
     val jvmOwner: String
-        get() = builtin?.jvmOwner ?: enclosingClass!!.jvmInternalName
+        get() = builtin?.jvmOwner ?: inheritedFrom ?: enclosingClass!!.jvmInternalName
 
     /**
      * `true` when the method must be dispatched with `invokeinterface`.

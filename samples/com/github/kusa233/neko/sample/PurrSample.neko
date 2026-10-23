@@ -1,0 +1,154 @@
+locate com.github.kusa233.neko.sample
+
+/**
+ * `purr { ... }` — a critical section, backed by a `java.util.concurrent.locks.StampedLock`.
+ *
+ * The block asks for a lock on the way in and gives it back on the way out, and "on the way out"
+ * includes every way there is: falling off the end, a `return`, a `raise`, and an exception thrown by
+ * anything called inside. That last one is why this is a keyword rather than a library call — the
+ * release has to be emitted for each path, and a `StampedLock` also has to be told *which*
+ * acquisition to undo, which is a stamp the source cannot carry.
+ *
+ * Three forms:
+ *   purr { ... }         the lock belonging to `this`
+ *   purr class { ... }   the lock belonging to the class, shared by every object and every static
+ *                        function
+ *   purr read { ... }    the same lock taken for reading, so readers do not wait for each other
+ *
+ * A thread may hold the read lock while others read, but a writer excludes everyone. So a
+ * read-modify-write belongs under `purr`, and only a read that does not need to be consistent with
+ * other readers belongs under `purr read`.
+ */
+
+class PurrSample() {
+    var total: int = 0
+
+    // A read-modify-write: two steps that must not be interleaved with anyone else's. Under `purr
+    // read` this would be wrong, because two readers hold the lock at the same time by design.
+    fun add(amount: int) {
+        purr {
+            current: int = this.total
+            this.total = current + amount
+        }
+    }
+
+    // Reading a value nobody is allowed to change meanwhile. Several threads may do this at once.
+    fun total(): int {
+        purr read {
+            return this.total
+        }
+    }
+
+    // A `return` inside the block leaves the method before reaching the code after the block, so the
+    // compiler unlocks first — writing this is not a leak. Note there is nothing after the block: a
+    // `purr` whose body always returns makes the rest of the function unreachable, and the analyzer
+    // says so.
+    fun early(): int {
+        purr {
+            return 42
+        }
+    }
+
+    // Two blocks one after the other. This is *not* nesting: the first has released before the second
+    // is entered, which is exactly why the same lock may be taken twice this way.
+    fun siblings(): int {
+        purr {
+            this.total = 1
+        }
+        purr {
+            this.total = this.total + 1
+        }
+        return this.total
+    }
+
+    static {
+        var created: int = 0
+
+        // The class lock is one lock for the whole class, so two different `PurrSample` objects still
+        // take turns. That is what makes it usable for state the objects share.
+        fun noteCreation() {
+            purr class {
+                created = created + 1
+            }
+        }
+
+        fun created(): int {
+            purr class {
+                return created
+            }
+        }
+
+        fun main(args: string[]) {
+            basic()
+            nesting()
+            lockScopes()
+        }
+
+        fun basic() {
+            counter: PurrSample = PurrSample()
+            counter.add(2)
+            counter.add(3)
+            println(counter.total())             // Should print '5'
+            println(counter.early())             // Should print '42'
+        }
+
+        fun nesting() {
+            counter: PurrSample = PurrSample()
+            println(counter.siblings())          // Should print '2'
+
+            // Error to compile: a StampedLock is not reentrant in any mode, so taking the same lock
+            // twice on one thread would block for ever — the analyzer refuses it rather than let the
+            // program hang.
+            // purr class {
+            //     purr class {
+            //         println(1)
+            //     }
+            // }
+            //
+            // Error to compile: the mode does not help. A write lock is exclusive even against the
+            // thread already holding it.
+            // purr class {
+            //     purr read {
+            //         println(1)
+            //     }
+            // }
+        }
+
+        // The two locks are different locks, so holding one while taking the other is legal — a
+        // class-wide guard around per-object work. A single lock could not do this: the inner `purr`
+        // would be a second acquisition and deadlock.
+        fun lockScopes() {
+            noteCreation()
+            noteCreation()
+            println(created())                   // Should print '2'
+
+            one: PurrSample = PurrSample()
+            one.guardedAdd(1)
+            println(one.total())                 // Should print '1'
+
+            // Error to compile: a `static` function has no `this`, so there is no instance lock for
+            // it to take. `purr class` is what it wants instead — which is why `lockScopes` above
+            // reaches the instance lock through a method of the object rather than taking it here.
+            // fun helper() {
+            //     purr {
+            //         println(1)
+            //     }
+            // }
+        }
+    }
+
+    // Both locks at once: the class lock outside, so the whole class takes turns, and this object's
+    // own lock inside. Taking the same lock twice would deadlock, but these are two different locks.
+    //
+    // Note what `add` may *not* do here: it already takes this object's lock, so calling it from
+    // inside a `purr { }` on the same object would be a second acquisition of one lock and would hang.
+    // Per-method analysis cannot see across the call, so that rule is the programmer's to keep.
+    fun guardedAdd(amount: int) {
+        purr class {
+            purr {
+                current: int = this.total
+                this.total = current + amount
+            }
+        }
+    }
+}
