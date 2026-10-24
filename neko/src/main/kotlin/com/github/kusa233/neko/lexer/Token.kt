@@ -86,14 +86,30 @@ enum class TokenType(val display: String) {
      * is worse than no check, and Neko has no flag to turn one on with.
      */
     NYA("'nya'"),
-    RAISE("'raise'"),
+    /**
+     * `'scratch'` — hands the values it names to the innermost `try` handler that declared a
+     * matching `emit [...]` signature.
+     *
+     * The word is the sample's: a `scratch` is where the program says "this is the point I would
+     * have had to unwind from", and the handler it reaches is generated as a method rather than
+     * travelled to by an exception.
+     */
+    SCRATCH("'scratch'"),
+    /**
+     * `'nyan'` — leaves the enclosing `try` handler, answering the value it names.
+     *
+     * The counterpart of `scratch` inside a handler: `scratch` enters one, `nyan` leaves it with a
+     * value, and `yield` leaves it by throwing the value to the `try` that declared it.
+     */
+    NYAN("'nyan'"),
     EMIT("'emit'"),
     /**
-     * `'try'` — now only the extractor form, `try f(...) { a -> ... }`, which receives a `raise`.
+     * `'try'` — now only the extractor form, `try f(...) { a -> ... }`, which declares the handler a
+     * `scratch` reaches and catches the `EmitYieldException` a `yield` throws.
      *
      * The `try { ... } catch ...` statement that handled a JVM throwable was removed: `nya`'s block
      * form replaces it for the failure a Neko program can actually name, because a bare `nya` is what
-     * raises one and a block is what answers it.
+     * throws one and a block is what answers it.
      */
     TRY("'try'"),
     /**
@@ -114,9 +130,9 @@ enum class TokenType(val display: String) {
      * writer is exclusive.
      *
      * Words rather than a call because this is not a call: the lock has to be released on every way
-     * out of the block — falling off the end, `return`, `raise`, and a thrown exception — and only the
-     * compiler can emit that. `StampedLock` makes the compiler's involvement unavoidable anyway:
-     * unlocking requires the *stamp* the acquisition answered, and it is not reentrant.
+     * out of the block — falling off the end, `return`, `nyan`, `yield`, and a thrown exception — and
+     * only the compiler can emit that. `StampedLock` makes the compiler's involvement unavoidable
+     * anyway: unlocking requires the *stamp* the acquisition answered, and it is not reentrant.
      *
      * Four keywords rather than one keyword plus modifiers because `read` and `class` are ordinary
      * identifiers in this language — `purr class { ... }` would have to read `class` as a keyword in
@@ -271,7 +287,8 @@ internal val KEYWORDS: Map<String, TokenType> = mapOf(
     "in" to TokenType.IN,
     "when" to TokenType.WHEN,
     "nya" to TokenType.NYA,
-    "raise" to TokenType.RAISE,
+    "scratch" to TokenType.SCRATCH,
+    "nyan" to TokenType.NYAN,
     "emit" to TokenType.EMIT,
     "try" to TokenType.TRY,
     "purr" to TokenType.PURR,

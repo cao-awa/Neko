@@ -35,8 +35,8 @@ class ClassSymbol(
      * The package prefix of the file that declared this class, in JVM internal form.
      *
      * Each file may `locate` its own package, so a class' package is a property of the declaration
-     * rather than of the compilation: the standard library classes a `raise` names live in the
-     * package of the file that raises, not of the file being compiled first.
+     * rather than of the compilation: the classes one file names live in that file's package, not in
+     * the package of whichever file happened to be compiled first.
      */
     val packagePrefix: String = "",
     /** `true` when the declaration was written `interface`. */
@@ -238,8 +238,9 @@ class FunctionSymbol(
     /**
      * The types named by the declaration's `emit` clause, empty when it has none.
      *
-     * A non-empty list means the function transfers control through a `raise` rather than returning:
-     * a caller must catch it with `try f(...) { a, b -> ... }`.
+     * A non-empty list means the function's `scratch` sites reach a handler with those values: a
+     * caller must declare one with `try f(...) { a, b -> ... }`. The list is also the *signature* a
+     * `scratch` is matched on, so it is what decides which handler a site belongs to.
      */
     val emitTypes: List<NekoType> = emptyList(),
     /** `true` when the declaration carried an `emit` clause, even an empty one such as `emit []`. */
@@ -273,7 +274,7 @@ class FunctionSymbol(
     /** The function's own type, e.g. `[] -> [int, int] -> int`. */
     override val type: NekoType = FunctionType(parameterTypes, returnType)
 
-    /** `true` when calling this function may transfer control through a `raise`. */
+    /** `true` when calling this function may reach a `try` handler through `scratch`. */
     val canRaise: Boolean get() = hasEmitClause
 
     /** `true` when this symbol describes a constructor rather than a callable function. */

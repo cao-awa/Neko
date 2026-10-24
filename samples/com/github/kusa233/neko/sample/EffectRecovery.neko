@@ -1,0 +1,37 @@
+locate com.github.kusa233.neko.sample
+
+/**
+ * The reference for `try ... { ... }`, `scratch` and `nyan`.
+ *
+ * `nyanTest` declares the handler; `b` reaches it from two calls down. The `try` compiles its
+ * `{ ... }` block into a method on this class, and every `scratch` with a matching emit signature
+ * calls that method instead of raising anything. `nyan` returns a value from it; `yield` throws an
+ * `EmitYieldException` that the `try` catches and stores into its target.
+ */
+class EffectRecovery {
+    static {
+        fun main(args: string[]) {
+            nyanTest()
+        }
+
+        fun nyanTest() {
+            v: int = try a() { a, b ->
+                if (a + b == 3) {
+                    nyan a + b // Should be 1 + 2
+                } else {
+                    yield 10 // v should be 10 if a + b not 3
+                }
+            }
+            println(v)
+        }
+
+        fun a(): int {
+            return b() // Recovery to b, return 30 directly
+        } emit [int, int]
+
+        fun b(): int {
+            v: int = scratch 1, 2
+            return v * 10 // Should be 3 * 10
+        } emit [int, int]
+    }
+}

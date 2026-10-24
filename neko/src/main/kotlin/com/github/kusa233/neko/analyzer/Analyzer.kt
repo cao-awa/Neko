@@ -66,6 +66,26 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private var currentExtractor: ExtractorTry? = null
 
     /**
+     * Every `scratch` site seen so far, held until the whole program has been analyzed.
+     *
+     * A site picks its handler by emit signature alone — the handler is a `try` written anywhere in
+     * the program whose callee's clause matches — so the link cannot be made while walking one
+     * function: the matching `try` may not have been reached yet. Recording the sites and resolving
+     * them at the end also makes "the first site decides the handler's return type" mean the first in
+     * *source* order rather than the first the walk happened to visit.
+     */
+    private val scratchSites = mutableListOf<ScratchSite>()
+
+    /**
+     * Every `try` that declared a handler, in source order.
+     *
+     * A `scratch` picks its handler by emit signature alone, so this is what a site is matched
+     * against. Two handlers whose callees declare the same clause would be indistinguishable — a site
+     * has nothing else to go on — so the second is reported rather than silently shadowing the first.
+     */
+    private val handlers = mutableListOf<ExtractorTry>()
+
+    /**
      * The locks held by the `purr` blocks currently open around the statement being analysed.
      *
      * A `StampedLock` is not reentrant, so taking one this thread already holds is a deadlock rather
@@ -142,8 +162,8 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     /**
      * `true` while the callee of a `try … { … -> }` is being resolved.
      *
-     * The call a `try` wraps is the one call to a raising function that is legal, so the check that
-     * rejects such a call everywhere else has to know it is looking at that one.
+     * The call a `try` wraps is the one call to an `emit`-declaring function that is legal, so the
+     * check that rejects such a call everywhere else has to know it is looking at that one.
      */
     private var resolvingTryCallee = false
 
@@ -156,11 +176,10 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private var currentClass: ClassSymbol? = null
 
     /**
-     * Whether the "is the standard library present?" diagnostic has already been considered.
+     * Whether the "is `EmitYieldException` loadable?" diagnostic has already been considered.
      *
-     * It is a property of the program rather than of any one `raise`, so it is reported once however
-     * many times `raise` appears: repeating it on every `raise` in a large file would bury the rest of
-     * the output.
+     * It is a property of the program rather than of any one `try`, so it is reported once however
+     * many `try` statements appear: repeating it on every one would bury the rest of the output.
      */
     private var standardLibraryChecked = false
 
@@ -168,11 +187,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private val parametersByFunction = LinkedHashMap<FunctionDeclaration, List<LocalSymbol>>()
 
     /**
-     * Whether the function currently being checked forwards a `raise` to its own caller.
+     * Whether the function currently being checked forwards its `emit` clause to its own caller.
      *
-     * Set when a call passes the `emit` clause on unchanged, which is a second way a function with an
-     * `emit` clause can reach its caller's extractor — beside writing `raise` itself. The
-     * "declares an 'emit' clause but can never 'raise'" check consults it.
+     * Set when a call passes the clause on unchanged, which is a second way a function with an
+     * `emit` clause can do work with it — beside reaching a handler directly with `scratch`. The
+     * "declares an 'emit' clause but can never reach a handler" check consults it.
      */
     private var forwardsRaise = false
 
@@ -185,6 +204,10 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         declareClasses()
         resolveSignatures()
         checkBodies()
+        // `scratch` and its handler are the one pair that cannot be checked as they are met: a site
+        // picks a `try` by emit signature, and either may be declared first. So the pairing happens
+        // here, once every declaration and every handler is known.
+        linkScratchHandlers()
         return classes
     }
 
@@ -587,7 +610,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             if (function.isAbstract && function.hasEmitClause) {
                 diagnostics.error(
                     "abstract function '${function.name}' cannot declare an 'emit' clause: a " +
-                        "function with no body has no 'raise' to hand values back with",
+                        "function with no body has no 'scratch' to reach a handler with",
                     function.nameSpan,
                 )
             }
@@ -815,11 +838,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     /**
      * Checks the shape of an `emit` clause against the function's declared return type.
      *
-     * A function that can `raise` has *two* ways to leave, and they are not alternatives: it may
-     * `raise`, which sends values to the caller's extractor and skips the rest of the body, or it may
-     * `return` normally. Declaring a return type as well is therefore meaningful — it is the value
-     * the call produces whenever the function does not raise, which is what `r = try f() { ... }`
-     * reads. Only the arity of the clause is checked here.
+     * A function with an `emit` clause has *two* ways to leave, and they are not alternatives: it may
+     * `scratch`, which hands values to the handler its caller's `try` declared and carries on with the
+     * answer, or it may `return` normally. Declaring a return type as well is therefore meaningful —
+     * it is the value the call produces whenever the function does not scratch, which is what
+     * `r = try f() { ... }` reads. Only the arity of the clause is checked here.
      */
     private fun checkEmitDeclaration(function: FunctionDeclaration, returnType: NekoType) {
         if (!function.hasEmitClause) return
@@ -841,7 +864,12 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             currentClass = classSymbol
             checkInterfacesImplemented(declaration, classSymbol)
             for (field in declaration.fields) checkFieldInitializer(field)
-            for (function in declaration.functions) checkFunctionBody(function, classSymbol)
+            for (function in declaration.functions) {
+                // Recorded before the body is walked, so a function can be looked up again once every
+                // body has been seen — which is what the `emit`-clause check at the end needs.
+                function.symbol?.let { functionsByName[it.name] = it }
+                checkFunctionBody(function, classSymbol)
+            }
             for (constructor in declaration.constructors) {
                 checkConstructorBody(constructor, declaration, classSymbol)
             }
@@ -1024,9 +1052,10 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
         analyzeBlock(body)
 
-        // A function that can `raise` is exempt from the "must return on every path" rule: a `raise`
-        // is a legitimate way to leave it, and the extractor — not a value — is what the caller
-        // receives. Requiring a return as well would make every such function untestable to write.
+        // A function with an `emit` clause is exempt from the "must return on every path" rule: a
+        // `yield` is a legitimate way to leave it, and the value it carries — not a `return` — is what
+        // the caller's `try` receives. Requiring a return as well would make every such function
+        // awkward to write.
         if (!declaredReturn.isVoidOrError && !symbol.canRaise && !body.alwaysReturns()) {
             diagnostics.error(
                 "function '${function.name}' declares that it returns ${declaredReturn.displayName} " +
@@ -1035,13 +1064,10 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             )
         }
 
-        if (symbol.canRaise && !forwardsRaise && body.statements.none { it.containsRaise() }) {
-            diagnostics.error(
-                "function '${function.name}' declares an 'emit' clause but can never 'raise', so " +
-                    "its results cannot be received",
-                function.nameSpan,
-            )
-        }
+        // "Declares an `emit` clause but can never make use of it" is checked in
+        // `linkScratchHandlers`, not here: whether the clause does any work depends on things only
+        // known once every body has been walked — notably whether some `try` names this function as
+        // its callee, which is the other way the clause earns its keep.
 
         popScope()
         popScope()
@@ -1058,7 +1084,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         var terminated: Statement? = null
         for (statement in block.statements) {
             if (terminated != null) {
-                // The sample marks the line after a `raise` as "Unreachable, notice as error level",
+                // The sample marks the line after a departure as "Unreachable, notice as error level",
                 // so this is an error rather than a warning. Still analysed, so that a second mistake
                 // on the unreachable line is reported in the same run.
                 diagnostics.error(
@@ -1118,7 +1144,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             is ForEachStatement -> analyzeForEach(statement)
             is IncrementStatement -> analyzeIncrement(statement)
             is WhenStatement -> analyzeWhen(statement)
-            is RaiseStatement -> analyzeRaise(statement)
+            is NyanStatement -> analyzeNyan(statement)
             is TryStatement -> analyzeTry(statement)
             is PurrStatement -> analyzePurr(statement)
             is IndexAssignmentStatement -> analyzeIndexAssignment(statement)
@@ -1243,32 +1269,43 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     }
 
     /**
-     * Reports a use of `raise` in a program that does not include the standard library.
+     * Reports a use of `scratch` or `yield` in a program that cannot see `EmitYieldException`.
      *
-     * `raise` is not a JVM operation: it lowers to throwing the library's `EarlyEmitException` and to
-     * the caller implementing the library's `EmitExtractorN`. Compiled without those sources the
-     * class files would name classes that do not exist, and the failure would appear only when the
-     * program was loaded. Reporting it here says what is missing while the user can still fix it.
-     *
-     * The `EmitExtractor` interfaces are checked too, because a `try` extractor implements one of
-     * them, so a program that raises but never catches still needs them emitted.
+     * Nothing here is lowered to a standard library *Neko* class any more: `scratch` is a call to a
+     * method the compiler generates, and the exception a `yield` throws ships with the compiler as a
+     * Java class rather than being compiled from `stdlib/`. So there is nothing for the program to
+     * include, and this check only catches the one case that can still go wrong — the compiler's own
+     * class missing from its runtime, which is a broken installation rather than a mistake in the
+     * program. It is reported at the first use so the reader sees it in context.
      */
     private fun checkStandardLibrary(span: Span) {
         if (standardLibraryChecked) return
         standardLibraryChecked = true
 
-        val missing = STANDARD_LIBRARY_TYPES.filter { classes[it] == null }
-        if (missing.isEmpty()) return
+        if (emitYieldExceptionAvailable()) return
 
         diagnostics.error(
-            "'raise' needs the Neko standard library, but this program does not include it: " +
-                "${missing.joinToString(", ")} " +
-                "${if (missing.size == 1) "is" else "are"} not declared. Write them yourself, or " +
-                "compile the library's sources together with this program — the build passes " +
-                "every directory in 'neko.libraryDirectories' to the compiler alongside the program",
+            "'scratch', 'nyan' and 'yield' need ${EMIT_YIELD_EXCEPTION_SIMPLE_NAME}, which ships " +
+                "with the compiler but is missing from this installation — check that the compiler's " +
+                "own classes are on the classpath",
             span,
         )
     }
+
+    /**
+     * Whether [EMIT_YIELD_EXCEPTION_SIMPLE_NAME] can be loaded.
+     *
+     * Asked of the running JVM rather than of the program's declarations, because the class is part of
+     * the compiler: a program never declares it, so `classes[...]` would always answer "missing".
+     */
+    private fun emitYieldExceptionAvailable(): Boolean =
+        runCatching {
+            Class.forName(
+                EMIT_YIELD_EXCEPTION_BINARY_NAME,
+                false,
+                Analyzer::class.java.classLoader,
+            )
+        }.isSuccess
 
     /**
      * `nya condition`, `nya condition { ... }`, `nya condition { ... } else { ... }` — checks the
@@ -1423,50 +1460,64 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         if (canThrowAssertion(expression.condition)) emptyMap() else factsFalse(expression.condition)
 
     /**
-     * `raise 1 * multiplier, multiplier`
+     * `scratch e1, e2` — enters the `try` handler whose `emit [...]` signature these values match.
      *
-     * Only meaningful inside a function that declared an `emit` clause, and the values must match
-     * that clause one for one. The sample marks the line after a `raise` as unreachable — and it is,
-     * because the lowering throws — so this is a terminating statement.
+     * Only meaningful inside a function that declared an `emit` clause, and the values must match that
+     * clause one for one: the clause is what says which handler out there is the right one, so a
+     * mismatch means no handler could ever be reached. What the site itself is worth is left to
+     * [linkScratchHandlers], which needs every site before it can answer.
+     *
+     * A `scratch` is *not* a departure — it is an ordinary call that returns whatever the handler
+     * answers — so unlike the `raise` it replaced, the statement after it is reachable.
+     *
+     * [expectedType] is what the position asks for — the declared type of the variable being
+     * initialised — and is `null` when the value is discarded. That is the whole of what decides the
+     * handler's return type.
      */
-    private fun analyzeRaise(statement: RaiseStatement) {
+    private fun analyzeScratch(expression: ScratchExpression, expectedType: NekoType?): NekoType {
         val function = currentFunction
-        checkStandardLibrary(statement.keywordSpan)
+        checkStandardLibrary(expression.keywordSpan)
 
         if (function == null || !function.canRaise) {
-            for (value in statement.values) analyzeExpression(value)
+            for (value in expression.values) analyzeExpression(value)
             diagnostics.error(
-                "'raise' is only allowed inside a function that declares an 'emit' clause",
-                statement.keywordSpan,
+                "'scratch' is only allowed inside a function that declares an 'emit' clause",
+                expression.keywordSpan,
             )
-            return
+            return ErrorType
         }
 
-        val expected = function.emitTypes
-        if (statement.values.size != expected.size) {
-            for (value in statement.values) analyzeExpression(value)
+        val raised = function.emitTypes
+        if (expression.values.size != raised.size) {
+            for (value in expression.values) analyzeExpression(value)
             diagnostics.error(
-                "'raise' must provide ${expected.size} value(s) to match the 'emit' clause of " +
-                    "'${function.name}' but ${statement.values.size} " +
-                    "${if (statement.values.size == 1) "was" else "were"} provided",
-                statement.keywordSpan,
+                "'scratch' must provide ${raised.size} value(s) to match the 'emit' clause of " +
+                    "'${function.name}' but ${expression.values.size} " +
+                    "${if (expression.values.size == 1) "was" else "were"} provided",
+                expression.keywordSpan,
                 notes = listOf(
                     diagnostics.note("'${function.name}' declares its 'emit' clause here", function.span),
                 ),
             )
-            return
+            return ErrorType
         }
 
-        for ((index, value) in statement.values.withIndex()) {
-            val actual = analyzeExpression(value, expected[index])
-            if (!isAssignable(actual, expected[index])) {
+        for ((index, value) in expression.values.withIndex()) {
+            val actual = analyzeExpression(value, raised[index])
+            if (!isAssignable(actual, raised[index])) {
                 diagnostics.error(
-                    "value ${index + 1} of 'raise' is declared as ${expected[index].displayName} by " +
-                        "the 'emit' clause but has type ${actual.displayName}",
+                    "value ${index + 1} of 'scratch' is declared as ${raised[index].displayName} " +
+                        "by the 'emit' clause but has type ${actual.displayName}",
                     value.span,
                 )
             }
         }
+
+        scratchSites += ScratchSite(expression, raised, expectedType?.takeIf { it !== ErrorType })
+
+        // The handler is linked later, once every `try` has been seen. Until then the site is assumed
+        // to answer what its position asked for, which is what keeps one mistake from cascading.
+        return expectedType ?: VoidType
     }
 
     /**
@@ -1487,40 +1538,246 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     /**
      * `r: int = try test(10) { a, b -> yield 1 }`
      *
-     * The expression form catches exactly what the statement form does. Its own value is what the
-     * call returned when it returned normally, and what the extractor's `yield` produced when it
-     * `raise`d instead — so the two paths must agree on one type, and the extractor must actually
-     * produce one.
+     * The expression form differs from the statement form in exactly one respect: it is worth a
+     * value. Which value depends on the path taken, and the two are not the same thing:
+     *
+     *  * **The call returned normally.** The `try` is worth the call's own return value. No handler
+     *    ran, so neither a `nyan` nor a `yield` had anything to say.
+     *  * **A `yield` ran.** The exception it threw carried the value, so that is what the `try` is
+     *    worth — which is why the statement form, worth nothing, refuses a `yield` outright.
+     *
+     * A `nyan` is deliberately *not* part of this: it answers the `scratch` site that entered the
+     * handler, and that site is somewhere else entirely — usually a different function. So a `try`
+     * expression whose handler only ever `nyan`s still needs the normal path to produce a value, and
+     * that is what the call's return type already is.
      */
     private fun analyzeTryExpression(expression: TryExpression): NekoType {
         val callee = analyzeExtractorTry(expression)
         val normalResult = callee?.returnType ?: ErrorType
 
         val yielded = expression.yieldedType
-        if (yielded == null) {
-            // The value would have to come from somewhere on the `raise` path, and the extractor
-            // never produces one — so a `try` used as a value would silently answer nothing.
-            diagnostics.error(
-                "this 'try' is used as a value, so its extractor must 'yield' the value to use " +
-                    "when the call 'raise's instead of returning",
-                expression.extractorBody.span,
-            )
-            return ErrorType
+        if (yielded != null) {
+            // The `yield` path has to agree with the normal one: they are two answers to the same
+            // question, so a disagreement means the expression means nothing.
+            if (!isAssignable(yielded, normalResult)) {
+                diagnostics.error(
+                    "this 'try' is worth ${normalResult.displayName} when the call returns, but its " +
+                        "handler 'yield's ${yielded.displayName} when it does not",
+                    expression.extractorBody.span,
+                )
+            }
+            return normalResult
         }
 
-        if (!isAssignable(yielded, normalResult)) {
-            diagnostics.error(
-                "this 'try' is worth ${normalResult.displayName} when the call returns, but its " +
-                    "extractor 'yield's ${yielded.displayName} when the call 'raise's",
-                expression.extractorBody.span,
-            )
-        }
-        return normalResult
+        // Nothing `yield`s. That is fine as long as the call itself answers something, because then
+        // the normal path supplies the value — a handler that only `nyan`s is exactly this case.
+        if (normalResult !== VoidType && normalResult !== ErrorType) return normalResult
+
+        // A `void` call leaves no value on the normal path, and nothing `yield`s on the other, so the
+        // expression could never be worth anything whatever happened.
+        diagnostics.error(
+            "this 'try' is used as a value, but '${expression.call.callee}' returns " +
+                "${normalResult.displayName} and its handler never 'yield's one, so neither path " +
+                "produces a value",
+            expression.extractorBody.span,
+        )
+        return ErrorType
     }
 
     /**
-     * The part both `try` forms share: check the callee may `raise`, then analyze the extractor body
-     * in a scope binding the values it named.
+     * Records [statement] as the handler answering [signature], refusing a duplicate.
+     *
+     * A `scratch` finds its handler by signature alone, so two handlers with the same one are
+     * indistinguishable from a site's point of view. The second is reported rather than left to win
+     * silently, which would make the program's behaviour depend on declaration order.
+     */
+    private fun registerHandler(statement: ExtractorTry, signature: List<NekoType>) {
+        val clash = handlers.firstOrNull { it.signatureMatches(signature) }
+        if (clash != null) {
+            diagnostics.error(
+                "another 'try' already declares a handler for this emit signature, so a 'scratch' " +
+                    "site could not tell the two apart",
+                statement.keywordSpan,
+                notes = listOf(diagnostics.note("the earlier handler is here", clash.keywordSpan)),
+            )
+            return
+        }
+        statement.handler.signature = signature
+        // Where the method lands is fixed here, while the walk still knows which class the `try` was
+        // written in: a `scratch` elsewhere in the program needs the answer before its own class is
+        // reached, so it cannot be left to the code generator to discover in emission order.
+        statement.handler.ownerClass = currentClass?.jvmInternalName
+        // The name too, for the same reason: the `scratch` may be emitted before the `try` is, so it
+        // cannot wait for the method to be registered. Numbered per enclosing function, in the order
+        // the handlers were linked, which is deterministic because the walk is.
+        val enclosingFunction = currentFunction?.name ?: "top"
+        val ordinal = handlerCounter.merge(enclosingFunction, 1, Int::plus)!! - 1
+        statement.handler.methodName = "$enclosingFunction\$scratch\$$ordinal"
+        handlers += statement
+    }
+
+    /** How many handlers each enclosing function has produced, used to number their method names. */
+    private val handlerCounter = mutableMapOf<String, Int>()
+
+    /** Whether [this] handler answers the same `emit` clause as [signature]. */
+    private fun ExtractorTry.signatureMatches(signature: List<NekoType>): Boolean =
+        handler.signature.size == signature.size &&
+            handler.signature.zip(signature).all { (mine, theirs) -> mine == theirs }
+
+    /**
+     * `nyan value` — leaves the enclosing `try` handler, answering [value].
+     *
+     * Only legal directly inside a `try`'s `{ ... }` block: that block is compiled into a method, and
+     * a `nyan` is the `return` from it. Its type must match what the `scratch` sites reaching that
+     * handler take, which [linkScratchHandlers] settles once all of them have been seen.
+     */
+    private fun analyzeNyan(statement: NyanStatement) {
+        val handler = currentExtractor
+        if (handler == null) {
+            analyzeExpression(statement.value)
+            diagnostics.error(
+                "'nyan' can only be used directly inside the 'try' handler it leaves; write " +
+                    "'return' to leave the enclosing function, or 'yield' to answer the 'try' itself",
+                statement.keywordSpan,
+            )
+            return
+        }
+
+        // The sites that fix this handler's return type have not been linked yet — they may not even
+        // have been analyzed — so the answer is only checked for well-formedness here and compared in
+        // `linkScratchHandlers`.
+        pendingNyanAnswers += handler to analyzeExpression(statement.value)
+    }
+
+    /** Every `nyan`, with what it answered, held until its handler's return type is known. */
+    private val pendingNyanAnswers = mutableListOf<Pair<ExtractorTry, NekoType>>()
+
+    /**
+     * Reports a function whose `emit` clause does no work.
+     *
+     * An `emit` clause earns its keep in one of three ways, and a clause that does none of them states
+     * a departure that cannot happen:
+     *
+     *  * its body reaches a handler — through `scratch`, through `yield`, or by calling a function
+     *    that declares the same clause;
+     *  * some `try` names it as the callee, so the clause is what a `scratch` matches on;
+     *  * it forwards a caller's clause unchanged, by declaring the identical `emit` types.
+     *
+     * Only the first was checkable during the walk; the second needs every `try` in the program, which
+     * is why this runs at the end with the rest of the linking.
+     */
+    private fun reportUselessEmitClauses() {
+        val wrapped = handlers.mapNotNull { tryCalleeName(it) }.toSet()
+
+        for ((_, symbol) in functionsByName) {
+            if (!symbol.canRaise) continue
+            if (symbol.inheritedFrom != null) continue
+            val body = symbol.declaration?.body ?: continue
+            if (body.statements.any { it.reachesHandler() }) continue
+            if (symbol.name in wrapped) continue
+            if (forwardsItsOwnClause(symbol)) continue
+            if (forwardedCallees.any { it === symbol }) continue
+
+            diagnostics.error(
+                "function '${symbol.name}' declares an 'emit' clause but can never reach a 'try' " +
+                    "handler, so its results cannot be received",
+                symbol.span,
+            )
+        }
+    }
+
+    /** The simple name of the function a `try` wraps, which is the one its clause describes. */
+    private fun tryCalleeName(handler: ExtractorTry): String? = when (val callee = handler.call.callee) {
+        is NameExpression -> callee.name
+        is MemberAccessExpression -> callee.memberName
+        else -> null
+    }
+
+    /**
+     * Whether [symbol] is a pass-through: it declares the same `emit` clause as whatever it calls.
+     *
+     * Such a wrapper is legal with no `scratch` of its own, because the departure belongs to the
+     * function it forwards; `forwardsRaise` already establishes this during the walk, and this is the
+     * same question asked from the outside.
+     */
+    private fun forwardsItsOwnClause(symbol: FunctionSymbol): Boolean =
+        forwardsRaiseSymbols.any { it === symbol }
+
+
+    /**
+     * Pairs each `scratch` site with the handler its emit signature names, and fixes that handler's
+     * return type from the first site that reaches it.
+     *
+     * Runs once the whole program has been walked, because neither side is knowable earlier: a
+     * handler's `try` may be written after the function holding the sites, and the sites are what
+     * decide what the handler answers. "The first site" means the first in *source* order — a handler
+     * reached by `v: int = scratch 1, 2` and later by a bare `scratch 3, 4` answers `int`, and the
+     * later site is the one reported if it disagrees.
+     */
+    private fun linkScratchHandlers() {
+        reportUselessEmitClauses()
+        for (site in scratchSites.sortedBy { it.expression.span.start }) {
+            val expression = site.expression
+            val handler = handlers.firstOrNull { it.signatureMatches(site.signature) }
+
+            if (handler == null) {
+                diagnostics.error(
+                    "no 'try' declares a handler for this emit signature, so this 'scratch' has " +
+                        "nowhere to go; write 'try call(...) { ... }' somewhere in the program whose " +
+                        "callee declares the same 'emit [...]' clause",
+                    expression.keywordSpan,
+                )
+                continue
+            }
+
+            expression.handler = handler
+            handler.handler.sites += site
+
+            val wanted = site.wantedType
+            val decided = handler.handler.returnType
+            if (decided == null) {
+                handler.handler.returnType = wanted
+            } else if (wanted != decided) {
+                diagnostics.error(
+                    "the first 'scratch' reaching this handler takes ${decided.displayName}, so " +
+                        "this one cannot take ${wanted?.displayName ?: "no value"}",
+                    expression.keywordSpan,
+                    notes = listOf(
+                        diagnostics.note(
+                            "the first site is here",
+                            handler.handler.sites.first().expression.keywordSpan,
+                        ),
+                    ),
+                )
+            }
+        }
+
+        // Now that each handler's return type is fixed, the `nyan`s written before it was known can
+        // be compared against it.
+        for ((handler, answer) in pendingNyanAnswers) {
+            val wanted = handler.handler.returnType ?: continue
+            if (!isAssignable(answer, wanted)) {
+                diagnostics.error(
+                    "this 'nyan' answers ${answer.displayName} but the 'scratch' sites reaching this " +
+                        "handler take ${wanted.displayName}",
+                    handler.extractorBody.span,
+                )
+            }
+        }
+
+        // A handler that `nyan`s a value while no `scratch` site asks for one still has to be emitted
+        // answering that value — otherwise the `nyan` would be a `return` of an `int` from a `void`
+        // method, which the verifier rejects. The type comes from the `nyan` itself, and comes second
+        // in precedence: a site that *does* ask decides, and a disagreement was already reported above.
+        for ((handler, answer) in pendingNyanAnswers) {
+            if (handler.handler.returnType == null) handler.handler.returnType = answer
+        }
+    }
+
+
+    /**
+     * The part both `try` forms share: check the callee may reach a handler, then analyze the
+     * extractor body in a scope binding the values it named.
      *
      * Returns the resolved callee, or `null` after reporting why the call cannot be caught.
      */
@@ -1535,6 +1792,13 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         }
 
         val expected = symbol?.emitTypes.orEmpty()
+
+        // Every handler is recorded whether or not its callee resolved, because a `scratch` site
+        // matching its signature still needs somewhere to point. A handler whose own `try` is already
+        // reported as broken then produces one error rather than a second, unrelated one.
+        if (symbol != null) {
+            registerHandler(statement, expected)
+        }
         // The call is resolved here rather than through `analyzeExpression`, so its type has to be
         // recorded by hand: code generation reads it to know what the call returns on the path where
         // it returns normally, which is where a `try` expression's value comes from.
@@ -1542,8 +1806,8 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         for (argument in call.arguments) analyzeExpression(argument)
 
         if (symbol == null) {
-            // Report the callee first — "not a function that may raise" is only actionable once the
-            // reader knows the call itself is fine. Resolve the receiver too, for `obj.f(...)`.
+            // Report the callee first — "not a function with an 'emit' clause" is only actionable once
+            // the reader knows the call itself is fine. Resolve the receiver too, for `obj.f(...)`.
             analyzeTryExtractor(statement, emptyList())
             return null
         }
@@ -1551,8 +1815,8 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         if (statement.extractorParameters.size > expected.size) {
             val extra = statement.extractorParameters[expected.size]
             diagnostics.error(
-                "this extractor names ${statement.extractorParameters.size} value(s) but " +
-                    "'${symbol.name}' raises ${expected.size}",
+                "this 'try' names ${statement.extractorParameters.size} value(s) but " +
+                    "'${symbol.name}' declares ${expected.size} in its 'emit' clause",
                 extra.span,
             )
         }
@@ -1566,8 +1830,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * callee's `emit` clause declares.
      */
     private fun analyzeTryExtractor(statement: ExtractorTry, expected: List<NekoType>) {
-        // A try extractor body is not a lambda: it runs in the enclosing function, so `this` and the
-        // enclosing variables are all still in scope, and a `raise` inside it behaves as usual.
+        // A try handler body is not a lambda: it is analysed in the enclosing function, so `this` and
+        // the enclosing variables are all still in scope here, and a `scratch` inside it behaves as
+        // usual. Note the gap that follows from that: code generation lifts the block out into a
+        // `static` method with no captures, so a handler that reads an enclosing local has no way to
+        // see it. Only the handler's own parameters and static state survive the move.
         val savedFunction = currentFunction
         val savedExtractor = currentExtractor
         // It is its own home for a `yield`, though: a `yield` written here produces the extractor's
@@ -1612,42 +1879,43 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     }
 
     /**
-     * Rejects a call to a function that may `raise` when nothing catches it.
+     * Rejects a call to a function with an `emit` clause when no `try` declares its handler.
      *
-     * A function with an `emit` clause may leave through `raise` rather than by returning, and the
-     * only thing that receives the raised values is a `try … { … -> }` extractor. Called anywhere
-     * else those values would have nowhere to go, so the call is an error rather than a value that
-     * is silently always null.
+     * A function with an `emit` clause may reach a handler, and the only thing that declares one is a
+     * `try … { … -> }` block. Called anywhere else, a `scratch` inside it would have nowhere to go, so
+     * the call is an error rather than a value that is silently always null.
      *
      * Note what is *not* claimed: the function still returns normally on the paths that do not
-     * raise, and its declared return type still describes those. The clause is about a second way
+     * scratch, and its declared return type still describes those. The clause is about a second way
      * out, not about the absence of the first.
      *
      * There is one exception, and it is the reason [forwardsRaiseUnchanged] exists: a caller that
-     * declares the *same* `emit` clause is not trying to receive the values, it is handing them on.
+     * declares the *same* `emit` clause is not trying to declare a handler, it is handing the clause
+     * on.
      */
     private fun checkCallableNormally(symbol: FunctionSymbol, span: Span) {
-        // A `try f(...)` extractor is exactly the construct that receives a `raise`, so the call it
+        // A `try f(...)` is exactly the construct that declares the handler, so the call it
         // wraps is the one place this requirement does not apply.
         if (resolvingTryCallee) return
         if (!symbol.canRaise) return
         if (forwardsRaiseUnchanged(symbol)) return
         diagnostics.error(
-            "'${symbol.name}' declares an 'emit' clause, so it may raise an effect, call it as " +
-                "'try ${symbol.name}(...) { ... -> }' to receive the values it 'raise's",
+            "'${symbol.name}' declares an 'emit' clause, so it may reach a 'try' handler; call it " +
+                "as 'try ${symbol.name}(...) { ... -> }' to declare the handler its 'scratch' sites " +
+                "look for",
             span,
         )
     }
 
     /**
      * Whether a call to [callee] here may stand as an ordinary call because this function forwards
-     * its `raise` to its own caller unchanged.
+     * its `emit` clause to its own caller unchanged.
      *
-     * A `raise` is a transfer of control to whoever can receive it. A function that declares the
-     * same `emit [T, ...]` clause as the one it is calling has nothing to do with the values: they
-     * are already in the form its own caller expects, so letting the exception travel one frame
-     * further is exactly as correct as catching it and raising it again. Requiring a `try` there
-     * would force every wrapper to unpack values only to hand them straight back.
+     * A `scratch` reaches whichever handler matches its signature, wherever that handler was written.
+     * A function that declares the same `emit [T, ...]` clause as the one it is calling has nothing to
+     * do with the values: they are already in the form its own caller expects, so letting a `scratch`
+     * inside the callee find the handler one frame up is exactly as correct as declaring one here.
+     * Requiring a `try` would force every wrapper to declare a handler that only passes the call on.
      *
      * The clauses must match *exactly*, type for type. `emit [int]` forwarding into `emit [Object]`
      * would not be a pass-through — it would need a conversion, and a `try` is where that belongs.
@@ -1657,16 +1925,29 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         if (!caller.canRaise) return false
         if (caller.emitTypes.size != callee.emitTypes.size) return false
         if (!caller.emitTypes.zip(callee.emitTypes).all { (mine, theirs) -> mine == theirs }) return false
-        // Recorded so the body check knows this function does reach its caller's extractor, even
-        // though it never writes `raise` itself.
+        // Recorded so the body check knows this function does reach its caller's handler, even
+        // though it never writes `scratch` itself.
         forwardsRaise = true
+        forwardsRaiseSymbols += caller
+        // The callee's clause is doing work too: it is what the forward matched against, so a
+        // function that only exists to be forwarded into is not a function with a useless clause.
+        forwardedCallees += callee
         return true
     }
 
+    /** The functions found to forward a caller's `emit` clause unchanged. */
+    private val forwardsRaiseSymbols = mutableListOf<FunctionSymbol>()
+
+    /** Functions whose `emit` clause some caller forwards unchanged. */
+    private val forwardedCallees = mutableSetOf<FunctionSymbol>()
+
+    /** Every declared function, so the end-of-run checks can revisit them. */
+    private val functionsByName = LinkedHashMap<String, FunctionSymbol>()
+
     /**
-     * Resolves the callee of a `try` statement, requiring a function that may `raise`.
+     * Resolves the callee of a `try`, requiring a function with an `emit` clause.
      *
-     * Returns the resolved symbol, or `null` after reporting why the call cannot be caught.
+     * Returns the resolved symbol, or `null` after reporting why the call cannot declare a handler.
      */
     private fun resolveRaiseableCallee(call: CallExpression): FunctionSymbol? {
         val callee = call.callee
@@ -1677,8 +1958,8 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 callee.resolution = selected
                 if (!selected.canRaise) {
                     diagnostics.error(
-                        "'${selected.name}' does not declare an 'emit' clause, so it never 'raises' " +
-                            "and this 'try' has nothing to catch",
+                        "'${selected.name}' does not declare an 'emit' clause, so it never " +
+                            "scratches and this 'try' has nothing to declare a handler for",
                         callee.span,
                     )
                 }
@@ -1699,8 +1980,8 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 return null
             }
             diagnostics.error(
-                "'try' needs a call to a function that may 'raise', but there is no function named " +
-                    "'${callee.name}'",
+                "'try' needs a call to a function with an 'emit' clause, but there is no function " +
+                    "named '${callee.name}'",
                 callee.span,
             )
             return null
@@ -1708,14 +1989,14 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
         if (callee is MemberAccessExpression) {
             // Reuse the ordinary member-call path so a bad `try` callee reports the same reasons a
-            // bad call would, then check the extra requirement that it may `raise`.
+            // bad call would, then check the extra requirement that it declares an `emit` clause.
             val type = analyzeMemberCall(call, callee)
             val resolved = callee.resolvedFunction
             if (resolved == null || type.isError) return null
             if (!resolved.canRaise) {
                 diagnostics.error(
-                    "'${resolved.name}' does not declare an 'emit' clause, so it never 'raises' " +
-                        "and this 'try' has nothing to catch",
+                    "'${resolved.name}' does not declare an 'emit' clause, so it never scratches " +
+                        "and this 'try' has nothing to declare a handler for",
                     callee.memberSpan,
                 )
             }
@@ -1726,8 +2007,8 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // callee of a `try`. Refer to the declaration by name instead.
         analyzeExpression(callee)
         diagnostics.error(
-            "'try' needs a call to a declared function, because only a declaration records which " +
-                "values it 'raise's",
+            "'try' needs a call to a declared function, because only a declaration records the " +
+                "values its 'scratch' sites pass",
             callee.span,
         )
         return null
@@ -2007,8 +2288,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         target.resolvedType = field.type
 
         // A `val` field is immutable once the object exists, so the only legal place to write it is
-        // the constructor that is building the object — which is exactly how the standard library
-        // stores the array a `raise` carried. Anywhere else the write is an error.
+        // the constructor that is building the object. Anywhere else the write is an error.
         if (!field.isMutable && !inConstructorAssignment(field)) {
             diagnostics.error(
                 "cannot assign to field '${field.name}' because it is declared with 'val'",
@@ -2054,11 +2334,12 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             // value without an expectation is all that is left to do.
             diagnostics.error(
                 if (extractor.acceptsYield) {
-                    "'return' cannot be used inside a 'try' extractor; use 'yield' to produce the " +
-                        "value of the 'try' expression"
+                    "'return' cannot be used inside a 'try' handler; use 'yield' to produce the " +
+                        "value of the 'try' expression, or 'nyan' to answer its 'scratch' site"
                 } else {
-                    "'return' cannot be used inside a 'try' extractor; it runs when the call " +
-                        "'raise's, so there is no function here to return from"
+                    "'return' cannot be used inside a 'try' handler; the block is compiled into a " +
+                        "method of its own, so there is no function here to return from — write " +
+                        "'nyan' to answer the 'scratch' site"
                 },
                 statement.keywordSpan,
             )
@@ -2105,23 +2386,31 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     }
 
     /**
-     * `yield x + y` — the value of the lambda it appears in, of the `try` expression whose extractor
-     * it is written in, or of the `nya` value form whose block it is written in.
+     * `yield x + y` — a departure with a value attached.
      *
-     * All three produce a value the same way, and in all three the first `yield` fixes the result type
-     * that later ones must match. Only the home of the value differs: a lambda's `yield` returns from
-     * the generated `invoke`, a `try` extractor's from the extractor class the compiler emits for it,
-     * and a `nya`'s from the branch the block is.
+     * Four homes accept it, and they are worth telling apart because they leave by different routes:
+     *
+     *  * **A function with an `emit` clause.** This is the one the sample exercises: `yield` throws
+     *    `EmitYieldException` carrying the value, and the `try` wrapping the call catches it and keeps
+     *    the value. It is how a function that cannot answer through `nyan` — because it never wrote a
+     *    `scratch` — still hands something back.
+     *  * **A lambda.** The value returns from the generated `invoke`.
+     *  * **A `try` extractor.** The value becomes the `try` expression's own value.
+     *  * **A `nya` used as a value.** The value becomes that branch's result.
+     *
+     * In all four the first `yield` fixes the result type that later ones must match.
      */
     private fun analyzeYield(statement: YieldStatement) {
         val lambda = currentLambda
         val extractor = currentExtractor
         val nya = currentNya
+        // A function whose `emit` clause lets it depart: `yield` is exactly how it does so.
+        val emitFunction = currentFunction?.takeIf { it.canRaise }
 
-        if (lambda == null && extractor == null && nya == null) {
+        if (lambda == null && extractor == null && nya == null && emitFunction == null) {
             diagnostics.error(
-                "'yield' can only be used inside a lambda, a 'try' expression or the blocks of a " +
-                    "'nya' used as a value; use 'return' to return from a function",
+                "'yield' can only be used inside a lambda, a 'try', a 'nya' used as a value, or a " +
+                    "function that declares an 'emit' clause; use 'return' to return from a function",
                 statement.keywordSpan,
             )
         }
@@ -2230,7 +2519,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * two loops in one method both declare `i`.
      *
      * Every part is optional. A missing condition means "always", so there is no test to require a
-     * `bool` of — `for (;;)` is an endless loop, and the only way out is a `return` or a `raise`.
+     * `bool` of — `for (;;)` is an endless loop, and the only way out is a `return` or a `yield`.
      */
     private fun analyzeFor(statement: ForStatement) {
         pushScope(statement)
@@ -2557,6 +2846,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         is IndexExpression -> analyzeIndexRead(expression)
         is NyaExpression -> analyzeNyaExpression(expression, expectedType)
         is TryExpression -> analyzeTryExpression(expression)
+        is ScratchExpression -> analyzeScratch(expression, expectedType)
     }
 
     // ------------------------------------------------------------------ literals
@@ -2820,7 +3110,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      *
      * Neko has no array literal, so an array can only come from elsewhere — a parameter, a field,
      * or a call into another language. Reading one element is therefore the only way to get at the
-     * contents, which is what the standard library's extractors need in order to unpack a `raise`.
+     * contents, which is what a `try` handler needs when it is handed an array.
      */
     private fun analyzeIndexRead(expression: IndexExpression): NekoType {
         val arrayType = requireArray(analyzeExpression(expression.array), expression.array.span)
@@ -4438,13 +4728,16 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         const val ITERABLE_INTERFACE = "com/github/kusa233/neko/stdlib/collection/Iterable"
 
         /**
-         * The standard library declarations `raise` and `try` are lowered against.
+         * Simple name of the exception a `yield` throws, shipped with the compiler.
          *
-         * A program that uses either needs every one of these present, because the generated code
-         * names them by their internal names: `EarlyEmitException` is what a `raise` throws, and
-         * `EmitExtractor` is what a `try` extractor implements.
+         * Not a standard library *Neko* declaration — nothing in `stdlib/` provides it — so it is
+         * never looked up among the program's classes; see [emitYieldExceptionAvailable].
          */
-        val STANDARD_LIBRARY_TYPES = listOf("EarlyEmitException", "EmitExtractor")
+        const val EMIT_YIELD_EXCEPTION_SIMPLE_NAME = "EmitYieldException"
+
+        /** Binary name of the same class, for asking the JVM whether it is there. */
+        const val EMIT_YIELD_EXCEPTION_BINARY_NAME =
+            "com.github.kusa233.neko.stdlib.emit.EmitYieldException"
 
         /**
          * The methods `java.lang.Enum` declares `final`, which an enum therefore cannot override.
@@ -4535,8 +4828,6 @@ private fun BlockStatement.alwaysReturns(): Boolean {
 
 private fun Statement.alwaysReturns(): Boolean = when (this) {
     is ReturnStatement -> true
-    // A `raise` transfers control to the caller's extractor by throwing, so it is terminating too.
-    is RaiseStatement -> true
     is BlockStatement -> alwaysReturns()
     is IfStatement -> elseBranch != null && thenBranch.alwaysReturns() && elseBranch.alwaysReturns()
     is WhenStatement -> hasElseBranch && branches.all { it.body.alwaysReturns() }
@@ -4550,11 +4841,12 @@ private fun Statement.alwaysReturns(): Boolean = when (this) {
     // A `for ... in` over an array or an iterable may always have zero elements, so it falls through.
     is ForEachStatement -> false
     // A `purr` block always runs its body, so it can only fall through if the body can. (A `try` is
-    // different: its extractor may not run at all.)
+    // different: its handler may not run at all.)
     is PurrStatement -> body.alwaysReturns()
     // A `try` returns only if every path out of it does, which is more than a conservative test can
     // tell; reporting "maybe falls through" is the safe answer.
-    is YieldStatement, is VariableDeclarationStatement, is AssignmentStatement,
+    // `scratch` is not terminating: the handler it calls answers a value, and the site continues.
+    is YieldStatement, is NyanStatement, is VariableDeclarationStatement, is AssignmentStatement,
     is ExpressionStatement, is TryStatement, is IndexAssignmentStatement,
     is IncrementStatement,
     -> false
@@ -4568,7 +4860,7 @@ private fun Statement.alwaysReturns(): Boolean = when (this) {
  * repeats the same test, so a chance that does not depend on the loop variable is a chance that comes.
  */
 private fun Statement.containsReturn(): Boolean = when (this) {
-    is ReturnStatement, is RaiseStatement -> true
+    is ReturnStatement -> true
     is BlockStatement -> statements.any { it.containsReturn() }
     is IfStatement -> thenBranch.containsReturn() || elseBranch?.containsReturn() == true
     is WhenStatement -> branches.any { it.body.containsReturn() }
@@ -4576,7 +4868,7 @@ private fun Statement.containsReturn(): Boolean = when (this) {
     is ForStatement -> body.containsReturn() || update?.containsReturn() == true
     is ForEachStatement -> body.containsReturn()
     is PurrStatement -> body.containsReturn()
-    is YieldStatement, is VariableDeclarationStatement, is AssignmentStatement,
+    is YieldStatement, is NyanStatement, is VariableDeclarationStatement, is AssignmentStatement,
     is ExpressionStatement, is TryStatement, is IndexAssignmentStatement,
     is IncrementStatement,
     -> false
@@ -4589,9 +4881,13 @@ private fun Statement.containsReturn(): Boolean = when (this) {
  * statements that unconditionally transfer control count here.
  */
 private fun Statement.terminatesFlow(): Boolean = when (this) {
-    is ReturnStatement, is RaiseStatement -> true
+    // A `nyan` leaves the enclosing `try` handler and never falls through to the next statement of
+    // that handler's block; a `return` leaves the function. A `yield` leaves by throwing, so it does
+    // not fall through either — whether it unwinds to a `try` or returns from a lambda, the statement
+    // after it in the same block is never reached.
+    is ReturnStatement, is NyanStatement, is YieldStatement -> true
     is BlockStatement -> statements.any { it.terminatesFlow() }
-    // A `purr` block runs unconditionally, so a `return` or `raise` inside it always terminates the
+    // A `purr` block runs unconditionally, so a `return` or `nyan` inside it always terminates the
     // method — the unlock the compiler inserts does not change where control ends up.
     is PurrStatement -> body.terminatesFlow()
     is IfStatement -> elseBranch != null && thenBranch.terminatesFlow() && elseBranch.terminatesFlow()
@@ -4602,7 +4898,8 @@ private fun Statement.terminatesFlow(): Boolean = when (this) {
 /** The words used when reporting a statement whose successors are unreachable. */
 private fun Statement.describeTerminator(): String = when (this) {
     is ReturnStatement -> "'return'"
-    is RaiseStatement -> "'raise'"
+    is NyanStatement -> "'nyan'"
+    is YieldStatement -> "'yield'"
     is BlockStatement -> "block"
     is IfStatement -> "'if'"
     is WhenStatement -> "'when'"
@@ -4611,38 +4908,53 @@ private fun Statement.describeTerminator(): String = when (this) {
 }
 
 /**
- * Whether this statement can `raise`, directly or anywhere inside it.
- * Used to reject a function that declares an `emit` clause but has no way to reach it: such a
- * function can only return normally, so a caller's `try` would never run its extractor.
+ * Whether this statement can reach a `try` handler, directly or through something it calls.
+ *
+ * An `emit` clause is satisfied by any of three things, and they are not the same:
+ *
+ *  * A `scratch`, which enters a handler and takes its answer.
+ *  * A `yield`, which leaves through the `try` that declared the handler.
+ *  * A call to another function with the same clause, which passes the ability on unchanged.
+ *
+ * Used to reject a function that declares an `emit` clause but has no way at all to reach a handler:
+ * such a function can only ever return normally, so the clause describes a departure that cannot
+ * happen.
  */
-private fun Statement.containsRaise(): Boolean = when (this) {
-    is RaiseStatement -> true
-    is BlockStatement -> statements.any { it.containsRaise() }
-    is IfStatement -> thenBranch.containsRaise() || elseBranch?.containsRaise() == true
-    is WhenStatement -> branches.any { it.body.containsRaise() }
-    is WhileStatement -> body.containsRaise()
-    is ForStatement -> body.containsRaise() || update?.containsRaise() == true
-    is ForEachStatement -> body.containsRaise()
-    // A `raise` in a `try` body belongs to that body's own function; the values it carries are
-    // handed to this statement's extractor instead.
-    is TryStatement -> extractorBody.statements.any { it.containsRaise() }
-    // A `raise` inside a `purr` block belongs to the enclosing function: the block is emitted inline,
-    // and the generated release runs on the way out of the throw rather than absorbing it.
-    is PurrStatement -> body.statements.any { it.containsRaise() }
-    // A `raise` written inside a `nya`'s blocks belongs to the function those blocks are emitted in,
-    // which is the enclosing one — so it counts here even though the `nya` itself cannot raise.
-    is ExpressionStatement -> expression.containsRaise()
+private fun Statement.reachesHandler(): Boolean = when (this) {
+    is BlockStatement -> statements.any { it.reachesHandler() }
+    is IfStatement -> thenBranch.reachesHandler() || elseBranch?.reachesHandler() == true
+    is WhenStatement -> branches.any { it.body.reachesHandler() }
+    is WhileStatement -> body.reachesHandler()
+    is ForStatement -> body.reachesHandler() || update?.reachesHandler() == true
+    is ForEachStatement -> body.reachesHandler()
+    // A `scratch` inside a `try`'s handler belongs to that handler's own function, but a `yield`
+    // there answers *this* `try` — which is the one case that makes the enclosing function's clause
+    // reachable from inside the block.
+    is TryStatement -> extractorBody.statements.any { it.reachesHandler() }
+    is PurrStatement -> body.statements.any { it.reachesHandler() }
+    is ExpressionStatement -> expression.reachesHandler()
+    is VariableDeclarationStatement -> initializer?.reachesHandler() == true
+    is ReturnStatement -> value?.reachesHandler() == true
+    is AssignmentStatement -> value.reachesHandler()
+    is IndexAssignmentStatement -> value.reachesHandler()
+    // A `yield` written directly in the body leaves through an enclosing `try`, so the function does
+    // reach a handler — the caller's.
+    is YieldStatement -> true
     else -> false
 }
 
-/**
- * Whether this expression contains a `raise`, which only a [`NyaExpression`] can: the blocks of a
- * `nya` are the one expression-shaped place a statement may be written.
- */
-private fun Expression.containsRaise(): Boolean = when (this) {
+/** Whether this expression reaches a `try` handler. See [Statement.reachesHandler]. */
+private fun Expression.reachesHandler(): Boolean = when (this) {
+    is ScratchExpression -> true
     is NyaExpression ->
-        failureBlock?.statements?.any { it.containsRaise() } == true ||
-            elseBlock?.statements?.any { it.containsRaise() } == true
+        failureBlock?.statements?.any { it.reachesHandler() } == true ||
+            elseBlock?.statements?.any { it.reachesHandler() } == true
+    is BinaryExpression -> left.reachesHandler() || right.reachesHandler()
+    is UnaryExpression -> operand.reachesHandler()
+    is ChainedComparisonExpression -> operands.any { it.reachesHandler() }
+    is CallExpression -> callee.reachesHandler() || arguments.any { it.reachesHandler() }
+    is IndexExpression -> array.reachesHandler() || index.reachesHandler()
+    is MemberAccessExpression -> receiver.reachesHandler()
     else -> false
 }
 
@@ -4671,6 +4983,11 @@ private fun Expression.containsRaise(): Boolean = when (this) {
  */
 private fun canThrowAssertion(expression: Expression): Boolean = when (expression) {
     is CallExpression, is NyaExpression, is TryExpression -> true
+
+    // `scratch` calls the handler method. Plainly written it can only reach a handler that was found
+    // — an unmatched site is an error — so the only assertion it can raise is one inside the values
+    // it passes.
+    is ScratchExpression -> expression.values.any { canThrowAssertion(it) }
 
     is BinaryExpression -> canThrowAssertion(expression.left) || canThrowAssertion(expression.right)
     is UnaryExpression -> canThrowAssertion(expression.operand)

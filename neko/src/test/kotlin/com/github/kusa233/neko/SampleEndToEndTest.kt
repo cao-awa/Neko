@@ -74,9 +74,7 @@ class SampleEndToEndTest {
      * package rather than on a list of names keeps that true as the library grows.
      */
     private fun isStandardLibraryClass(internalName: String): Boolean =
-        internalName.contains("EmitExtractor") ||
-            internalName.endsWith("/EarlyEmitException") ||
-            internalName.startsWith("com/github/kusa233/neko/stdlib/")
+        internalName.startsWith("com/github/kusa233/neko/stdlib/")
 
     @Test
     fun `the sample compiles without errors`() {
@@ -151,32 +149,31 @@ class SampleEndToEndTest {
     }
 
     @Test
-    fun `the exception sample produces the classes its emit lowering implies`() {
+    fun `the exception sample produces the classes its effect lowering implies`() {
         val result = compileSample(exceptionSamplePath())
-        // The sample's own class and the extractor literal's class. The `EmitExtractorN` interfaces
-        // and `EarlyEmitException` come from `samples/library`, which is compiled in the same run, so
-        // they are emitted alongside rather than supplied from outside.
+        // The sample's own class, and nothing else: a handler is a `static` method of the class the
+        // `try` was written in, not a class of its own. The old lowering needed a generated
+        // `EmitExtractor` class per handler because it passed values through a lambda; a method needs
+        // no such thing, so this set shrinking is the visible half of the change.
         val emitted = result.classes.keys.filterNot { isStandardLibraryClass(it) }
         assertEquals(
-            setOf(
-                "com/github/kusa233/neko/sample/ExceptionSample",
-                "com/github/kusa233/neko/sample/ExceptionSample\$Emit\$0",
-            ),
+            setOf("com/github/kusa233/neko/sample/ExceptionSample"),
             emitted.toSet(),
             "unexpected set of generated classes",
         )
         assertTrue(
-            result.classes.containsKey("com/github/kusa233/neko/stdlib/emit/EarlyEmitException"),
-            "the standard library must be emitted by the same run: ${result.classes.keys}",
+            result.classes.keys.none { it.contains("/emit/") },
+            "the Neko library no longer supplies effect classes: ${result.classes.keys}",
         )
     }
 
     @Test
-    fun `the exception sample lowers raise to the exception the spec describes`() {
+    fun `the exception sample lowers scratch to a static handler method`() {
         val result = compileSample(exceptionSamplePath())
         val bytes = result.classes.getValue("com/github/kusa233/neko/sample/ExceptionSample")
 
         val methods = mutableMapOf<String, MutableList<String>>()
+        val flags = mutableMapOf<String, Int>()
         org.objectweb.asm.ClassReader(bytes).accept(
             object : org.objectweb.asm.ClassVisitor(org.objectweb.asm.Opcodes.ASM9) {
                 override fun visitMethod(
@@ -187,6 +184,7 @@ class SampleEndToEndTest {
                     thrown: Array<out String>?,
                 ): org.objectweb.asm.MethodVisitor? {
                     methods.getOrPut(name) { mutableListOf() }.add(descriptor)
+                    flags[name] = access
                     if (name == "emitTest") {
                         methods.getOrPut("emitTest:thrown") { mutableListOf() }
                             .addAll(thrown.orEmpty().toList())
@@ -197,23 +195,35 @@ class SampleEndToEndTest {
             org.objectweb.asm.ClassReader.SKIP_CODE,
         )
 
-        // The spec's own names: `test$emit$0()` is the builder, and it is `private static` and
-        // returns `Object[]`.
+        // Three `try`s means three handlers, numbered in source order. Each takes only its `emit`
+        // clause — two `int`s — and answers the `int` the matching `scratch` site declared.
         assertEquals<List<String>>(
-            listOf("(II)[Ljava/lang/Object;"),
-            methods["emitTest\$emit\$0"].orEmpty(),
-            "the raise builder should box both values into an Object[]",
+            listOf("(III)I"),
+            methods["main\$scratch\$0"].orEmpty(),
+            "the first 'try' in 'main' should become a handler taking every emit value",
         )
-        // `raise` is a throw, so the raising function declares it and the caller can catch it.
+        // `public static`, because a `scratch` may be written in another class entirely.
+        val access = flags.getValue("main\$scratch\$0")
+        assertTrue(
+            access and org.objectweb.asm.Opcodes.ACC_STATIC != 0,
+            "a handler must be static so it has no receiver",
+        )
+        assertTrue(
+            access and org.objectweb.asm.Opcodes.ACC_PUBLIC != 0,
+            "a handler must be public so another class may call it",
+        )
+
+        // `emitTest` declares an `emit` clause and throws `EmitYieldException` to leave by it, so the
+        // attribute has to say so for a caller to know it may need catching.
         assertEquals<List<String>>(
-            listOf("com/github/kusa233/neko/stdlib/emit/EarlyEmitException"),
+            listOf("com/github/kusa233/neko/stdlib/emit/EmitYieldException"),
             methods["emitTest:thrown"].orEmpty(),
-            "a raising function must record EarlyEmitException",
+            "a function whose 'emit' clause is left by throwing must record the exception",
         )
     }
 
     @Test
-    fun `the exception sample runs and prints both raised values`() {
+    fun `the exception sample runs and prints what each path is worth`() {
         val directory = Files.createTempDirectory("neko-exception-sample")
         val result = compileSample(exceptionSamplePath(), outputDirectory = directory)
         assertTrue(!result.hasErrors, "the exception sample must compile before it can be run")
@@ -231,15 +241,18 @@ class SampleEndToEndTest {
             System.setOut(original)
         }
 
-        // `try emitTest(true) { emit1, emit2 -> ... }` and `raise 123, 456`: the extractor prints both
-        // values, so the output starts "123" then "456". This is the sample's whole point — the values
-        // crossed a frame boundary by being thrown, not returned. The line that follows the `raise`
-        // is the unreachable one, and `yield 1` is what the `try` expression is worth, so the
-        // `println(result)` that follows it prints that yielded `1`.
+        // Two calls, and the point of the sample is that they take different routes:
+        //
+        //  * `invoker(true)` scratches 123, 456 and 789, so the handler prints all three and answers
+        //    1 — which comes back through `scratch` to `emitTest`, out of its `return v`, and into
+        //    `kept`.
+        //  * `leave(2)` also scratches, but its handler `yield`s 7 rather than answering the site, so
+        //    the exception carries 7 up to the `try` that declared the handler. `leave` itself keeps
+        //    running with whatever came back to it.
         assertEquals(
-            listOf("123", "456", "1"),
+            listOf("123", "456", "789", "1", "7"),
             buffer.toString(Charsets.UTF_8).replace("\r\n", "\n").trim().lines(),
-            "the raised values should reach the extractor in order, then the yield should print",
+            "each path should be worth what its own mechanism gives it",
         )
     }
 
@@ -422,28 +435,13 @@ class SampleEndToEndTest {
     }
 
     @Test
-    fun `the exception sample's try expression is worth the extractor's yield`() {
+    fun `the exception sample's handler answers the value its scratch site takes`() {
         val result = compileSample(exceptionSamplePath())
-        val bytes = result.classes.getValue("com/github/kusa233/neko/sample/ExceptionSample\$Emit\$0")
+        val bytes = result.classes.getValue("com/github/kusa233/neko/sample/ExceptionSample")
 
-        // The extractor's body writes `yield 1`, so it implements the value-returning family and its
-        // `invoke` answers an `Object` — the boxed `1` the `try` expression receives when the call
-        // `raise`s instead of returning.
-        var interfaceName: String? = null
         val methods = mutableMapOf<String, String>()
         org.objectweb.asm.ClassReader(bytes).accept(
             object : org.objectweb.asm.ClassVisitor(org.objectweb.asm.Opcodes.ASM9) {
-                override fun visit(
-                    version: Int,
-                    access: Int,
-                    name: String,
-                    signature: String?,
-                    superName: String?,
-                    interfaces: Array<out String>?,
-                ) {
-                    interfaceName = interfaces?.firstOrNull()
-                }
-
                 override fun visitMethod(
                     access: Int,
                     name: String,
@@ -458,15 +456,14 @@ class SampleEndToEndTest {
             org.objectweb.asm.ClassReader.SKIP_CODE,
         )
 
+        // There is no extractor class any more: the `{ ... }` block became a method of the sample's own
+        // class, so this asserts on that method instead of on a generated interface's `invoke`. The
+        // handler `nyan`s 1, and the `scratch` that reaches it declares an `int`, so the method answers
+        // an `int` — the value the `try` is worth when the call returns through it.
         assertEquals(
-            "com/github/kusa233/neko/stdlib/emit/EmitExtractorWithResult2",
-            interfaceName,
-            "an extractor that yields must implement the value-returning family",
-        )
-        assertEquals(
-            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            methods["invoke"],
-            "the yielding invoke returns the value, erased to Object",
+            "(III)I",
+            methods["main\$scratch\$0"],
+            "the handler takes its emit values and answers what the scratch site declared",
         )
     }
 
@@ -494,27 +491,34 @@ class SampleEndToEndTest {
     }
 
     /**
-     * The sample's unreachable statement after `raise` must be reported at error level, on the line
-     * the comment names.
+     * The statement after a departing `yield` must be reported at error level.
+     *
+     * The sample used to carry an `raise` with an unreachable line beneath it; with `scratch` there is
+     * no such thing, because `scratch` *returns*. The unreachable case now belongs to `yield`, so the
+     * test builds that program rather than reading it out of the sample — the rule is the same one.
      */
     @Test
-    fun `the statement after raise is an error at the line the sample marks`() {
-        val original = Files.readString(exceptionSamplePath())
-        val uncommented = original.replace(
-            "// Unreachable, notice as error level.",
-            "println(\"unreachable\")",
+    fun `the statement after a yield is an error at the line it sits on`() {
+        val content = TestSupport.file(
+            "class Emitter {",
+            "    static {",
+            "        fun value(): int {",
+            "            yield 1",
+            "            println(\"unreachable\")",
+            "            return 2",
+            "        } emit [int]",
+            "    }",
+            "}",
         )
-        assertTrue(uncommented != original, "the sample should still mark the unreachable line")
-
-        val error = analyzeWithLibrary("ExceptionSample.neko", uncommented).single()
+        val error = analyzeWithLibrary("Emit.neko", content).single()
         assertEquals(
-            "unreachable statement: execution cannot continue past the preceding 'raise'",
+            "unreachable statement: execution cannot continue past the preceding 'yield'",
             error.message,
         )
         assertEquals(
-            TestSupport.locationOf(uncommented, "println(\"unreachable\")"),
+            TestSupport.locationOf(content, "println(\"unreachable\")"),
             "${error.span?.line}:${error.span?.column}",
-            "the error belongs where the sample's comment sits",
+            "the error belongs on the unreachable line",
         )
     }
 
@@ -526,8 +530,8 @@ class SampleEndToEndTest {
         //
         // The sample never writes a `throws` clause — that keyword is gone from the language. It
         // writes `} emit [int, int]`, which is the same promise in the language's own spelling: the
-        // function can leave by raising rather than by returning. The lowering must still record
-        // `EarlyEmitException` in the class file, so a JVM tool reading it sees the failure mode.
+        // function may leave by throwing rather than by returning. The class file records
+        // `EmitYieldException`, which is what that departure actually is now.
         val reader = org.objectweb.asm.ClassReader(bytes)
         val exceptions = mutableListOf<String>()
         reader.accept(
@@ -546,7 +550,7 @@ class SampleEndToEndTest {
             org.objectweb.asm.ClassReader.SKIP_CODE,
         )
         assertEquals(
-            listOf("com/github/kusa233/neko/stdlib/emit/EarlyEmitException"),
+            listOf("com/github/kusa233/neko/stdlib/emit/EmitYieldException"),
             exceptions,
             "an 'emit' clause belongs in the class file's Exceptions attribute",
         )

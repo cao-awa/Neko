@@ -136,13 +136,13 @@ class ImportTest {
     @Test
     fun `the standard library needs no import`() {
         // The whole point: a program in a package of its own — not the library's, not the sample's —
-        // uses `raise` and `try` with no `import` at all.
+        // uses `scratch` and `try` with no `import` at all.
         val program = TestSupport.file(
             "class Main() {",
             "    static {",
             "        fun main() {",
             "            value: int = try Emitter.test() { raised ->",
-            "                yield raised + 1",
+            "                nyan raised + 1",
             "            }",
             "            println(value)",
             "        }",
@@ -152,7 +152,8 @@ class ImportTest {
             "class Emitter() {",
             "    static {",
             "        fun test(): int {",
-            "            raise 5",
+            "            v: int = scratch 5",
+            "            return v",
             "        } emit [int]",
             "    }",
             "}",
@@ -177,7 +178,7 @@ class ImportTest {
             "    static {",
             "        fun main() {",
             "            value: int = try Emitter.test() { raised ->",
-            "                yield raised",
+            "                nyan raised",
             "            }",
             "            println(value)",
             "        }",
@@ -187,7 +188,8 @@ class ImportTest {
             "class Emitter() {",
             "    static {",
             "        fun test(): int {",
-            "            raise 3",
+            "            v: int = scratch 3",
+            "            return v",
             "        } emit [int]",
             "    }",
             "}",

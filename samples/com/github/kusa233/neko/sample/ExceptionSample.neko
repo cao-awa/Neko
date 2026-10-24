@@ -3,28 +3,55 @@ locate com.github.kusa233.neko.sample
 class ExceptionSample() {
     static {
         fun main(args: string[]) {
-            result: int = try invoker() { emit1, emit2 ->
+            // The `{ ... }` block is the handler, and this `try` is the only one for `emit [int, int,
+            // int]` — a `scratch` finds its handler by that signature alone, so two handlers declaring
+            // the same clause would be indistinguishable from a site's point of view. (The other
+            // samples are compiled in the same run, so a signature another one already uses is taken.)
+            //
+            // `invoker(true)` reaches it with `scratch 123, 456, 789`, so all three values are printed
+            // and the handler answers 1. That answer comes back through the `scratch` call, out of
+            // `emitTest`'s `return v`, and lands in `kept`.
+            kept: int = try invoker(true) { emit1, emit2, emit3 ->
                 println(emit1)
                 println(emit2)
-                yield 1
+                println(emit3)
+                nyan 1
             }
-            println(result)
-            // Error to compile: 'invoker' has an 'emit' clause, so it may raise an effect.
-            // Call it with 'try invoker() { emit1, emit2 -> ... }' to receive what it 'raise's.
-            // result = invoker()
+            println(kept)
+
+            // A handler may instead leave through the `try` rather than answer the `scratch` site.
+            // `leave` scratches, but its handler `yield`s rather than `nyan`s: the value is thrown as
+            // an `EmitYieldException`, caught here, and becomes what the `try` is worth. The `nyan`
+            // path and the `yield` path are the two ways a handler can finish, side by side.
+            left: int = try leave(2) { amount ->
+                yield amount + 5
+            }
+            println(left)
         }
 
-        fun invoker(): int {
-            return emitTest(true)
-        } emit [int, int]
+        fun invoker(flag: bool): int {
+            return emitTest(flag)
+        } emit [int, int, int]
 
         fun emitTest(flag: bool): int {
             if (flag) {
-                raise 123, 456
-                // Unreachable, notice as error level.
+                // Enters the handler written above, and is worth whatever it answers.
+                v: int = scratch 123, 456, 789
+                return v
             } else {
+                // No `scratch` on this path, so the call simply returns: the `try` is worth 789 and
+                // the handler never runs. That is the contrast worth seeing — a `scratch` is a call,
+                // not a departure, so a function that does not reach one behaves like any other.
                 return 789
             }
-        } emit [int, int]
+        } emit [int, int, int]
+
+        // Scratches, but this handler answers the `try` with a `yield` rather than the site with a
+        // `nyan`, so the value never comes back here — `leave` carries on with whatever the handler
+        // gave it, which is why the `return` says `v` and never reaches the caller.
+        fun leave(amount: int): int {
+            v: int = scratch amount
+            return v
+        } emit [int]
     }
 }

@@ -5,24 +5,29 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
- * Tests for `raise`, `emit` and `try`.
+ * Tests for `scratch`, `nyan`, `yield`, `emit` and `try`.
  *
- * The rule is that a function declaring an `emit` clause hands its values back by *leaving early* —
- * it throws a carrier that the caller's `try` catches and unpacks. The generated code is inspected
- * where the shape matters (the builder's name and descriptor) and run where the behaviour matters,
- * because the point of the lowering is that the values survive the frame boundary intact.
+ * The rule these pin down is the one the sample describes, and it is worth stating plainly because
+ * it is easy to assume the old behaviour: **`scratch` does not throw.** A `try`'s `{ ... }` block is
+ * compiled into a `static` method, and a `scratch` whose `emit` clause matches that handler calls it
+ * with `invokestatic` and carries on with whatever it answers — so `v: int = scratch 1, 2` is an
+ * ordinary initialisation whose right-hand side happens to be a call.
  *
- * These programs `locate com.github.kusa233.neko.sample`, the same package as `ExceptionSample.neko`.
- * Neko resolves a name against the file's own package and without an `import`, so the standard
- * library `EarlyEmitException` and `EmitExtractorN` — which are themselves Neko sources under
- * `stdlib` — are only reachable from that package. Writing these fixtures anywhere else
- * would test a program whose generated code names classes it cannot see.
+ * Only two things transfer control:
  *
- * A `try` comes in the two forms the language gives it. The *statement* form
- * `try f(10) { a, b -> ... }` discards what the call raises and is implemented by `EmitExtractorN`,
- * whose `invoke` answers nothing. The *expression* form `r: int = try f() { a -> yield 1 }` is worth
- * a value and is implemented by `EmitExtractorWithResultN`, whose `invoke` answers the `yield` — and
- * when the call returns normally instead, the `try` is worth the call's own return value.
+ *  * **`yield`** leaves through the `try` rather than through the handler, so it throws
+ *    `EmitYieldException` carrying its value. The `try` catches it and keeps the value as the
+ *    construct's own result, which is why a `try` used as a value needs a `yield` on the path where
+ *    the call did not return normally.
+ *  * **`nyan`** leaves the handler it is written in, answering a value to the `scratch` site that
+ *    reached it. It is a plain `return` from the generated method.
+ *
+ * The two are not interchangeable, and the difference is the point: `scratch` 1 enters, `nyan`
+ * answers the site that entered, `yield` answers the `try` that declared the handler.
+ *
+ * These programs `locate com.github.kusa233.neko.sample`, the same package as
+ * `EffectRecovery.neko`, because that is where the sample puts them and a diagnostic quoting a file
+ * should point at the code the sample actually shows.
  */
 class EmitTest {
 
@@ -36,12 +41,35 @@ class EmitTest {
         }
     }
 
-    /** A raising `Emitter` and a `Main` that catches it, the shape the sample describes. */
-    private fun raisingProgram(): String = samplePackage(
+    /**
+     * The shape `EffectRecovery.neko` describes: `b` scratches, `nyanTest`'s handler answers, and
+     * `a` forwards.
+     *
+     * It is the smallest program where the three keywords meet: `b` writes the `scratch`, `nyanTest`
+     * writes the handler that receives it, and `a` sits in between so that the `scratch` runs two
+     * frames below the `try` that declared the handler.
+     */
+    private fun recoveryProgram(): String = samplePackage(
         "class Emitter {",
         "    static {",
-        "        fun test(multiplier: int) {",
-        "            raise 1 * multiplier, multiplier",
+        "        fun nyanTest(): int {",
+        "            v: int = try a() { a, b ->",
+        "                if (a + b == 3) {",
+        "                    nyan a + b",
+        "                } else {",
+        "                    yield 10",
+        "                }",
+        "            }",
+        "            return v",
+        "        }",
+        "",
+        "        fun a(): int {",
+        "            return b()",
+        "        } emit [int, int]",
+        "",
+        "        fun b(): int {",
+        "            v: int = scratch 1, 2",
+        "            return v * 10",
         "        } emit [int, int]",
         "    }",
         "}",
@@ -49,551 +77,102 @@ class EmitTest {
         "class Main {",
         "    static {",
         "        fun main() {",
-        "            try Emitter.test(10) { first, second ->",
-        "                println(first)",
-        "                println(second)",
-        "            }",
+        "            println(Emitter.nyanTest())",
         "        }",
         "    }",
         "}",
     )
 
-    /** Compiles [source] into a fresh directory together with the standard library, and loads it. */
-    private fun loadWithSupport(source: String): TestSupport.LoadedProgram =
-        TestSupport.loadWithLibrary(source, name = "Emit.neko")
+    /** Compiles [source] and loads it. Nothing here needs the standard library any more. */
+    private fun load(source: String): TestSupport.LoadedProgram =
+        TestSupport.load(source, name = "Emit.neko")
+
+    /** Runs `Main.main` and returns what it printed. */
+    private fun run(program: TestSupport.LoadedProgram): String =
+        program.capturingOutput { program.invoke("com.github.kusa233.neko.sample.Main", "main") }
+
+    // ------------------------------------------------------------------ the whole mechanism
 
     @Test
-    fun `a raise compiles and hands both values to the extractor`() {
-        val program = loadWithSupport(raisingProgram())
-        val output = program.capturingOutput {
-            program.invoke("com.github.kusa233.neko.sample.Main", "main")
-        }
-        // `raise 1 * 10, 10` — the values cross the frame boundary by being thrown, and arrive in
-        // the order the `raise` named them.
-        assertEquals("10\n10\n", output)
+    fun `a scratch reaches its handler and the nyan answer comes back`() {
+        // `b` scratches 1 and 2, the handler answers 3, and `b` returns 30 — so the value crossed two
+        // frames without an exception, which is what makes this a different mechanism from `raise`.
+        assertEquals("30\n", run(load(recoveryProgram())))
     }
 
     @Test
-    fun `a raising function names its builder after itself`() {
-        val result = compileInSamplePackage(raisingProgram())
-        assertTrue(!result.hasErrors, "the program must compile first")
+    fun `the handler is a static method named after the function holding the try`() {
+        val result = TestSupport.compile(recoveryProgram(), name = "Emit.neko")
+        assertTrue(!result.hasErrors, "the program must compile first: ${TestSupport.messages(result)}")
+
         val methods = methodDescriptors(result.classes.getValue("com/github/kusa233/neko/sample/Emitter"))
-
-        // The sample's own naming: `test$emit$0()`, `private static`, returning `Object[]` — and it
-        // takes one `int` per raised value, so `raise 1 * multiplier, multiplier` gives it two.
+        // The sample's own naming: `nyanTest$scratch$0`, taking the two `int`s of the `emit` clause
+        // and answering the `int` the scratch site declared.
         assertEquals(
-            "(II)[Ljava/lang/Object;",
-            methods["test\$emit\$0"],
-            "the builder should box the raised values into an Object[]",
+            "(II)I",
+            methods["nyanTest\$scratch\$0"],
+            "the handler should take its emit values and answer what the site declared",
         )
     }
 
     @Test
-    fun `a raising function records the exception it throws`() {
-        val result = compileInSamplePackage(raisingProgram())
-        // The spec's line 31: a function with an `emit` clause declares that it can raise.
-        assertEquals(
-            listOf("com/github/kusa233/neko/stdlib/emit/EarlyEmitException"),
-            thrownTypesOf(result.classes.getValue("com/github/kusa233/neko/sample/Emitter"), "test"),
-            "an 'emit' clause must reach the class file's Exceptions attribute",
-        )
-    }
-
-    @Test
-    fun `a function with an emit clause must actually raise`() {
-        val result = TestSupport.compile(
-            TestSupport.file(
-                "class Emitter {",
-                "    static {",
-                "        fun test() {",
-                "            println(\"no raise\")",
-                "        } emit [int]",
-                "    }",
-                "}",
-            ),
-        )
-        assertTrue(
-            TestSupport.errors(result).any { it.message.contains("can never 'raise'") },
-            "unexpected messages: ${TestSupport.messages(result)}",
-        )
-    }
-
-    @Test
-    fun `a try needs a callee that can raise`() {
-        val result = TestSupport.compileWithLibrary(
-            TestSupport.file(
-                "class Emitter {",
-                "    static {",
-                "        fun plain() {",
-                "        }",
-                "    }",
-                "}",
-                "",
-                "class Main {",
-                "    static {",
-                "        fun main() {",
-                "            try Emitter.plain() { ->",
-                "                println(\"never\")",
-                "            }",
-                "        }",
-                "    }",
-                "}",
-            ),
-        )
-        assertTrue(
-            TestSupport.errors(result).any { it.message.contains("nothing to catch") },
-            "unexpected messages: ${TestSupport.messages(result)}",
-        )
-    }
-
-    @Test
-    fun `a raise may not leave a function without an emit clause`() {
-        val result = TestSupport.compileWithLibrary(
-            TestSupport.file(
-                "class Emitter {",
-                "    static {",
-                "        fun test() {",
-                "            raise 1",
-                "        }",
-                "    }",
-                "}",
-            ),
-        )
-        assertTrue(
-            TestSupport.errors(result).any { it.message.contains("emit") },
-            "unexpected messages: ${TestSupport.messages(result)}",
-        )
-    }
-
-    @Test
-    fun `the number of raised values must match the emit clause`() {
-        val result = TestSupport.compileWithLibrary(
-            TestSupport.file(
-                "class Emitter {",
-                "    static {",
-                "        fun test() {",
-                "            raise 1",
-                "        } emit [int, int]",
-                "    }",
-                "}",
-            ),
-        )
-        assertTrue(
-            TestSupport.errors(result).any { it.message.contains("2") },
-            "unexpected messages: ${TestSupport.messages(result)}",
-        )
-    }
-
-    @Test
-    fun `the statement after a raise is unreachable at error level`() {
-        val source = TestSupport.file(
-            "class Emitter {",
-            "    static {",
-            "        fun test() {",
-            "            raise 1",
-            "            println(\"unreachable\")",
-            "        } emit [int]",
-            "    }",
-            "}",
-        )
-        val error = TestSupport.errors(TestSupport.compileWithLibrary(source)).single()
-        assertEquals(
-            "unreachable statement: execution cannot continue past the preceding 'raise'",
-            error.message,
-        )
-        assertEquals(
-            TestSupport.locationOf(source, "println"),
-            "${error.span?.line}:${error.span?.column}",
-            "the error belongs on the unreachable statement",
-        )
-    }
-
-    @Test
-    fun `an emit clause may be combined with a return type`() {
-        // A raiseable function may also answer a value on the path where it returns instead of
-        // raising; the two are not exclusive. Which one the caller observed is what a `try`
-        // expression resolves: the call's own value, or the extractor's `yield`.
-        val program = loadWithSupport(
+    fun `a scratch does not throw, so a yielding handler still leaves through the try`() {
+        // `b` scratches 4 and 5, the sum is not 3, so the handler `yield`s 10 instead of answering —
+        // and the value arrives at the `try` rather than back at `b`, which is why the answer is 10
+        // and not 45.
+        val program = load(
             samplePackage(
                 "class Emitter {",
                 "    static {",
-                "        fun test(mode: int): int {",
-                "            if (mode == 1) {",
-                "                raise 9",
-                "            }",
-                "            return 3",
-                "        } emit [int]",
-                "    }",
-                "}",
-                "",
-                "class Main {",
-                "    static {",
-                "        fun main() {",
-                "            returned: int = try Emitter.test(0) { value ->",
-                "                yield value * 10",
-                "            }",
-                "            println(returned)",
-                "            raised: int = try Emitter.test(1) { value ->",
-                "                yield value * 10",
-                "            }",
-                "            println(raised)",
-                "        }",
-                "    }",
-                "}",
-            ),
-        )
-        val output = program.capturingOutput {
-            program.invoke("com.github.kusa233.neko.sample.Main", "main")
-        }
-        // The first call returns `3`, so the `try` is worth the call's own value and the extractor
-        // never runs. The second `raise`s `9`, so the extractor's `yield 9 * 10` is what the `try`
-        // is worth instead.
-        assertEquals("3\n90\n", output, "the try should be worth whichever path was taken")
-    }
-
-    @Test
-    fun `a yielding extractor implements the value-returning extractor family`() {
-        val result = compileInSamplePackage(
-            samplePackage(
-                "class Emitter {",
-                "    static {",
-                "        fun test(): int {",
-                "            raise 5",
-                "        } emit [int]",
-                "    }",
-                "}",
-                "",
-                "class Main {",
-                "    static {",
-                "        fun main() {",
-                "            value: int = try Emitter.test() { raised ->",
-                "                yield raised + 1",
-                "            }",
-                "            println(value)",
-                "        }",
-                "    }",
-                "}",
-            ),
-        )
-        assertTrue(!result.hasErrors, "the program must compile first")
-
-        val extractor = result.classes.keys.single { it.endsWith("\$Emit\$0") }
-        val methods = methodDescriptors(result.classes.getValue(extractor))
-        assertEquals(
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            methods["invoke"],
-            "the yielding invoke must answer the value, erased to Object",
-        )
-        assertTrue(
-            interfacesOf(result.classes.getValue(extractor))
-                .contains("com/github/kusa233/neko/stdlib/emit/EmitExtractorWithResult1"),
-            "a yielding extractor must implement the value-returning family",
-        )
-    }
-
-    @Test
-    fun `an extractor that does not yield implements the void extractor family`() {
-        val result = compileInSamplePackage(raisingProgram())
-        val extractor = result.classes.keys.single { it.endsWith("\$Emit\$0") }
-        assertEquals(
-            "(Ljava/lang/Object;Ljava/lang/Object;)V",
-            methodDescriptors(result.classes.getValue(extractor))["invoke"],
-            "a statement-form extractor's invoke answers nothing",
-        )
-        assertTrue(
-            interfacesOf(result.classes.getValue(extractor))
-                .contains("com/github/kusa233/neko/stdlib/emit/EmitExtractor2"),
-            "a non-yielding extractor must implement the void family",
-        )
-    }
-
-    @Test
-    fun `a try used as a value needs a yield`() {
-        val result = TestSupport.compileWithLibrary(
-            TestSupport.file(
-                "class Emitter {",
-                "    static {",
-                "        fun test(): int {",
-                "            raise 5",
-                "        } emit [int]",
-                "    }",
-                "}",
-                "",
-                "class Main {",
-                "    static {",
-                "        fun main() {",
-                "            value: int = try Emitter.test() { raised ->",
-                "                println(raised)",
-                "            }",
-                "        }",
-                "    }",
-                "}",
-            ),
-        )
-        assertTrue(
-            TestSupport.errors(result).any { it.message.contains("must 'yield'") },
-            "unexpected messages: ${TestSupport.messages(result)}",
-        )
-    }
-
-    @Test
-    fun `a yield may not appear in the extractor of a try statement`() {
-        // The statement form discards the value, so a `yield` there would produce something no one
-        // could ever read.
-        val result = TestSupport.compileWithLibrary(
-            TestSupport.file(
-                "class Emitter {",
-                "    static {",
-                "        fun test(): int {",
-                "            raise 5",
-                "        } emit [int]",
-                "    }",
-                "}",
-                "",
-                "class Main {",
-                "    static {",
-                "        fun main() {",
-                "            try Emitter.test() { raised ->",
-                "                yield raised",
-                "            }",
-                "        }",
-                "    }",
-                "}",
-            ),
-        )
-        assertTrue(
-            TestSupport.errors(result).any { it.message.contains("cannot 'yield'") },
-            "unexpected messages: ${TestSupport.messages(result)}",
-        )
-    }
-
-    @Test
-    fun `a return may not appear inside a try extractor`() {
-        val result = TestSupport.compileWithLibrary(
-            TestSupport.file(
-                "class Emitter {",
-                "    static {",
-                "        fun test(): int {",
-                "            raise 5",
-                "        } emit [int]",
-                "    }",
-                "}",
-                "",
-                "class Main {",
-                "    static {",
-                "        fun main() {",
-                "            value: int = try Emitter.test() { raised ->",
-                "                return raised",
-                "            }",
-                "        }",
-                "    }",
-                "}",
-            ),
-        )
-        assertTrue(
-            TestSupport.errors(result).any { it.message.contains("'return' cannot be used inside") },
-            "unexpected messages: ${TestSupport.messages(result)}",
-        )
-    }
-
-    @Test
-    fun `a call to a raiseable function is a plain call when the caller declares the same emit clause`() {
-        // A wrapper that declares the same clause has nothing to do with the values: they are
-        // already in the form its own caller expects, so letting the exception travel one frame
-        // further is the same as catching it and raising it again. Requiring a `try` here would
-        // force every wrapper to unpack values only to hand them straight back.
-        val program = loadWithSupport(
-            samplePackage(
-                "class Emitter {",
-                "    static {",
-                "        fun inner(multiplier: int) {",
-                "            raise 2 * multiplier, multiplier",
-                "        } emit [int, int]",
-                "",
-                "        fun outer(multiplier: int) {",
-                "            inner(multiplier)",
-                "        } emit [int, int]",
-                "    }",
-                "}",
-                "",
-                "class Main {",
-                "    static {",
-                "        fun main() {",
-                "            try Emitter.outer(10) { first, second ->",
-                "                println(first)",
-                "                println(second)",
-                "            }",
-                "        }",
-                "    }",
-                "}",
-            ),
-        )
-        val output = program.capturingOutput {
-            program.invoke("com.github.kusa233.neko.sample.Main", "main")
-        }
-        assertEquals("20\n10\n", output, "the raise should pass through the wrapper untouched")
-    }
-
-    @Test
-    fun `a passing-through wrapper records that it may raise`() {
-        val result = compileInSamplePackage(
-            samplePackage(
-                "class Emitter {",
-                "    static {",
-                "        fun inner() {",
-                "            raise 1",
-                "        } emit [int]",
-                "",
-                "        fun outer() {",
-                "            inner()",
-                "        } emit [int]",
-                "    }",
-                "}",
-            ),
-        )
-        assertTrue(!result.hasErrors, "unexpected messages: ${TestSupport.messages(result)}")
-        // `outer` never writes `raise` itself, but the exception it forwards still leaves through it,
-        // so its caller must be able to catch it there.
-        assertEquals(
-            listOf("com/github/kusa233/neko/stdlib/emit/EarlyEmitException"),
-            thrownTypesOf(result.classes.getValue("com/github/kusa233/neko/sample/Emitter"), "outer"),
-            "a wrapper must declare the exception it forwards",
-        )
-    }
-
-    @Test
-    fun `a call still needs a try when the emit clauses differ`() {
-        // `emit [int]` forwarding into `emit [Object]` is not a pass-through: it would need a
-        // conversion, and a `try` is where that belongs.
-        val result = TestSupport.compileWithLibrary(
-            TestSupport.file(
-                "class Emitter {",
-                "    static {",
-                "        fun inner() {",
-                "            raise 1",
-                "        } emit [int]",
-                "",
-                "        fun outer() {",
-                "            inner()",
-                "        } emit [Object]",
-                "    }",
-                "}",
-            ),
-        )
-        assertTrue(
-            TestSupport.errors(result).any { it.message.contains("may raise an effect") },
-            "unexpected messages: ${TestSupport.messages(result)}",
-        )
-    }
-
-    @Test
-    fun `a call to a raiseable function needs a try when the caller cannot raise`() {
-        val result = TestSupport.compileWithLibrary(
-            TestSupport.file(
-                "class Emitter {",
-                "    static {",
-                "        fun inner() {",
-                "            raise 1",
-                "        } emit [int]",
-                "",
-                "        fun outer() {",
-                "            inner()",
-                "        }",
-                "    }",
-                "}",
-            ),
-        )
-        assertTrue(
-            TestSupport.errors(result).any { it.message.contains("may raise an effect") },
-            "unexpected messages: ${TestSupport.messages(result)}",
-        )
-    }
-
-    @Test
-    fun `a try used as a value works inside a lambda`() {
-        // The extractor becomes a class of its own, emitted inside whichever method it appears in. If
-        // that method is a lambda, whatever the extractor reads from the enclosing scope has to be
-        // forwarded by the lambda first — exactly as a nested lambda's reads are.
-        val program = loadWithSupport(
-            samplePackage(
-                "class Emitter {",
-                "    static {",
-                "        fun test(): int {",
-                "            raise 5",
-                "        } emit [int]",
-                "    }",
-                "}",
-                "",
-                "class Main {",
-                "    static {",
-                "        fun main() {",
-                "            prefix: int = 100",
-                "            read: [int] -> int = { extra ->",
-                "                yield try Emitter.test() { raised ->",
-                "                    yield prefix + raised + extra",
+                "        fun nyanTest(): int {",
+                "            v: int = try a() { a, b ->",
+                "                if (a + b == 3) {",
+                "                    nyan a + b",
+                "                } else {",
+                "                    yield 10",
                 "                }",
                 "            }",
-                "            println(read(1))",
+                "            return v",
                 "        }",
-                "    }",
-                "}",
-            ),
-        )
-        val output = program.capturingOutput {
-            program.invoke("com.github.kusa233.neko.sample.Main", "main")
-        }
-        assertEquals("106\n", output, "the extractor must see what the lambda captured")
-    }
-
-    @Test
-    fun `a try used as a value carries a string`() {
-        val program = loadWithSupport(
-            samplePackage(
-                "class Emitter {",
-                "    static {",
-                "        fun test(): string {",
-                "            raise 5",
-                "        } emit [int]",
+                "",
+                "        fun a(): int {",
+                "            return b()",
+                "        } emit [int, int]",
+                "",
+                "        fun b(): int {",
+                "            v: int = scratch 4, 5",
+                "            return v * 10",
+                "        } emit [int, int]",
                 "    }",
                 "}",
                 "",
                 "class Main {",
                 "    static {",
                 "        fun main() {",
-                "            label: string = try Emitter.test() { raised ->",
-                "                yield \"raised\"",
-                "            }",
-                "            println(label)",
+                "            println(Emitter.nyanTest())",
                 "        }",
                 "    }",
                 "}",
             ),
         )
-        val output = program.capturingOutput {
-            program.invoke("com.github.kusa233.neko.sample.Main", "main")
-        }
-        assertEquals("raised\n", output, "the value must survive as a string")
+        assertEquals("10\n", run(program), "the yield should answer the try, not the scratch")
     }
 
     @Test
-    fun `a try used as a value needs the standard library just as a raise does`() {
-        // The value form names `EmitExtractorWithResultN` in the class it generates, so a program
-        // without the library must be told at compile time rather than at load time.
+    fun `a handler that answers nothing is declared to return void`() {
+        // A `scratch` written as an expression statement of its own: nothing takes the value, so the
+        // handler has no reason to answer one and is emitted as `void`.
         val result = TestSupport.compile(
             samplePackage(
                 "class Emitter {",
                 "    static {",
-                "        fun test(): int {",
-                "            raise 5",
-                "        } emit [int]",
-                "    }",
-                "}",
+                "        fun fire(a: int, b: int) {",
+                "            scratch a, b",
+                "        } emit [int, int]",
                 "",
-                "class Main {",
-                "    static {",
-                "        fun main() {",
-                "            value: int = try Emitter.test() { raised ->",
-                "                yield raised",
+                "        fun run() {",
+                "            try fire(1, 2) { a, b ->",
+                "                println(a + b)",
                 "            }",
                 "        }",
                 "    }",
@@ -601,88 +180,557 @@ class EmitTest {
             ),
             name = "Emit.neko",
         )
-        assertTrue(
-            TestSupport.errors(result).any { it.message.contains("standard library") },
-            "unexpected messages: ${TestSupport.messages(result)}",
+        assertTrue(!result.hasErrors, "the program must compile first: ${TestSupport.messages(result)}")
+
+        val methods = methodDescriptors(result.classes.getValue("com/github/kusa233/neko/sample/Emitter"))
+        assertEquals(
+            "(II)V",
+            methods["run\$scratch\$0"],
+            "a handler reached only by a discarded scratch should answer nothing",
         )
     }
 
+    // -------------------------------------------------------------- how a scratch picks a handler
+
     @Test
-    fun `a try used as a value rejects an extractor that yields the wrong type`() {
-        val result = TestSupport.compileWithLibrary(
-            TestSupport.file(
+    fun `a scratch reaches the handler whose emit signature matches`() {
+        // Two handlers, different signatures: the `[int, int]` one is the one `b` matches, and the
+        // `[string]` one is not. That is the whole linking rule, and it is why the signatures have to
+        // be distinguishable.
+        val program = load(
+            samplePackage(
                 "class Emitter {",
                 "    static {",
-                "        fun test(): int {",
-                "            raise 5",
-                "        } emit [int]",
+                "        fun run(): int {",
+                "            v: int = try pair() { a, b ->",
+                "                nyan a + b",
+                "            }",
+                "            return v",
+                "        }",
+                "",
+                "        fun pair(): int {",
+                "            return produce()",
+                "        } emit [int, int]",
+                "",
+                "        fun produce(): int {",
+                "            v: int = scratch 3, 4",
+                "            return v",
+                "        } emit [int, int]",
+                "",
+                "        fun words(): int {",
+                "            w: int = scratch \"hi\"",
+                "            return w",
+                "        } emit [string]",
+                "",
+                "        fun talk(): int {",
+                "            w: int = try say() { s ->",
+                "                nyan 0",
+                "            }",
+                "            return w",
+                "        }",
+                "",
+                "        fun say(): int {",
+                "            return 0",
+                "        } emit [string]",
                 "    }",
                 "}",
                 "",
                 "class Main {",
                 "    static {",
                 "        fun main() {",
-                "            value: int = try Emitter.test() { raised ->",
-                "                yield \"not an int\"",
-                "            }",
+                "            println(Emitter.run())",
                 "        }",
                 "    }",
                 "}",
             ),
         )
+        assertEquals("7\n", run(program), "the [int, int] scratch should reach the [int, int] handler")
+    }
+
+    @Test
+    fun `a scratch with no matching handler says so`() {
+        val result = TestSupport.compile(
+            samplePackage(
+                "class Emitter {",
+                "    static {",
+                "        fun lonely(): int {",
+                "            v: int = scratch 1",
+                "            return v",
+                "        } emit [int]",
+                "    }",
+                "}",
+            ),
+            name = "Emit.neko",
+        )
         assertTrue(
-            TestSupport.errors(result).any { it.message.contains("when the call returns") },
+            TestSupport.errors(result).any { it.message.contains("no 'try' declares a handler") },
             "unexpected messages: ${TestSupport.messages(result)}",
         )
     }
 
     @Test
-    fun `a raise still works when the extractor reads an outer variable`() {
-        // The extractor is a separate class, so anything it reads from the enclosing method has to
-        // be captured — the same rule a lambda follows.
-        val program = loadWithSupport(
+    fun `two handlers with the same emit signature are ambiguous`() {
+        val result = TestSupport.compile(
+            samplePackage(
+                "class Emitter {",
+                "    static {",
+                "        fun first(): int {",
+                "            return 1",
+                "        } emit [int]",
+                "",
+                "        fun second(): int {",
+                "            return 2",
+                "        } emit [int]",
+                "",
+                "        fun a(): int {",
+                "            v: int = try first() { a ->",
+                "                nyan a",
+                "            }",
+                "            return v",
+                "        }",
+                "",
+                "        fun b(): int {",
+                "            v: int = try second() { a ->",
+                "                nyan a",
+                "            }",
+                "            return v",
+                "        }",
+                "    }",
+                "}",
+            ),
+            name = "Emit.neko",
+        )
+        assertTrue(
+            TestSupport.errors(result).any { it.message.contains("could not tell the two apart") },
+            "unexpected messages: ${TestSupport.messages(result)}",
+        )
+    }
+
+    @Test
+    fun `a later scratch that disagrees about the handler's type is an error`() {
+        // The first site takes an `int`, so the handler answers `int`; the second takes nothing, which
+        // would need a `void` handler. One method cannot be both.
+        val result = TestSupport.compile(
+            samplePackage(
+                "class Emitter {",
+                "    static {",
+                "        fun source(): int {",
+                "            v: int = scratch 1",
+                "            return v",
+                "        } emit [int]",
+                "",
+                "        fun first(): int {",
+                "            v: int = scratch 1",
+                "            return v",
+                "        } emit [int]",
+                "",
+                "        fun second() {",
+                "            scratch 2",
+                "        } emit [int]",
+                "",
+                "        fun holder(): int {",
+                "            v: int = try source() { a ->",
+                "                nyan a",
+                "            }",
+                "            return v",
+                "        }",
+                "    }",
+                "}",
+            ),
+            name = "Emit.neko",
+        )
+        assertTrue(
+            TestSupport.errors(result).any { it.message.contains("so this one cannot take") },
+            "unexpected messages: ${TestSupport.messages(result)}",
+        )
+    }
+
+    // ------------------------------------------------------------------------------ nyan and yield
+
+    @Test
+    fun `nyan outside a try handler is refused`() {
+        val result = TestSupport.compile(
+            samplePackage(
+                "class Emitter {",
+                "    static {",
+                "        fun test(): int {",
+                "            nyan 1",
+                "            return 2",
+                "        }",
+                "    }",
+                "}",
+            ),
+            name = "Emit.neko",
+        )
+        assertTrue(
+            TestSupport.errors(result).any { it.message.contains("'nyan' can only be used") },
+            "unexpected messages: ${TestSupport.messages(result)}",
+        )
+    }
+
+    @Test
+    fun `nyan that disagrees with what the sites take is an error`() {
+        val result = TestSupport.compile(
+            samplePackage(
+                "class Emitter {",
+                "    static {",
+                "        fun source(): int {",
+                "            v: int = scratch 1",
+                "            return v",
+                "        } emit [int]",
+                "",
+                "        fun consumer(): int {",
+                "            v: int = scratch 1",
+                "            return v",
+                "        } emit [int]",
+                "",
+                "        fun holder(): int {",
+                "            v: int = try source() { a ->",
+                "                nyan \"not an int\"",
+                "            }",
+                "            return v",
+                "        }",
+                "    }",
+                "}",
+            ),
+            name = "Emit.neko",
+        )
+        assertTrue(
+            TestSupport.errors(result).any { it.message.contains("this 'nyan' answers") },
+            "unexpected messages: ${TestSupport.messages(result)}",
+        )
+    }
+
+    @Test
+    fun `a yield leaves through the try even when the handler is several calls deep`() {
+        // The `yield` is written three calls below the `try` and still answers it — which is the one
+        // thing `scratch` and `nyan` cannot do, and the reason `yield` is a throw. Each function in
+        // between declares the same `emit` clause so it may pass the departure on unchanged.
+        val program = load(
+            samplePackage(
+                "class Emitter {",
+                "    static {",
+                "        fun inner(): int {",
+                "            yield 42",
+                "        } emit [int]",
+                "",
+                "        fun middle(): int {",
+                "            return inner()",
+                "        } emit [int]",
+                "",
+                "        fun outer(): int {",
+                "            return middle()",
+                "        } emit [int]",
+                "",
+                "        fun run(): int {",
+                "            v: int = try outer() { a ->",
+                "                nyan a",
+                "            }",
+                "            return v",
+                "        }",
+                "    }",
+                "}",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            println(Emitter.run())",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        assertEquals("42\n", run(program), "a 'yield' three frames down should still answer its 'try'")
+    }
+
+    // ------------------------------------------------------------------------------- statements
+
+    @Test
+    fun `a scratch is not a departure, so the statements after it still run`() {
+        // The counterpart of the old `raise` test. `scratch` is an ordinary call, so `helper` carries
+        // on after it and `run` carries on after the value comes back — where a `raise` would have
+        // left the function on the spot.
+        val program = load(
+            samplePackage(
+                "class Emitter {",
+                "    static {",
+                "        fun helper(v: int): int {",
+                "            x: int = scratch v",
+                "            println(\"helper continues\")",
+                "            return x",
+                "        } emit [int]",
+                "",
+                "        fun run() {",
+                "            v: int = try helper(5) { a ->",
+                "                nyan a",
+                "            }",
+                "            println(v)",
+                "            println(\"after\")",
+                "        }",
+                "    }",
+                "}",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            Emitter.run()",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        assertEquals("helper continues\n5\nafter\n", run(program))
+    }
+
+    @Test
+    fun `a statement after nyan is unreachable at error level`() {
+        val result = TestSupport.compile(
+            samplePackage(
+                "class Emitter {",
+                "    static {",
+                "        fun source(): int {",
+                "            v: int = scratch 1",
+                "            return v",
+                "        } emit [int]",
+                "",
+                "        fun consumer(): int {",
+                "            v: int = scratch 1",
+                "            return v",
+                "        } emit [int]",
+                "",
+                "        fun holder(): int {",
+                "            v: int = try source() { a ->",
+                "                nyan a",
+                "                println(\"unreachable\")",
+                "            }",
+                "            return v",
+                "        }",
+                "    }",
+                "}",
+            ),
+            name = "Emit.neko",
+        )
+        assertTrue(
+            TestSupport.errors(result).any { it.message.contains("unreachable statement") },
+            "unexpected messages: ${TestSupport.messages(result)}",
+        )
+    }
+
+    @Test
+    fun `a function with an emit clause must actually scratch`() {
+        val result = TestSupport.compile(
             samplePackage(
                 "class Emitter {",
                 "    static {",
                 "        fun test() {",
-                "            raise 5",
+                "            println(\"no scratch\")",
                 "        } emit [int]",
                 "    }",
                 "}",
-                "",
-                "class Main {",
-                "    static {",
-                "        fun main() {",
-                "            prefix: int = 100",
-                "            try Emitter.test() { value ->",
-                "                println(prefix + value)",
-                "            }",
-                "        }",
-                "    }",
-                "}",
             ),
+            name = "Emit.neko",
         )
-        val output = program.capturingOutput {
-            program.invoke("com.github.kusa233.neko.sample.Main", "main")
-        }
-        assertEquals("105\n", output, "the extractor should see the enclosing method's variable")
+        assertTrue(
+            TestSupport.errors(result).any { it.message.contains("can never reach a 'try' handler") },
+            "unexpected messages: ${TestSupport.messages(result)}",
+        )
     }
 
     @Test
-    fun `a raise leaves the function rather than merely returning a value`() {
-        // `raise` transfers control out, so the statement after it never runs. Here the body is
-        // written so the raise is conditional: only the branch taken raises, and the code after the
-        // `if` still runs otherwise — which is what proves the lowering is a real departure and not
-        // an ordinary return the caller could ignore.
-        val program = loadWithSupport(
+    fun `a scratch needs a function that declares an emit clause`() {
+        val result = TestSupport.compile(
             samplePackage(
                 "class Emitter {",
                 "    static {",
-                "        fun test(mode: int) {",
-                "            if (mode == 1) {",
-                "                raise 7",
+                "        fun test(): int {",
+                "            v: int = scratch 1",
+                "            return v",
+                "        }",
+                "    }",
+                "}",
+            ),
+            name = "Emit.neko",
+        )
+        assertTrue(
+            TestSupport.errors(result).any { it.message.contains("declares an 'emit' clause") },
+            "unexpected messages: ${TestSupport.messages(result)}",
+        )
+    }
+
+    @Test
+    fun `a scratch must provide exactly the values its emit clause declares`() {
+        val result = TestSupport.compile(
+            samplePackage(
+                "class Emitter {",
+                "    static {",
+                "        fun test(): int {",
+                "            v: int = scratch 1",
+                "            return v",
+                "        } emit [int, int]",
+                "    }",
+                "}",
+            ),
+            name = "Emit.neko",
+        )
+        assertTrue(
+            TestSupport.errors(result).any { it.message.contains("must provide 2 value(s)") },
+            "unexpected messages: ${TestSupport.messages(result)}",
+        )
+    }
+
+    @Test
+    fun `a scratch value of the wrong type is reported at the value`() {
+        val result = TestSupport.compile(
+            samplePackage(
+                "class Emitter {",
+                "    static {",
+                "        fun test(): int {",
+                "            v: int = scratch \"text\"",
+                "            return v",
+                "        } emit [int]",
+                "    }",
+                "}",
+            ),
+            name = "Emit.neko",
+        )
+        assertTrue(
+            TestSupport.errors(result).any { it.message.contains("has type string") },
+            "unexpected messages: ${TestSupport.messages(result)}",
+        )
+    }
+
+    // ---------------------------------------------------------------------------------- the call
+
+    @Test
+    fun `a call to a scratchable function is only legal in a try`() {
+        val result = TestSupport.compile(
+            samplePackage(
+                "class Emitter {",
+                "    static {",
+                "        fun test() {",
+                "            scratch 1",
+                "        } emit [int]",
+                "",
+                "        fun call() {",
+                "            test()",
+                "        }",
+                "    }",
+                "}",
+            ),
+            name = "Emit.neko",
+        )
+        assertTrue(
+            TestSupport.errors(result).any { it.message.contains("call it as") },
+            "unexpected messages: ${TestSupport.messages(result)}",
+        )
+    }
+
+    @Test
+    fun `a wrapper that declares the same emit clause may call through`() {
+        // `wrapper` writes no `scratch` at all: it forwards `source`'s clause unchanged, so the
+        // departure belongs to `source` and passing it on needs no `try` of its own.
+        val program = load(
+            samplePackage(
+                "class Emitter {",
+                "    static {",
+                "        fun source(): int {",
+                "            v: int = scratch 1",
+                "            return v",
+                "        } emit [int]",
+                "",
+                "        fun wrapper(): int {",
+                "            return source()",
+                "        } emit [int]",
+                "",
+                "        fun run(): int {",
+                "            v: int = try wrapper() { a ->",
+                "                nyan a",
                 "            }",
-                "            println(\"no raise\")",
+                "            return v",
+                "        }",
+                "    }",
+                "}",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            println(Emitter.run())",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        // The handler answers `a`, which is the 1 `source` scratched, so the wrapper forwards it
+        // through unchanged.
+        assertEquals("1\n", run(program))
+    }
+
+    // ---------------------------------------------------------------------------- wide values
+
+    @Test
+    fun `an emit clause carries wide values without boxing them`() {
+        // The old mechanism boxed every value into an `Object[]`; a `scratch` passes them as ordinary
+        // parameters, so a `long` keeps its own descriptor and reaches the handler intact. This pins
+        // the descriptor down, which is the part a reader would otherwise have to take on trust.
+        val source = samplePackage(
+            "class Emitter {",
+            "    static {",
+            "        fun source(): int {",
+            "            return 1",
+            "        } emit [long, double]",
+            "",
+            "        fun consumer(): int {",
+            "            v: int = scratch 9000000000L, 2.5",
+            "            return v",
+            "        } emit [long, double]",
+            "",
+            "        fun run(): int {",
+            "            v: int = try source() { a, b ->",
+            "                nyan 7",
+            "            }",
+            "            return v",
+            "        }",
+            "    }",
+            "}",
+        )
+        val result = TestSupport.compile(source, name = "Emit.neko")
+        assertTrue(!result.hasErrors, "the program must compile first: ${TestSupport.messages(result)}")
+
+        val methods = methodDescriptors(
+            result.classes.getValue("com/github/kusa233/neko/sample/Emitter"),
+        )
+        assertEquals(
+            "(JD)I",
+            methods["run\$scratch\$0"],
+            "a wide value should keep its own slot width as a parameter",
+        )
+    }
+
+    // ------------------------------------------------------------------------ the handler's class
+
+    @Test
+    fun `a handler is emitted in the class that holds its try, and scratch may call it from anywhere`() {
+        // The handler lives on `Other`, because that is where the `try` was written, but the only
+        // `scratch` reaching it is in `Emitter`. That is why it is emitted `public static` rather than
+        // `private`: no other access flag would let a different class call it.
+        val program = load(
+            samplePackage(
+                "class Other {",
+                "    static {",
+                "        fun run(): int {",
+                "            v: int = try Emitter.consumer() { a ->",
+                "                nyan a + 100",
+                "            }",
+                "            return v",
+                "        }",
+                "    }",
+                "}",
+                "",
+                "class Emitter {",
+                "    static {",
+                "        fun consumer(): int {",
+                "            v: int = scratch 5",
+                "            return v",
                 "        } emit [int]",
                 "    }",
                 "}",
@@ -690,19 +738,111 @@ class EmitTest {
                 "class Main {",
                 "    static {",
                 "        fun main() {",
-                "            try Emitter.test(0) { value ->",
-                "                println(value)",
-                "            }",
+                "            println(Other.run())",
                 "        }",
                 "    }",
                 "}",
             ),
         )
-        val output = program.capturingOutput {
-            program.invoke("com.github.kusa233.neko.sample.Main", "main")
-        }
-        assertEquals("no raise\n", output, "a call that does not raise should not run the extractor")
+        // `consumer` scratches 5, which reaches `Other.run$scratch$0`, which answers 105 — and that
+        // number comes back to `consumer` as its own `v`, then out of `run` as its `v`.
+        assertEquals("105\n", run(program))
     }
+
+    @Test
+    fun `a function that declares an emit clause records the exception it can throw`() {
+        // A `yield` written in a function that is *not* the one catching leaves through that
+        // function's own frame, so it must be able to throw. The class file's `Exceptions` attribute
+        // is where a caller — and a reflective reader — finds that.
+        val result = TestSupport.compile(
+            samplePackage(
+                "class Emitter {",
+                "    static {",
+                "        fun inner(): int {",
+                "            yield 42",
+                "        } emit [int]",
+                "",
+                "        fun run(): int {",
+                "            v: int = try inner() { a ->",
+                "                nyan a",
+                "            }",
+                "            return v",
+                "        }",
+                "    }",
+                "}",
+            ),
+            name = "Emit.neko",
+        )
+        assertTrue(!result.hasErrors, "the program must compile first: ${TestSupport.messages(result)}")
+
+        assertEquals(
+            listOf("com/github/kusa233/neko/stdlib/emit/EmitYieldException"),
+            thrownTypesOf(
+                result.classes.getValue("com/github/kusa233/neko/sample/Emitter"),
+                "inner",
+            ),
+            "a function whose 'emit' clause is left by a 'yield' must record it",
+        )
+    }
+
+    @Test
+    fun `a method that catches the yield itself declares nothing`() {
+        // The mirror image, and the one worth being precise about: `run` wraps the throwing call in a
+        // `try` that catches `EmitYieldException`, so the exception cannot leave `run` and the method
+        // has nothing to declare. Only the method it *calls* is marked.
+        val result = TestSupport.compile(
+            samplePackage(
+                "class Emitter {",
+                "    static {",
+                "        fun inner(): int {",
+                "            yield 42",
+                "        } emit [int]",
+                "",
+                "        fun run(): int {",
+                "            v: int = try inner() { a ->",
+                "                nyan a",
+                "            }",
+                "            return v",
+                "        }",
+                "    }",
+                "}",
+            ),
+            name = "Emit.neko",
+        )
+        assertTrue(!result.hasErrors, "the program must compile first: ${TestSupport.messages(result)}")
+
+        val methods = methodDescriptors(
+            result.classes.getValue("com/github/kusa233/neko/sample/Emitter"),
+        )
+        assertEquals(
+            emptyList(),
+            thrownTypesOf(
+                result.classes.getValue("com/github/kusa233/neko/sample/Emitter"),
+                "run",
+            ),
+            "a 'try' catches the exception, so the catching method declares nothing",
+        )
+        // And the method that really throws does declare it, which is what makes the pair meaningful.
+        assertEquals("()I", methods["inner"], "the fixture should still contain 'inner'")
+    }
+
+    @Test
+    fun `a handler that answers with nyan declares nothing`() {
+        // The mirror image: `nyanTest`'s handler only ever `nyan`s, and a `nyan` is a plain `return`
+        // from the handler method — no exception is involved, so nothing is declared.
+        val result = TestSupport.compile(recoveryProgram(), name = "Emit.neko")
+        assertTrue(!result.hasErrors, "the program must compile first: ${TestSupport.messages(result)}")
+
+        assertEquals(
+            emptyList(),
+            thrownTypesOf(
+                result.classes.getValue("com/github/kusa233/neko/sample/Emitter"),
+                "nyanTest",
+            ),
+            "'nyanTest' catches its own 'yield', so it declares nothing",
+        )
+    }
+
 
     /** The parameter/return descriptor of every method in [bytes], keyed by name. */
     private fun methodDescriptors(bytes: ByteArray): Map<String, String> {
@@ -725,27 +865,6 @@ class EmitTest {
         return methods
     }
 
-    /** The internal names of the interfaces [bytes] declares. */
-    private fun interfacesOf(bytes: ByteArray): List<String> {
-        var interfaces: List<String> = emptyList()
-        org.objectweb.asm.ClassReader(bytes).accept(
-            object : org.objectweb.asm.ClassVisitor(org.objectweb.asm.Opcodes.ASM9) {
-                override fun visit(
-                    version: Int,
-                    access: Int,
-                    name: String,
-                    signature: String?,
-                    superName: String?,
-                    declared: Array<out String>?,
-                ) {
-                    interfaces = declared.orEmpty().toList()
-                }
-            },
-            org.objectweb.asm.ClassReader.SKIP_CODE,
-        )
-        return interfaces
-    }
-
     /** The `Exceptions` attribute of the method named [method] in [bytes]. */
     private fun thrownTypesOf(bytes: ByteArray, method: String): List<String> {
         var thrown: List<String> = emptyList()
@@ -766,14 +885,4 @@ class EmitTest {
         )
         return thrown
     }
-
-    /**
-     * Compiles [source] in the sample's package together with the standard library.
-     *
-     * The library has to be part of the same run: `raise` is lowered against its
-     * `EarlyEmitException` and `EmitExtractor`, so a program that raises without them is rejected as
-     * missing the library rather than compiled.
-     */
-    private fun compileInSamplePackage(source: String): CompilationResult =
-        TestSupport.compileWithLibrary(source, name = "Emit.neko")
 }

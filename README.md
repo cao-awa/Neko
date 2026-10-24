@@ -1,7 +1,7 @@
 # Neko language
 
-Neko is a toy JVM language for experimenting with compilers: it has classes, interfaces, `emit`/`raise`
-error control, and it compiles straight to Java bytecode.
+Neko is a toy JVM language for experimenting with compilers: it has classes, interfaces,
+`emit`/`scratch`/`nyan` error control, and it compiles straight to Java bytecode.
 
 ## Project layout
 
@@ -66,12 +66,15 @@ output. It is the closest thing to a reference for [nullable types](#nullable-ty
 ```
 
 `NyaSample` does the same for [`nya`](#checking-what-the-program-believes), and `ExceptionSample` for
-`raise` and `try`. `EnumSample` shows [`miao class`](#enum-miao) — the constants, the values they can
-carry, and `values()`/`valueOf()` — and `PurrSample` shows
+`scratch`, `nyan` and `try`. `EffectRecovery` is the reference for the same mechanism — the one the
+`emit`/`scratch`/`nyan` section below walks through. `EnumSample` shows [`miao class`](#enum-miao) —
+the constants, the values they can carry, and `values()`/`valueOf()` — and `PurrSample` shows
 [locking](#locking-purr-purred-purrcls-purredcls):
 
 ```bash
 ./gradlew :neko:runNeko -Pneko.program=NyaSample
+./gradlew :neko:runNeko -Pneko.program=ExceptionSample
+./gradlew :neko:runNeko -Pneko.program=EffectRecovery
 ./gradlew :neko:runNeko -Pneko.program=EnumSample
 ./gradlew :neko:runNeko -Pneko.program=PurrSample
 ```
@@ -79,9 +82,8 @@ carry, and `values()`/`valueOf()` — and `PurrSample` shows
 ## Standard library
 
 The standard library is written in Neko, in `stdlib/`, and is **not** embedded in the compiler: a
-program that uses `raise` or `try` is compiled against it, and if it cannot be found the compiler
-reports that as an error rather than substituting a built-in. This keeps the language's error
-mechanism honest — what the compiler lowers against is ordinary Neko source you can read.
+program that uses it is compiled against it, and if it cannot be found the compiler reports that as an
+error rather than substituting a built-in.
 
 There is exactly one built-in that is not written in Neko: `println`, in one overload per built-in
 type — the seven numeric ones, `string`, `bool` and `Object`. It mirrors `System.out.println` and is
@@ -89,8 +91,13 @@ modelled as an ordinary function so the analyzer and the emitter share one resol
 `short` and `char` have no `PrintStream` method of their own, so those three are declared with the
 Neko type and emitted as the `int` overload Java widens them to anyway.
 
-`stdlib/com/github/kusa233/neko/stdlib/emit/` holds what `raise` and `try` lower to. Nothing else is
-required to use the language: a program that never raises compiles without the library at all.
+The effect mechanism is deliberately *not* in `stdlib/`. `yield` throws
+`com.github.kusa233.neko.stdlib.emit.EmitYieldException`, which ships with the compiler as a Java class
+— it is the one thing a program cannot write for itself, because it has to be caught by the `try` that
+declared the handler. Everything else the mechanism needs is generated: a `try`'s `{ ... }` block
+becomes a `static` method of the class holding the `try`, and `scratch` compiles to an ordinary
+`invokestatic` against it. So a program that uses `scratch`, `nyan` or `try` compiles with no library
+on the path at all.
 
 `stdlib/com/github/kusa233/neko/stdlib/collection/` holds `Iterator` and `Iterable`, the protocol
 `for ... in` walks. A program needs them only by *implementing* them; a `for` over an array does not
@@ -330,9 +337,9 @@ class Counter() {
 
 The lock is a `java.util.concurrent.locks.StampedLock`, which is why this is a keyword rather than a
 library call: the release has to be emitted for **every** way out of the block — falling off the end,
-a `return`, a `raise`, and an exception thrown by anything called inside — and `unlock` also needs the
-stamp the acquisition answered, which is a `long` the source cannot carry. A `synchronized` block
-would need neither, but it also cannot offer a read lock.
+a `return`, a `nyan`, a `yield`, and an exception thrown by anything called inside — and `unlock` also
+needs the stamp the acquisition answered, which is a `long` the source cannot carry. A `synchronized`
+block would need neither, but it also cannot offer a read lock.
 
 There are two independent choices — *which* lock, and *which* mode — and each combination has its own
 word:
@@ -499,7 +506,8 @@ The primitives are Java's eight, spelled as Neko spells them:
 | `Throwable`| —              | `java.lang.Throwable`  |
 
 A primitive is carried as the Java reference type in the table whenever it has to be an `Object` —
-inside the `Object[]` a `raise` boxes into, or as a type argument, which the JVM erases.
+inside the `Object` a `yield` throws, inside a nullable local, or as a type argument, which the JVM
+erases.
 
 Because those Java types are what the values actually become, they are also accepted as type names:
 
@@ -643,50 +651,90 @@ declared function.
 
 ### Error control
 
-Emit and raise:
+A function that declares an `emit` clause says it may hand control to a `try`'s `{ ... }` block.
+**`scratch` enters that block and comes back with an answer** — it is an ordinary call, not a
+departure. The block is compiled into a `static` method, so `scratch` is an `invokestatic`:
+
 ```neko
 class Neko() {
   fun invoker() {
-    // Must use try to call a emitted function.
-    try test() { emit1, emit2 ->
+    // Calling an `emit` function always needs a `try`, even one that never scratches: the clause is
+    // what names the handler, and only a `try` declares one.
+    v: int = try test() { emit1, emit2 ->
       println(emit1 * emit2)
+      // `nyan` answers the `scratch` site that entered this block.
+      nyan emit1 + emit2
     }
+    println(v)
   }
 
   fun inheritEmit() {
-    // When function signature has correct
-    // emitted like calling function,
-    // Then don't need to try.
+    // A function with the *same* clause may pass the departure on unchanged, so it needs no `try`.
     test()
   } emit [int, int]
 
-  fun test() {
-    raise 123, 456
+  fun test(): int {
+    // Reaches the block two frames up and is worth whatever it answers.
+    return scratch 123, 456
   } emit [int, int]
 }
 ```
 
-Emit and raise with returning value:
+A `try` used as a value is worth what its call returned when it returned normally. The `nyan` answer
+travels back to the `scratch` site, not to the `try` — so the two are independent:
+
 ```neko
 class Neko() {
   fun invoker() {
-    // Use a variable to receive it return value.
-    result: int = try test(true) { emit1, emit2 ->
-      println(emit1 * emit2)
-      // If raised, return this.
-      yield emit1 * emit2
+    // The call returns 0, so this is 0 — the handler's `nyan` went to the `scratch` site instead.
+    result: int = try test(false) { emit1, emit2 ->
+      nyan emit1 * emit2
     }
+    println(result)
   }
 
   fun test(flag: bool): int {
     if (flag) {
-      raise 123, 456
+      v: int = scratch 123, 456
+      return v
     } else {
       return 0
     }
   } emit [int, int]
 }
 ```
+
+**`yield` leaves through the `try` instead.** It throws `EmitYieldException` carrying its value, the
+`try` catches it, and that value becomes what the `try` is worth — so it works from any depth, and a
+`try` that is used as a value can be answered even by a call that never scratches:
+
+```neko
+class Neko() {
+  fun invoker() {
+    // `test` never scratches, but the handler yields, so the `try` is worth 7.
+    result: int = try test() { emit1, emit2 ->
+      yield 7
+    }
+    println(result)
+  }
+
+  fun test(): int {
+    return 0
+  } emit [int, int]
+}
+```
+
+The three keywords are not interchangeable, and the difference is the whole design:
+
+| written | reaches | carries a value to |
+| --- | --- | --- |
+| `scratch v1, v2` | the handler whose `emit` clause matches | the site itself, as its own result |
+| `nyan v` | leaves the handler | the `scratch` site that entered it |
+| `yield v` | leaves by throwing | the `try` that declared the handler |
+
+A `scratch` is matched to a handler by its `emit` signature alone, so **each signature may have only
+one handler in the program** — two would be indistinguishable from a site's point of view, and that is
+reported rather than resolved by declaration order.
 
 ### Checking what the program believes
 
@@ -751,7 +799,7 @@ Everything else follows from the condition:
 
 `nya` is deliberately not a function call: what it lowers to is not a call but a branch that either
 throws or runs a block — plus, when there is a block, a handler that catches the `AssertionError` the
-condition may raise, covering the condition and nothing else.
+condition may throw, covering the condition and nothing else.
 
 The bare form is compiled exactly the way Java's own `assert` is: branch **past** the throw, and let
 the throw follow the branch.

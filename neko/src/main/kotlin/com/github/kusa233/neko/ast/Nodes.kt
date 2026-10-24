@@ -307,18 +307,19 @@ class FunctionDeclaration(
      * The result types named by a trailing `emit [int, int]` clause, always empty when the clause is
      * absent.
      *
-     * A function with an `emit` clause gains a second way out: a `raise a, b` statement inside it
-     * transfers control to the caller's `try` extractor, carrying one value per listed type,
-     * instead of returning normally. The paths that do not raise still return a value of the
-     * declared return type, so the clause says "may raise", not "never returns". The clause is
-     * written after the body.
+     * A function with an `emit` clause gains a second way out: a `scratch a, b` statement inside it
+     * passes those values to the handler the caller's `try` declared, and carries on with whatever
+     * that handler answers. The clause is also what a `scratch` site is *matched* on, so the types
+     * say what the handler receives. The paths that never scratch still return a value of the
+     * declared return type, so the clause says "may reach a handler", not "never returns". The clause
+     * is written after the body.
      */
     val emitTypes: List<TypeReference> = emptyList(),
     /**
      * `true` when an `emit` clause was written at all.
      *
      * Distinct from `emitTypes.isNotEmpty()`, because `emit []` is a legal clause naming zero
-     * values: a `raise` with nothing to carry, matched by the caller's `try f() { -> ... }`.
+     * values: a `scratch` with nothing to carry, matched by the caller's `try f() { -> ... }`.
      */
     val hasEmitClause: Boolean = false,
     override val span: Span,
@@ -676,7 +677,7 @@ class NyaExpression(
  * The lock is a `java.util.concurrent.locks.StampedLock`, which is never reentrant: taking the same
  * lock twice on one thread deadlocks. That is why [lock] is part of the node's identity for the
  * analyzer to check nesting with, and why the release cannot be left to the block's own code — it
- * has to happen on every way out, including a `return` and a `raise`.
+ * has to happen on every way out, including a `return`, a `nyan`, and a `yield`.
  *
  * Two things are chosen, and each of the four words chooses both at once:
  *
@@ -727,45 +728,59 @@ enum class PurrMode {
 }
 
 /**
- * `raise e1, e2` — leaves the enclosing `emit`-declaring function early, handing the values to the
- * caller's extractor.
+ * `scratch e1, e2` — enters the `try` handler whose `emit [...]` signature these values match,
+ * handing it the values and continuing with whatever it answers.
  *
- * Only valid inside a function that declares an `emit [...]` clause, and the number of values must
- * match the number of types in that clause. Execution never continues after a `raise`.
+ * This is an *expression*, not a statement: the handler is generated as an ordinary method, so a
+ * `scratch` is a call. `v: int = scratch 1, 2` keeps the value it answers, and a bare `scratch 1, 2`
+ * discards one — which is what decides whether the generated handler is declared to return a value or
+ * `void`.
+ *
+ * Only valid inside a function that declares an `emit [...]` clause, and the number and types of the
+ * values must match that clause.
  */
-class RaiseStatement(
+class ScratchExpression(
     val keywordSpan: Span,
     val values: List<Expression>,
     override val span: Span,
-) : Statement {
-    /**
-     * Filled in by the code generator: the static builder method that boxes the raised values.
-     *
-     * The sample names this `test$emit$0()` — one per `raise` site, named after its function.
-     */
-    var builderName: String? = null
+) : Expression() {
+    /** Filled in by the analyzer: the `try` handler this site reaches, once one is found. */
+    var handler: ExtractorTry? = null
 
-    /** Filled in by the code generator: the class that declares [builderName]. */
-    var builderOwner: String? = null
+    /** Filled in by the code generator: the generated method this site calls. */
+    var handlerMethod: String? = null
 }
 
 /**
- * The part of a `try` that catches a `raise`, shared by the statement and the expression form.
+ * `nyan value` — leaves the enclosing `try` handler, answering [value].
  *
- * Both forms call a function that may `raise` and run the same kind of extractor over the values it
- * carries; they differ only in what the construct is worth. `try f(...) { a -> ... }` on its own is a
- * statement and produces nothing, while `r: int = try f(...) { a -> yield 1 }` is an expression whose
- * value is what its extractor `yield`s — which is why [acceptsYield] distinguishes the two and why
- * only the expression form may write `yield`.
+ * A handler is generated as a method whose return type the reaching `scratch` sites fix, so a `nyan`
+ * is a `return` from that method. A handler that writes no `nyan` had better `yield` on every path:
+ * `yield` throws, so it never falls off the end.
+ */
+class NyanStatement(
+    val keywordSpan: Span,
+    val value: Expression,
+    override val span: Span,
+) : Statement
+
+/**
+ * The part of a `try` that declares a handler, shared by the statement and the expression form.
+ *
+ * The `{ ... }` block is compiled into a `static` method, and every `scratch` whose `emit` clause
+ * matches this `try`'s callee calls it. The two forms differ only in what the construct is worth:
+ * `try f(...) { a -> ... }` on its own is a statement and produces nothing, while
+ * `r: int = try f(...) { a -> yield 1 }` is an expression worth what a `yield` carried — which is why
+ * [acceptsYield] distinguishes the two and why only the expression form may `yield` for its value.
  */
 interface ExtractorTry : Node {
     /** Span of the `try` keyword. */
     val keywordSpan: Span
 
-    /** The call whose `raise` this `try` catches. Always a [CallExpression]. */
+    /** The call this `try` wraps, whose callee's `emit` clause names the handler's signature. */
     val call: CallExpression
 
-    /** The names given to the raised values, in declaration order. */
+    /** The names given to the handler's values, in declaration order. */
     val extractorParameters: List<LambdaParameter>
 
     val extractorBody: BlockStatement
@@ -773,34 +788,104 @@ interface ExtractorTry : Node {
     /** Span of the `->` that introduces the extractor body, used when it is missing. */
     val arrowSpan: Span?
 
-    /** `true` for the expression form, whose extractor produces the value the `try` is worth. */
+    /** `true` for the expression form, whose handler produces the value the `try` is worth. */
     val acceptsYield: Boolean
 
     /**
      * The type the extractor's `yield` produces, fixed by the first one it writes.
      *
-     * `null` means the body never `yield`s, so its `invoke` returns nothing and the `try` uses the
-     * void `EmitExtractorN` family. Analysis fills this in, and code generation reads it to pick the
-     * family — which is why it is the one property that decides the lowering.
+     * `null` means the body never `yield`s, so its handler never leaves that way.
      */
     var yieldedType: NekoType?
+
+    /**
+     * Everything the two later passes learn about the method this `{ ... }` block becomes.
+     *
+     * An interface cannot hold initialized state in Kotlin, so the mutable half of a handler lives in
+     * this one object; both `try` forms own exactly one.
+     */
+    val handler: HandlerInfo
 }
 
 /**
- * `try call(args) { a, b -> ... }` — calls a function that may `raise`, and runs [extractorBody] with
- * the raised values if it does.
+ * What the analyzer and code generator decide about one `try` handler, which is emitted as a method.
  *
- * This is the only construct that catches a `raise`. [extractorParameters] receive the raised values
- * in declaration order; their types come from the callee's `emit` clause, so a lambda-style
- * parameter list needs no annotations. A call that returns normally never runs the extractor body.
+ * The block is not run by the `try` itself: it is a handler, reached by `scratch` sites, so the code
+ * generator emits it as a static method of the enclosing class and each `scratch` calls it. That
+ * makes three facts about it something two passes have to agree on — its signature, what it answers,
+ * and what it is called — and they are all gathered here.
+ */
+class HandlerInfo {
+    /**
+     * The emit signature this handler answers, recorded by the analyzer.
+     *
+     * Taken from the wrapped call's `emit [...]` clause. A `scratch` site is matched to a handler by
+     * comparing this, which is why two handlers with the same one are ambiguous.
+     */
+    var signature: List<NekoType> = emptyList()
+
+    /**
+     * What the handler answers, fixed by the first `scratch` site that reaches it.
+     *
+     * A `scratch` written where a value is wanted — `v: int = scratch 1, 2` — makes the handler
+     * answer that type; one written as a statement of its own makes it answer nothing. The first
+     * site decides, and a later site that disagrees is an error, because the method can only have
+     * one return type.
+     */
+    var returnType: NekoType? = null
+
+    /**
+     * Every `scratch` site that reaches this handler, in source order.
+     *
+     * Collected during analysis and read back once [returnType] is settled, so that "the first one
+     * decides" means the first *written*, not whichever happened to be analyzed first — a handler may
+     * be reached from a function declared before the one holding the `try`.
+     */
+    val sites: MutableList<ScratchSite> = mutableListOf()
+
+    /** The generated method this handler was compiled into; filled in by the code generator. */
+    var methodName: String? = null
+
+    /**
+     * The internal name of the class this handler's method is written into.
+     *
+     * A `scratch` almost never sits in the class holding its `try` — the whole point is that it runs
+     * in another call frame — so the call site needs to know which class to `invokestatic` before that
+     * class has been reached. The analyzer knows, because it walked where the `try` was written, so it
+     * records it here and the code generator reads it rather than rediscovering it.
+     */
+    var ownerClass: String? = null
+}
+
+/**
+ * One `scratch` reaching a handler, as recorded by the analyzer.
+ *
+ * [signature] is the `emit` clause of the function the site was written in, which is what picks the
+ * handler. [wantedType] is the type the site needs that handler to answer: the declared type of the
+ * variable the `scratch` initialises, or `null` when the value is discarded and the handler must
+ * answer nothing.
+ */
+class ScratchSite(
+    val expression: ScratchExpression,
+    val signature: List<NekoType>,
+    val wantedType: NekoType?,
+)
+
+/**
+ * `try call(args) { a, b -> ... }` — declares a handler for the call's `emit` clause, and runs
+ * [extractorBody] whenever a `scratch` reaches it.
+ *
+ * This is the only construct that declares a handler. [extractorParameters] receive the `scratch`
+ * site's values in declaration order; their types come from the callee's `emit` clause, so a
+ * lambda-style parameter list needs no annotations. A call that never scratches never runs the body.
  *
  * A call to a function with an `emit` clause is *only* legal here — or in [TryExpression], which asks
- * the same call for a value: anywhere else it is an error, because such a call cannot return a value
- * and its `raise` would have nowhere to go.
+ * the same call for a value: anywhere else it is an error, because such a call would have no handler
+ * to reach.
  */
 class TryStatement(
     override val keywordSpan: Span,
-    /** The call whose `raise` this statement catches. Always a [CallExpression]. */
+    /** The call this statement wraps. */
     override val call: CallExpression,
     override val extractorParameters: List<LambdaParameter>,
     override val extractorBody: BlockStatement,
@@ -808,11 +893,13 @@ class TryStatement(
     override val arrowSpan: Span?,
     override val span: Span,
 ) : Statement, ExtractorTry {
-    /** A statement is worth nothing, so its extractor has no value to `yield`. */
+    /** A statement is worth nothing, so its handler has no value to `yield`. */
     override val acceptsYield: Boolean get() = false
 
-    /** A statement's extractor can never `yield`, so this stays `null`. */
+    /** A statement's handler can never `yield`, so this stays `null`. */
     override var yieldedType: NekoType? = null
+
+    override val handler = HandlerInfo()
 }
 
 // ------------------------------------------------------------------------- expressions
@@ -831,14 +918,14 @@ sealed class Expression : Node {
 }
 
 /**
- * `r: int = try f(...) { a -> yield 1 }` — the same catching construct as [TryStatement], but worth a
- * value.
+ * `r: int = try f(...) { a -> yield 1 }` — the same handler-declaring construct as [TryStatement], but
+ * worth a value.
  *
- * When the call returns normally the expression is worth whatever it returned; when the call
- * `raise`s instead, the extractor runs and the expression is worth the value its `yield` produced.
- * That is why a `yield` is what the extractor body needs in order to be a value at all: without one
- * the extractor answers nothing, and a reader who wrote `r: int = try ...` would silently get
- * nothing. The analyzer requires one whenever the value is actually read.
+ * When the call returns normally the expression is worth whatever it returned. When a `yield` runs
+ * instead, the expression is worth the value that `yield` threw, which is why the two paths must agree
+ * on one type. A handler that only `nyan`s does *not* contribute a value here — its answer goes to the
+ * `scratch` site that entered it, which is somewhere else entirely — so `yield` is the only way for
+ * the handler to decide what the `try` itself is worth.
  */
 class TryExpression(
     override val keywordSpan: Span,
@@ -848,10 +935,12 @@ class TryExpression(
     override val arrowSpan: Span?,
     override val span: Span,
 ) : Expression(), ExtractorTry {
-    /** An expression is worth a value, so its extractor may `yield` one. */
+    /** An expression is worth a value, so its handler may `yield` one. */
     override val acceptsYield: Boolean get() = true
 
     override var yieldedType: NekoType? = null
+
+    override val handler = HandlerInfo()
 }
 
 /** A bare identifier, such as `field1`, `str` or `println`. */

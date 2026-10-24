@@ -318,7 +318,7 @@ class SampleRulesTest {
             "unexpected message: ${error.message}",
         )
         assertTrue(
-            error.message.contains("'raise <value>, ...'"),
+            error.message.contains("'scratch <value>, ...'"),
             "the message should name the replacement: ${error.message}",
         )
         assertEquals(
@@ -329,15 +329,45 @@ class SampleRulesTest {
     }
 
     @Test
-    fun `a raise satisfies the requirement to return`() {
-        // A function with an `emit` clause may not declare a return type — it hands its values to
-        // the extractor instead — so the check is that such a function needs no `return` at all.
-        val result = TestSupport.compileWithLibrary(
+    fun `raise is rejected by explaining how its meaning changed`() {
+        // `raise` was the keyword `scratch` replaced, but the two are not synonyms: `raise` left the
+        // function and `scratch` returns from the handler call. A program ported from `raise` would
+        // therefore still compile and quietly behave differently, so the diagnostic has to say what
+        // changed rather than just name the new keyword.
+        val source = TestSupport.program(
+            "static {",
+            "    fun sends() {",
+            "        raise 1, 2",
+            "    } emit [int, int]",
+            "}",
+        )
+        val result = TestSupport.compile(source)
+        val error = TestSupport.errors(result).single()
+        assertTrue(
+            error.message.contains("'raise' is not an Neko keyword"),
+            "unexpected message: ${error.message}",
+        )
+        assertTrue(
+            error.message.contains("does not leave the function"),
+            "the message should say how the meaning changed: ${error.message}",
+        )
+        assertEquals(
+            TestSupport.locationOf(source, "raise"),
+            "${error.span?.line}:${error.span?.column}",
+            "the error should point at the removed keyword",
+        )
+    }
+
+    @Test
+    fun `yield satisfies the requirement to return`() {
+        // A function with an `emit` clause leaves by throwing rather than returning, so a `yield` on
+        // every path is a legitimate finish — it needs no `return` to satisfy the check.
+        val result = TestSupport.compile(
             TestSupport.file(
                 "class Test {",
                 "    static {",
                 "        fun value() {",
-                "            raise 1",
+                "            yield 1",
                 "        } emit [int]",
                 "    }",
                 "}",
@@ -345,7 +375,7 @@ class SampleRulesTest {
         )
         assertTrue(
             !result.hasErrors,
-            "'raise' leaves the function, so no 'return' is needed:\n" +
+            "'yield' leaves the function, so no 'return' is needed:\n" +
                 TestSupport.errorLocations(result).joinToString("\n"),
         )
     }

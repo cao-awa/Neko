@@ -49,7 +49,7 @@ class CompilationResult(
  * ```
  *
  * **The unit of compilation is a program, not a file.** Neko programs are split across files — the
- * standard library that `raise` depends on is itself written in Neko — so all of them are parsed
+ * standard library is itself written in Neko — so all of them are parsed
  * and then analysed against *one* symbol table. That is what lets a class in one file name a class
  * declared in another instead of being treated as an unknown type. Code generation only runs when
  * analysis found no errors, so a program that fails to compile never leaves stale or half-written

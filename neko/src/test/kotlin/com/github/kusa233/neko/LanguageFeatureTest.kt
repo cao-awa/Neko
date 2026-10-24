@@ -439,8 +439,8 @@ class LanguageFeatureTest {
 
     @Test
     fun `a non-int array index is rejected at the index`() {
-        // Arrays cannot be created by the language — only the compiler's own `raise` builder makes
-        // one — so this reads a parameter, which is the one way a program names an array.
+        // Arrays cannot be created by the language — there is no array literal — so this reads a
+        // parameter, which is the one way a program names an array.
         val source = file(
             "class Main {",
             "    static {",
@@ -468,8 +468,9 @@ class LanguageFeatureTest {
 
     @Test
     fun `an array element may be read through an index`() {
-        // The standard library's `extract` is the real use: a `try` extractor receives the values in
-        // an `Object[]` and passes each on to `invoke`, which is exactly what this reproduces.
+        // Arrays cannot be created by the language, so this reads a parameter — which is the one way a
+        // program names an array. The `Object[]` below is the shape the old extractor machinery used;
+        // it is kept because indexing an array is what is under test, not the effect mechanism.
         val program = TestSupport.loadWithLibrary(
             samplePackage(
                 "class Reader {",
@@ -484,7 +485,7 @@ class LanguageFeatureTest {
                 "class Emitter {",
                 "    static {",
                 "        fun test() {",
-                "            raise 11, 22",
+                "            scratch 11, 22",
                 "        } emit [int, int]",
                 "    }",
                 "}",
@@ -504,7 +505,7 @@ class LanguageFeatureTest {
         val output = program.capturingOutput {
             program.invoke("com.github.kusa233.neko.sample.Main", "main")
         }
-        assertEquals("11\n22\n", output, "the raised values should arrive in order")
+        assertEquals("11\n22\n", output, "the scratched values should arrive in order")
     }
 
     private fun samplePackage(vararg lines: String): String = buildString {
@@ -519,40 +520,14 @@ class LanguageFeatureTest {
     // ------------------------------------------------------------------ the standard library
 
     @Test
-    fun `a raise without the standard library says so`() {
-        // The lowering names `EarlyEmitException` and `EmitExtractor`, so a program that raises but
-        // does not include the library would emit class files naming classes that do not exist. The
-        // diagnostic says which declarations are missing and how the build supplies them.
-        val result = TestSupport.compile(
-            file(
-                "class Emitter {",
-                "    static {",
-                "        fun test() {",
-                "            raise 1",
-                "        } emit [int]",
-                "    }",
-                "}",
-            ),
-        )
-        val error = TestSupport.errors(result).single()
-        assertTrue(
-            error.message.contains("needs the Neko standard library"),
-            "unexpected message: ${error.message}",
-        )
-        assertTrue(
-            error.message.contains("EarlyEmitException"),
-            "the message should name what is missing: ${error.message}",
-        )
-        assertTrue(
-            error.message.contains("neko.libraryDirectories"),
-            "the message should say how to supply it: ${error.message}",
-        )
-    }
-
-    @Test
     fun `the standard library compiles on its own`() {
         // It is ordinary Neko, so it has to satisfy every rule a program does — including the
         // interface check that each abstract method is implemented.
+        //
+        // The effect machinery is deliberately absent from this list. `EmitYieldException` ships with
+        // the compiler as a Java class, because `yield` has to throw something the JVM already knows
+        // how to catch; nothing in the Neko library is involved, which is why a program can use
+        // `scratch`/`nyan` with no library on the path at all.
         val result = Compiler.compileProgram(TestSupport.standardLibrarySources())
         assertTrue(
             !result.hasErrors,
@@ -560,8 +535,12 @@ class LanguageFeatureTest {
                 result.renderDiagnostics().joinToString("\n"),
         )
         assertTrue(
-            result.classes.containsKey("com/github/kusa233/neko/stdlib/emit/EarlyEmitException"),
+            result.classes.containsKey("com/github/kusa233/neko/stdlib/collection/Iterator"),
             "unexpected classes: ${result.classes.keys}",
+        )
+        assertTrue(
+            result.classes.keys.none { it.contains("/emit/") },
+            "the Neko library should no longer carry effect classes: ${result.classes.keys}",
         )
     }
 }

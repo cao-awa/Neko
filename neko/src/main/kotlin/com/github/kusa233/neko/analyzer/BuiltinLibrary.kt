@@ -35,7 +35,7 @@ import com.github.kusa233.neko.types.VoidType
  * `null` an `Object` parameter also accepts.
  *
  * The `Object` overload is what lets a program print a value whose static type the compiler does not
- * track — an element of the `Object[]` a `raise` carried, or a `T` erased to `Object`.
+ * track — an element of an array parameter, or a `T` erased to `Object`.
  */
 object BuiltinLibrary {
 

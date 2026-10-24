@@ -101,14 +101,15 @@ val nekoPrograms: Map<String, String> = mapOf(
     "EnumSample" to "com.github.kusa233.neko.sample.EnumSample",
     "PurrSample" to "com.github.kusa233.neko.sample.PurrSample",
     "ForSample" to "com.github.kusa233.neko.sample.ForSample",
+    "EffectRecovery" to "com.github.kusa233.neko.sample.EffectRecovery",
 )
 
 /**
  * Compiles every configured source and library directory into [nekoOutputPath].
  *
- * The library is passed as well as the programs, because compilation is per *program*: `raise` lowers
- * to the library's `EarlyEmitException`, so a program that raises only compiles if the library is part
- * of the same run.
+ * The library is passed as well as the programs, because compilation is per *program*: a program's
+ * classes are resolved against the ones compiled earlier in the same run, so a program that calls
+ * into the library only compiles if the library is part of it.
  */
 tasks.register<JavaExec>("compileNeko") {
     group = "neko"
@@ -149,6 +150,9 @@ tasks.register<JavaExec>("runNeko") {
     val requested = (findProperty("neko.program") as String?)
         ?: nekoMainClass.substringAfterLast('.')
     mainClass.set(nekoPrograms[requested] ?: nekoMainClass)
-    classpath = files(nekoOutputPath)
+    // The compiled program, plus the compiler's own classes: `EmitYieldException` is a Java class that
+    // ships with the compiler rather than being generated from Neko, so a `yield` in a program resolves
+    // to it at run time only if the main source set is on the classpath too.
+    classpath = files(nekoOutputPath) + sourceSets["main"].runtimeClasspath
     workingDir = rootDirectory.asFile
 }

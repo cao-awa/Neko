@@ -37,17 +37,16 @@ import org.objectweb.asm.Opcodes.*
  *  * **Capture is by value.** A lambda copies each referenced enclosing variable into a field. The
  *    analyzer rejects assignment to such a variable, which is what keeps that copy from silently
  *    diverging from the original.
- *  * **`raise` throws, `try` catches.** A `raise e1, e2` boxes its values into an `Object[]`,
- *    wraps them in the standard library's `EarlyEmitException`, and throws it; the construct that
- *    called the raising function catches it and hands the array to its extractor. The extractor
- *    literal is compiled like a lambda, implementing a standard library interface named for the
- *    number of values it receives.
- *  * **A `try` may be worth a value.** Its two forms differ only in whether the extractor's `invoke`
- *    answers something: the statement form implements `EmitExtractorN` and discards what it finds,
- *    while `r: int = try f() { a -> yield 1 }` implements `EmitExtractorWithResultN`, whose `invoke`
- *    answers the `yield` 鈥攂oxed, since the interface erases `R` to `Object`. Both forms then fill one
- *    slot from whichever path ran: the call's own return value when it returned, or `doEmit`'s answer
- *    when it raised.
+ *  * **`scratch` calls, `yield` throws, `nyan` returns.** A `try`'s `{ ... }` block becomes a
+ *    `public static` method of the class holding the `try`, taking the `emit` clause's values as its
+ *    parameters. A `scratch v1, v2` is an `invokestatic` against that method and carries on with
+ *    whatever it answers — it does **not** throw, and passes nothing through a carrier array. `nyan`
+ *    is a plain `return` from that method. `yield` is the only departure: it throws
+ *    `EmitYieldException` carrying its value, and the `try` that declared the handler catches it.
+ *  * **A `try` may be worth a value.** Both forms meet at one slot: the call's own return value when
+ *    it returned, or the exception's payload when a `yield` ran. The field is one `Object` wide
+ *    because the two paths can disagree on the JVM type, so each is boxed on the way in and unboxed
+ *    to the `try`'s own type on the way out.
  *
  * The generator assumes the analyzer ran without errors; where a node is missing its recorded type
  * it emits [ErrorType]'s placeholder descriptor rather than crashing, so a partially analysed tree
@@ -103,68 +102,71 @@ class BytecodeGenerator(
     }
 
     /**
-     * Static builder methods to emit, grouped by the class that declares them.
+     * The `try` handlers whose methods have to be written into class [owner], in source order.
      *
-     * A `raise` needs a method that boxes its values into an `Object[]`, and that method belongs to
-     * whichever class the `raise` was compiled into 鈥攖he enclosing Neko class, or a generated
-     * extractor class when the `raise` appears inside an extractor body. Registration is keyed by
-     * owner so each writer gets exactly the builders it must declare, drained just before that
-     * writer is finished.
+     * A handler is not inlined where its `try` is written: it becomes a method of the class that
+     * holds the `try`, and any `scratch` site anywhere in the program calls it. So the real work
+     * happens *after* the owning class' functions have been emitted, while the writer is still open,
+     * which is what this queue is for.
      */
-    private val builderRegistrations = LinkedHashMap<String, MutableList<Pair<RaiseStatement, String>>>()
+    private val handlerRegistrations = LinkedHashMap<String, MutableList<PendingHandler>>()
 
-    /** Numbers the builders within one function, so their names are stable and unique. */
-    private val builderCounters = LinkedHashMap<String, Int>()
+    /**
+     * A `try` handler waiting to be emitted as a method.
+     */
+    private class PendingHandler(
+        val construct: ExtractorTry,
+        val name: String,
+    )
 
-    /** Registers a builder for [statement] in [owner] and returns the name it will be emitted as. */
-    private fun registerBuilder(statement: RaiseStatement, owner: String, functionName: String): String {
-        val index = builderCounters.getOrDefault(functionName, 0)
-        builderCounters[functionName] = index + 1
-        val name = "$functionName\$emit\$$index"
-        builderRegistrations.getOrPut(owner) { mutableListOf() } += statement to name
-        statement.builderName = name
-        statement.builderOwner = owner
+    /** Registers [construct] as a handler method of [owner] and returns the name it was given. */
+    private fun registerHandler(construct: ExtractorTry, owner: String): String {
+        // The analyzer already named it, for the same reason it fixed the owner: a `scratch` in a
+        // function emitted earlier needs the name before this registration could happen.
+        val name = construct.handler.methodName ?: run {
+            val ownerName = currentFunctionName
+            val index = handlerCounters.getOrDefault(ownerName, 0)
+            handlerCounters[ownerName] = index + 1
+            "$ownerName\$scratch\$$index".also { construct.handler.methodName = it }
+        }
+        handlerRegistrations.getOrPut(owner) { mutableListOf() } += PendingHandler(construct, name)
         return name
     }
 
-    /** Emits and clears every builder registered for [owner], before its writer is finished. */
-    private fun drainBuilders(writer: ClassWriter, owner: String) {
-        val pending = builderRegistrations.remove(owner) ?: return
-        for ((statement, name) in pending) emitBuilder(writer, statement, name)
+    /** Emits and clears every handler registered for [owner], before its writer is finished. */
+    private fun drainHandlers(writer: ClassWriter, owner: String) {
+        val pending = handlerRegistrations.remove(owner) ?: return
+        for (handler in pending) emitHandlerMethod(writer, handler)
     }
+
+    /** Numbers the handlers within one function, so their names are stable and unique. */
+    private val handlerCounters = LinkedHashMap<String, Int>()
+
+    /** The function currently being emitted, whose name prefixes its handler methods. */
+    private var currentFunctionName = "handler"
+
 
     /**
      * The internal name of a standard library class, looked up in the program.
      *
-     * The library is written in Neko and compiled alongside the program, so `EarlyEmitException`
-     * is a class this very run will emit 鈥攊ts internal name comes from the declaration rather than
-     * from an assumption about the package. The fallback keeps code generation working when the
-     * library is absent, so the reader sees the analyzer's "the library is missing" diagnostic
-     * rather than a crash here.
+     * The library is written in Neko and compiled alongside the program, so `Iterable` is a class
+     * this very run will emit — its internal name comes from the declaration rather than from an
+     * assumption about the package. The fallback keeps code generation working when the library is
+     * absent, so the reader sees the analyzer's "the library is missing" diagnostic rather than a
+     * crash here.
      */
     private fun standardLibraryClass(simpleName: String): String =
         classes[simpleName]?.jvmInternalName ?: (currentClass?.packagePrefix ?: "") + simpleName
 
-    /** The standard library's exception that carries raised values. */
-    private fun earlyEmitExceptionClass(): String = standardLibraryClass(EARLY_EMIT_EXCEPTION_CLASS)
-
-    /** The standard library's base interface every `EmitExtractorN` extends. */
-    private fun emitExtractorBaseClass(): String = standardLibraryClass(EMIT_EXTRACTOR_CLASS)
-
-    /** The `EmitExtractorN` interface for [arity], which the standard library provides. */
-    private fun emitExtractorInterface(arity: Int): String = standardLibraryClass("EmitExtractor$arity")
-
     /**
-     * The `EmitExtractorWithResultN` interface for [arity], used when the extractor writes `yield`.
+     * The JVM name of `EmitYieldException`, the checked exception a `yield` throws.
      *
-     * The two families differ only in what `invoke` answers 鈥攏othing, or the value the `try`
-     * produces 鈥攕o which one a `try` implements is decided by whether its body yields.
+     * Unlike everything else in the standard library this one is *not* written in Neko: it is a plain
+     * Java class shipped with the compiler, because the value it carries is a single `Object` and a
+     * Neko class would only add a layer for nothing. So its name is the one fixed internal name in
+     * this file, taken from [EMIT_YIELD_EXCEPTION_CLASS] rather than from a declaration.
      */
-    private fun emitExtractorWithResultInterface(arity: Int): String =
-        standardLibraryClass("$EMIT_EXTRACTOR_WITH_RESULT_PREFIX$arity")
-
-    /** Descriptor of `Object[]`, the carrier a `raise` boxes its values into. */
-    private fun objectArrayType(): String = "[Ljava/lang/Object;"
+    private fun emitYieldExceptionClass(): String = EMIT_YIELD_EXCEPTION_CLASS
 
     private fun packagePrefix(): String = currentClass?.packagePrefix ?: ""
 
@@ -294,9 +296,9 @@ class BytecodeGenerator(
 
         emitMainBridge(writer, declaration, symbol)
 
-        // A `raise` needs a builder in whichever class it was compiled into, so any that this class
-        // owns are written now, while the writer is still open.
-        drainBuilders(writer, internalName)
+        // A handler method lives in whichever class its `try` was written in, so any this class owns
+        // are written now, while the writer is still open.
+        drainHandlers(writer, internalName)
 
         writer.visitEnd()
         output[internalName] = writer.toByteArray()
@@ -457,7 +459,7 @@ class BytecodeGenerator(
             is YieldStatement -> collectPurrLocks(statement.value, used)
             is AssignmentStatement -> collectPurrLocks(statement.value, used)
             is IndexAssignmentStatement -> collectPurrLocks(statement.value, used)
-            is RaiseStatement -> statement.values.forEach { collectPurrLocks(it, used) }
+            is NyanStatement -> collectPurrLocks(statement.value, used)
         }
     }
 
@@ -1291,14 +1293,14 @@ class BytecodeGenerator(
             return
         }
 
-        // A function that declares `emit` also declares that it may `raise`, and a `raise` is
-        // lowered to throwing `EarlyEmitException` 鈥攕o that exception is what the class file's
-        // `Exceptions` attribute records. A body in an interface is a default method, which the JVM
-        // permits from Java 8 on.
-        val declaredExceptions = if (symbol.canRaise) {
-            arrayOf(earlyEmitExceptionClass())
-        } else {
-            null
+        // A `try` whose handler can `yield` makes this method able to throw `EmitYieldException`, and
+        // so does calling any function that can. The attribute is advisory for the JVM, but it is what
+        // a reader of the class file uses to see the departure, so it is recorded whenever either is
+        // true — not only when this very function declares an `emit` clause.
+        val declaredExceptions = when {
+            symbol.canRaise -> arrayOf(emitYieldExceptionClass())
+            function.body != null && function.body.reachesYield() -> arrayOf(emitYieldExceptionClass())
+            else -> null
         }
 
         val mv = writer.visitMethod(access, function.name, descriptor, null, declaredExceptions)
@@ -1311,9 +1313,12 @@ class BytecodeGenerator(
             lambdaIdentity = null,
             firstSlot = if (symbol.isStatic) 0 else 1,
             static = symbol.isStatic,
-            builderPrefix = function.name,
             returnType = returnType,
         )
+        // Handler methods are named after the function their `try` was written in, so the name has to
+        // be current before any statement is emitted — a nested `try` inherits it.
+        val enclosingFunction = currentFunctionName
+        currentFunctionName = function.name
 
         for (parameter in parametersByFunction[function].orEmpty()) {
             scope.allocate(parameter)
@@ -1330,6 +1335,7 @@ class BytecodeGenerator(
 
         mv.visitMaxs(0, 0)
         mv.visitEnd()
+        currentFunctionName = enclosingFunction
     }
 
     // ------------------------------------------------------------ statements
@@ -1355,7 +1361,7 @@ class BytecodeGenerator(
             is ForEachStatement -> emitForEach(statement, scope)
             is IncrementStatement -> emitIncrement(statement, scope)
             is WhenStatement -> emitWhen(statement, scope)
-            is RaiseStatement -> emitRaise(statement, scope)
+            is NyanStatement -> emitNyan(statement, scope)
             is TryStatement -> emitTry(statement, scope)
             is PurrStatement -> emitPurr(statement, scope)
             is IndexAssignmentStatement -> emitIndexAssignment(statement, scope)
@@ -1522,6 +1528,35 @@ class BytecodeGenerator(
      * where the value is picked up. That is also why the value is boxed here: the slot is one `Object`
      * wide whatever the `nya` is worth.
      */
+    /**
+     * `nyan value` — leaves the enclosing `try` handler, answering the value.
+     *
+     * The handler is a method, so this is simply a `return` from it: the value is converted to the
+     * method's own return type and returned. That is the whole difference from `yield`, which throws
+     * instead — see [emitYield].
+     */
+    private fun emitNyan(statement: NyanStatement, scope: MethodScope) {
+        emitExpression(statement.value, scope)
+        val returnType = scope.returnType
+        emitStoreValue(statement.value.type, returnType, scope.mv)
+        // A `nyan` leaves the handler, and the handler runs inside the `try`'s protected region, so
+        // any `purr` block entered inside it has to be released before the method returns.
+        emitPurrReleaseOnExit(scope)
+        scope.mv.visitInsn(returnOpcode(if (returnType === VoidType || returnType === ErrorType) statement.value.type else returnType))
+    }
+
+    /**
+     * `yield value` — answers the `try` that declared the enclosing handler.
+     *
+     * A `yield` is *not* a `return`: it leaves through the `try`, which may be several calls up the
+     * stack, so it throws `EmitYieldException` carrying the value. The `try` catches that and stores
+     * the value as the construct's own result — which is why a `yield` can appear inside a function
+     * the handler calls, not only in the handler itself.
+     *
+     * The other two forms of `yield` are the ones the language already had: inside a `nya` value form
+     * it fills the shared slot and jumps to the join point, and inside a lambda it is that lambda's
+     * return.
+     */
     private fun emitYield(statement: YieldStatement, scope: MethodScope) {
         emitExpression(statement.value, scope)
 
@@ -1533,20 +1568,43 @@ class BytecodeGenerator(
             return
         }
 
-        // A `yield` in a lambda or an extractor is a `return` from the method it was generated in, so
-        // it leaves a `purr` block the same way a `return` does and has to unlock first.
-        if (scope.extractorResult) {
-            emitBox(statement.value.type, scope.mv)
+        // A `yield` in a lambda is that lambda's return, whatever it is worth; a `yield` in a `try`
+        // handler leaves through the `try` instead, which is the throwing arm below.
+        if (scope.lambdaIdentity != null && !scope.extractorResult) {
+            emitStoreValue(statement.value.type, scope.returnType, scope.mv)
+            val target = scope.returnType
             emitPurrReleaseOnExit(scope)
-            scope.mv.visitInsn(ARETURN)
+            scope.mv.visitInsn(
+                returnOpcode(if (target === VoidType || target === ErrorType) statement.value.type else target),
+            )
             return
         }
-        emitStoreValue(statement.value.type, scope.returnType, scope.mv)
-        // The lambda's `invoke` answers whatever its function type says. A rejected body can leave the
-        // scope without one, and then the value's own type is the only thing left to answer with.
-        val target = scope.returnType
+
+        // `throw new EmitYieldException(value)`, with the value boxed because the exception carries a
+        // single `Object` whatever the `emit` clause declared.
+        //
+        // The value is boxed into a local *before* the `NEW`, rather than left on the stack under the
+        // new object: `new` pushes an uninitialized reference, and a value sitting beneath it makes the
+        // verifier's frame disagree about what is where. Storing first keeps the stack empty at the
+        // `NEW`, which is the shape every constructor call in this generator uses.
+        val mv = scope.mv
+        val exceptionClass = emitYieldExceptionClass()
+        val payloadSlot = scope.allocateTemp(ObjectType)
+        emitBox(statement.value.type, mv)
+        mv.visitVarInsn(ASTORE, payloadSlot)
+
+        mv.visitTypeInsn(NEW, exceptionClass)
+        mv.visitInsn(DUP)
+        mv.visitVarInsn(ALOAD, payloadSlot)
+        mv.visitMethodInsn(
+            INVOKESPECIAL,
+            exceptionClass,
+            "<init>",
+            "(Ljava/lang/Object;)V",
+            false,
+        )
         emitPurrReleaseOnExit(scope)
-        scope.mv.visitInsn(returnOpcode(if (target === VoidType || target === ErrorType) statement.value.type else target))
+        mv.visitInsn(ATHROW)
     }
 
     private fun emitIf(statement: IfStatement, scope: MethodScope) {
@@ -2185,110 +2243,156 @@ class BytecodeGenerator(
     }
 
     /**
-     * `raise 1 * multiplier, multiplier` 鈥?leaves the function early, handing the values to the
-     * caller's extractor.
+     * `scratch 1 * multiplier, multiplier` — enters the `try` handler those values match.
      *
-     * The lowering is the one the sample spells out: the values are boxed into an `Object[]` by a
-     * generated static builder 鈥擿test$emit$0()` in the sample 鈥攖hen wrapped in the standard
-     * library's `EarlyEmitException` and thrown. Boxing is what lets one carrier type serve any
-     * number of raised values, and throwing is what lets the caller's `try` catch the hand-off
-     * without the callee returning.
+     * Unlike the `raise` it replaces, this does **not** throw. The handler is a generated `static`
+     * method, so a `scratch` is an `INVOKESTATIC` and the program carries on with whatever it
+     * answers — which is what makes `v: int = scratch 1, 2` an ordinary initialisation rather than a
+     * transfer of control. Nothing is boxed and no array is assembled: the parameters have their own
+     * descriptors on the call, which is the whole reason the old `Object[]` carrier is gone.
      */
-    private fun emitRaise(statement: RaiseStatement, scope: MethodScope) {
+    private fun emitScratch(expression: ScratchExpression, scope: MethodScope) {
         val mv = scope.mv
+        val handler = expression.handler
+        val methodName = handler?.handler?.methodName
+        val owner = scratchHandlerOwner(expression)
 
-        // The values are boxed by a generated static builder 鈥攖he sample's `test$emit$0()` 鈥攔ather
-        // than assembled here, because each value has its own descriptor and the array must hold all
-        // of them. The builder is emitted once its owner's writer is complete.
-        val builder = registerBuilder(statement, scope.owner, scope.builderPrefix)
-
-        for (value in statement.values) emitExpression(value, scope)
-        mv.visitMethodInsn(
-            INVOKESTATIC,
-            scope.owner,
-            builder,
-            descriptorOf(statement.values.map { it.type }, objectArrayType()),
-            false,
-        )
-
-        // One slot for the `Object[]`, and a reference 鈥?so one slot wide whatever was raised.
-        val valuesSlot = scope.allocateTemp(ObjectType)
-        mv.visitVarInsn(ASTORE, valuesSlot)
-        emitEarlyEmitThrow(scope, valuesSlot)
-    }
-
-    /** `throw new EarlyEmitException(values)`, with the array in local [valuesSlot]. */
-    private fun emitEarlyEmitThrow(scope: MethodScope, valuesSlot: Int) {
-        val mv = scope.mv
-        val exceptionClass = earlyEmitExceptionClass()
-        mv.visitTypeInsn(NEW, exceptionClass)
-        mv.visitInsn(DUP)
-        mv.visitVarInsn(ALOAD, valuesSlot)
-        mv.visitMethodInsn(
-            INVOKESPECIAL,
-            exceptionClass,
-            "<init>",
-            "(${objectArrayType()})V",
-            false,
-        )
-        mv.visitInsn(ATHROW)
-    }
-
-    /**
-     * Emits the static builder a `raise` needs: it boxes the values into an `Object[]` and returns
-     * it.
-     *
-     * This exists because the values have different descriptors 鈥攐ne `int`, one `String` 鈥攕o no
-     * single constructor call could assemble the array. The method is `private static` and named
-     * after its function, matching the sample's `test$emit$0()`.
-     */
-    private fun emitBuilder(writer: ClassWriter, statement: RaiseStatement, name: String) {
-        val valueTypes = statement.values.map { it.type }
-        val mv = writer.visitMethod(
-            ACC_PRIVATE or ACC_STATIC,
-            name,
-            descriptorOf(valueTypes, objectArrayType()),
-            null,
-            null,
-        )
-        mv.visitCode()
-
-        pushInt(valueTypes.size, mv)
-        mv.visitTypeInsn(ANEWARRAY, "java/lang/Object")
-
-        // The parameters occupy slots 0..n-1 *in JVM terms*, which for a `long` or a `double` is two
-        // slots rather than one: the array's slot is the total width of what came before it, not the
-        // number of parameters.
-        val arraySlot = valueTypes.sumOf { BuiltinTypes.slotCountOf(it) }
-        mv.visitVarInsn(ASTORE, arraySlot)
-
-        var parameterSlot = 0
-        for ((index, type) in valueTypes.withIndex()) {
-            mv.visitVarInsn(ALOAD, arraySlot)
-            pushInt(index, mv)
-            mv.visitVarInsn(loadOpcode(type), parameterSlot)
-            emitBox(type, mv)
-            mv.visitInsn(AASTORE)
-            parameterSlot += BuiltinTypes.slotCountOf(type)
+        if (handler == null || methodName == null || owner == null) {
+            // Analysis already reported the unmatched site. Something of the right shape still has
+            // to be pushed so the rest of the expression verifies.
+            pushDefault(expression.type, mv)
+            return
         }
 
-        mv.visitVarInsn(ALOAD, arraySlot)
-        mv.visitInsn(ARETURN)
-        mv.visitMaxs(0, 0)
-        mv.visitEnd()
+        for (value in expression.values) emitExpression(value, scope)
+        emitScratchCall(owner, methodName, expression, scope)
+    }
+
+    /** The class that declares the handler method [expression] calls. */
+    private fun scratchHandlerOwner(expression: ScratchExpression): String? =
+        expression.handler?.handler?.ownerClass
+            ?: expression.handler?.let { handlerOwners[it] }
+
+    /**
+     * `invokestatic owner.name(values)`, with the arguments already on the stack.
+     *
+     * The descriptor comes from the handler itself — the types it takes are the `emit` clause's, and
+     * what it answers is the handler's return type — so the call site and the declaration cannot
+     * disagree.
+     */
+    private fun emitScratchCall(
+        owner: String,
+        methodName: String,
+        expression: ScratchExpression,
+        scope: MethodScope,
+    ) {
+        val handler = expression.handler!!
+        val arguments = handler.handler.signature
+        val returns = handler.handler.returnType ?: VoidType
+        scope.mv.visitMethodInsn(
+            INVOKESTATIC,
+            owner,
+            methodName,
+            descriptorOf(arguments, returns),
+            false,
+        )
     }
 
     /**
-     * `try test(10) { emit1, emit2 -> ... }` 鈥攃alls the function and runs the extractor if it
-     * raises, discarding whatever the extractor produced.
+     * Whether this body can let an `EmitYieldException` out, so the method should declare it.
      *
-     * The lowering is a `try`/`catch` around the call, exactly as the sample describes: the call sits
-     * in the protected region, and `EarlyEmitException` is caught and handed to the extractor. A call
-     * that returns normally jumps past the handler, so the extractor body runs only on a `raise`.
+     * Two things make that possible, and both have to be counted:
+     *
+     *  * a `yield` written in this body and not swallowed by a `try` of its own — the throw is emitted
+     *    right here;
+     *  * a call to any function that can do either, since the exception simply passes through.
+     *
+     * The second is not an optimization: without it, `fun run() { v = try inner() { ... } }` would be
+     * emitted without the attribute while `inner` throws, and the class file would describe the wrong
+     * thing. A `try`'s own handler is excluded from the first because its `yield` answers *that* `try`
+     * and is caught before it could leave.
+     */
+    private fun BlockStatement.reachesYield(): Boolean = statements.any { it.reachesYield() }
+
+    private fun Statement.reachesYield(): Boolean = when (this) {
+        is YieldStatement -> true
+        is BlockStatement -> reachesYield()
+        is IfStatement -> thenBranch.reachesYield() || elseBranch?.reachesYield() == true
+        is WhenStatement -> branches.any { it.body.reachesYield() }
+        is WhileStatement -> body.reachesYield()
+        is ForStatement -> body.reachesYield() || update?.reachesYield() == true
+        is ForEachStatement -> body.reachesYield()
+        is PurrStatement -> body.reachesYield()
+        is ExpressionStatement -> expression.reachesYield()
+        is VariableDeclarationStatement -> initializer?.reachesYield() == true
+        is ReturnStatement -> value?.reachesYield() == true
+        is AssignmentStatement -> value.reachesYield()
+        is IndexAssignmentStatement -> value.reachesYield()
+        // The call inside the `try` may throw, and this method catches it — so it does *not* let the
+        // exception out, which is exactly why the attribute is not wanted here. The handler body is a
+        // method of its own, so what it does is not this method's business either.
+        is TryStatement -> false
+        else -> false
+    }
+
+    /**
+     * Whether this expression can let a `yield` out, which for the purposes here means whether it can
+     * throw `EmitYieldException`.
+     *
+     * A call counts when its callee declares an `emit` clause: that clause is precisely the promise
+     * that the function may leave by throwing rather than returning.
+     */
+    private fun Expression.reachesYield(): Boolean = when (this) {
+        is CallExpression -> {
+            // The callee's own declaration is what says whether it may leave by throwing. A bare name
+            // records its target in `resolution`; a member access names it in `resolvedFunction`.
+            val target = (callee as? NameExpression)?.resolution as? FunctionSymbol
+                ?: (callee as? MemberAccessExpression)?.resolvedFunction
+            (target != null && target.canRaise) ||
+                arguments.any { it.reachesYield() } ||
+                callee.reachesYield()
+        }
+        is BinaryExpression -> left.reachesYield() || right.reachesYield()
+        is UnaryExpression -> operand.reachesYield()
+        is NyaExpression ->
+            failureBlock?.statements?.any { it.reachesYield() } == true ||
+                elseBlock?.statements?.any { it.reachesYield() } == true
+        is IndexExpression -> array.reachesYield() || index.reachesYield()
+        is MemberAccessExpression -> receiver.reachesYield()
+        is ScratchExpression -> values.any { it.reachesYield() }
+        else -> false
+    }
+
+
+    /**
+     * `try test(10) { emit1, emit2 -> ... }` — calls the function and runs the `{ ... }` block if it
+     * reaches a handler, discarding whatever that block answers.
+     *
+     * The `{ ... }` block is not run here: it becomes a `static` method of this class (see
+     * [emitHandlerMethod]) and the `try` itself only has to call the function and then catch the
+     * `yield`s that come back out of it.
      */
     private fun emitTry(statement: TryStatement, scope: MethodScope) {
+        emitHandlerRegistration(statement)
         emitExtractorTry(statement, scope, resultSlot = null)
     }
+
+    /**
+     * Registers this `try`'s `{ ... }` block as a method of the class being emitted.
+     *
+     * The method takes only the `emit` clause's values as parameters and nothing else, because the
+     * `scratch` sites that call it run in *other* call frames: there is no enclosing local for them
+     * to pass, and a `static` method cannot read one through `this` either. The analyzer enforces
+     * that the body consequently reads nothing but its parameters and static state.
+     */
+    private fun emitHandlerRegistration(construct: ExtractorTry) {
+        handlerOwners[construct] = currentOwner
+        registerHandler(construct, currentOwner)
+    }
+
+    /** The internal name of the class each handler method was emitted into. */
+    private val handlerOwners = mutableMapOf<ExtractorTry, String>()
+
 
     // ------------------------------------------------------------------- purr
 
@@ -2296,10 +2400,11 @@ class BytecodeGenerator(
      * `purr { ... }` 鈥?take a `StampedLock`, run the block, unlock on the way out.
      *
      * This cannot be a library call, and the reason is the *release*. It has to happen on every way
-     * out of the block, and there are four: falling off the end, `return`, `raise`, and a thrown
-     * exception. The last two are covered by a catch-all handler, since a `raise` is an `athrow` like
-     * any other; a `return` is not covered by anything, which is why the release is also emitted
-     * inline before the `*RETURN` instruction 鈥?see `MethodScope.purr` and [emitPurrReleaseOnExit].
+     * out of the block, and there are five: falling off the end, `return`, `nyan`, `yield`, and a
+     * thrown exception. The last two are covered by a catch-all handler, since a `yield` is an
+     * `athrow` like any other; a `return` and a `nyan` are not covered by anything, which is why the
+     * release is also emitted inline before the `*RETURN` instruction 鈥?see `MethodScope.purr` and
+     * [emitPurrReleaseOnExit].
      *
      * ```
      *   stamp = lock.writeLock()          // or readLock()
@@ -2412,16 +2517,21 @@ class BytecodeGenerator(
     }
 
     /**
-     * `r: int = try f() { a -> yield 1 }` 鈥攖he same catching construct, but worth a value.
+     * `r: int = try f() { a -> nyan a + 1 }` — the same construct, but worth a value.
      *
-     * Both paths meet at one slot: the call's own return value when it returns, and `doEmit`'s answer
-     * 鈥攖he value the extractor's `yield` produced 鈥攚hen it `raise`s instead. Which is why the
-     * extractor has to yield for this form to mean anything: without one, `doEmit` could only answer
-     * `null`, and the reader would silently get nothing. The analyzer requires the yield; here the
-     * slot is simply filled from whichever path was taken and unboxed into the `try`'s type.
+     * Both paths meet at one slot: the call's own return value when it returns, and the value the
+     * handler answered when it ran instead. The handler has to answer a value for this form to mean
+     * anything, so the `scratch` sites reaching it must all be initialising something — the analyzer
+     * requires that, and here the slot is simply filled from whichever path was taken and converted
+     * into the `try`'s own type.
+     *
+     * The boxed slot is still used because the two paths can disagree on the JVM type: the call
+     * answers whatever it returns, and a `nyan` in the handler answers what the sites asked for.
+     * Boxing both makes one local serve either, which the verifier accepts.
      */
     private fun emitTryExpression(expression: TryExpression, scope: MethodScope) {
         val mv = scope.mv
+        emitHandlerRegistration(expression)
         // The slot holds a boxed value from either path, so it is one `Object` wide whatever the
         // `try` is worth.
         val resultSlot = scope.allocateTemp(ObjectType)
@@ -2441,19 +2551,25 @@ class BytecodeGenerator(
     /**
      * The `try`/`catch` both forms share.
      *
-     * [resultSlot] is the local that collects the construct's value 鈥攖he call's return value on the
-     * normal path, `doEmit`'s answer on the `raise` path 鈥攐r `null` when the value is discarded.
+     * The handler is a method, so the only thing the `try` itself has to do is catch the `yield`
+     * exceptions the call can let out: a `yield` inside the handler throws `EmitYieldException`
+     * carrying its value, and the `try` that declared the handler is what catches it. A `scratch`,
+     * by contrast, is an ordinary call and never reaches here.
+     *
+     * [resultSlot] is the local that collects the construct's value — the call's return value on the
+     * normal path, the exception's payload on the `yield` path — or `null` when the value is
+     * discarded.
      */
     private fun emitExtractorTry(construct: ExtractorTry, scope: MethodScope, resultSlot: Int?) {
         val mv = scope.mv
-        val exceptionClass = earlyEmitExceptionClass()
+        val exceptionClass = emitYieldExceptionClass()
 
         val start = Label()
         val end = Label()
         val handler = Label()
         val after = Label()
 
-        // The exception object is kept so its array can be handed to the extractor in a moment.
+        // The exception object is kept so the value it carries can be read out of it.
         val exceptionSlot = scope.allocateTemp(ThrowableType)
 
         mv.visitTryCatchBlock(start, end, handler, exceptionClass)
@@ -2474,188 +2590,118 @@ class BytecodeGenerator(
         mv.visitLabel(end)
         mv.visitJumpInsn(GOTO, after)
 
+        // A `yield` anywhere below this call — in the handler, or in a function it called — arrives
+        // here. Its `data` field *is* the value, so there is nothing to unpack.
         mv.visitLabel(handler)
         mv.visitVarInsn(ASTORE, exceptionSlot)
         markLine(mv, construct.extractorBody)
-
-        // `exception.doEmit(extractor)`, so the exception goes on the stack first. It answers an
-        // `Object`: the value a yielding extractor produced, or `null` when it produced none.
         mv.visitVarInsn(ALOAD, exceptionSlot)
-        emitExtractorInstance(construct, scope)
-        mv.visitMethodInsn(
-            INVOKEVIRTUAL,
+        mv.visitFieldInsn(
+            GETFIELD,
             exceptionClass,
-            "doEmit",
-            "(L${emitExtractorBaseClass()};)Ljava/lang/Object;",
-            false,
+            EMIT_YIELD_PAYLOAD_FIELD,
+            "Ljava/lang/Object;",
         )
-        if (resultSlot == null) mv.visitInsn(POP) else mv.visitVarInsn(ASTORE, resultSlot)
+        if (resultSlot == null) {
+            mv.visitInsn(POP)
+        } else {
+            // The payload is already an `Object`, which is exactly what [resultSlot] holds, so the
+            // two paths of the `try` meet in one local without a conversion.
+            mv.visitVarInsn(ASTORE, resultSlot)
+        }
         mv.visitLabel(after)
     }
 
     /**
-     * Pushes a fresh instance of the extractor literal's class.
+     * Emits a `try` handler as a `static` method of the class its `try` was written in.
      *
-     * Like a lambda, the literal becomes a `final` class implementing the standard library's
-     * `EmitExtractorN` for its arity 鈥攐r `EmitExtractorWithResultN` when the body yields 鈥攚ith
-     * whatever it reads from the enclosing scope copied in through the constructor.
-     */
-    private fun emitExtractorInstance(construct: ExtractorTry, scope: MethodScope) {
-        val mv = scope.mv
-        val (captures, extractorClassName) = emitExtractorClass(construct, scope)
-
-        mv.visitTypeInsn(NEW, extractorClassName)
-        mv.visitInsn(DUP)
-        for ((symbol, _) in captures) {
-            val slot = scope.slotOf(symbol)
-            if (slot != null) {
-                mv.visitVarInsn(loadOpcode(symbol.type), slot)
-            } else {
-                mv.visitVarInsn(ALOAD, 0)
-                mv.visitFieldInsn(
-                    GETFIELD,
-                    scope.owner,
-                    scope.captureOf(symbol)!!,
-                    descriptorOf(symbol.type),
-                )
-            }
-        }
-        mv.visitMethodInsn(
-            INVOKESPECIAL,
-            extractorClassName,
-            "<init>",
-            descriptorOf(captures.map { it.first.type }, VoidType),
-            false,
-        )
-    }
-
-    /**
-     * Emits the class behind a `try` extractor and returns its capture fields.
+     * This is the heart of the design. The `{ ... }` block is not inlined into the method holding the
+     * `try`: it becomes a method of its own, and every `scratch` site that matches its `emit` clause
+     * calls it with `invokestatic`. Three consequences are worth spelling out, because each one
+     * explains a piece of the code below.
      *
-     * Which family the class implements is decided here, by whether the body yields: a body that
-     * produces a value implements `EmitExtractorWithResultN`, whose `invoke` answers it, and one that
-     * does not implements `EmitExtractorN`, whose `invoke` answers nothing. Either way the standard
-     * library supplies `extract(Object[])` as a default method 鈥攊t unpacks the array and calls
-     * `invoke` 鈥攕o only `invoke` is generated here. Since the interface erases its type parameters
-     * to `Object`, `invoke` receives `Object`s and unboxes each into the typed local the body reads.
+     *  - **It takes only the `emit` values.** A `scratch` runs in a different call frame, so there is
+     *    no enclosing local to hand over; `static` means there is no `this` to read one through
+     *    either. That is why the method is `private static` like the sample's `nyanTest$scratch$0`,
+     *    and why the analyzer refuses a handler body that reads anything except its own parameters
+     *    and static state.
+     *  - **Its return type comes from the sites.** `v: int = scratch 1, 2` needs an `int` back, and a
+     *    bare `scratch 1, 2` needs nothing, so the analyzer fixes the type from the first site and
+     *    this method is declared to answer exactly it. A handler with no reaching site at all is still
+     *    emitted, answering `void`, because the analyzer has already reported it.
+     *  - **`yield` and `nyan` mean opposite things.** A `nyan` is an ordinary `return`. A `yield`
+     *    leaves through the `try` instead — it throws `EmitYieldException` carrying the value — which
+     *    is how a handler answers the construct rather than its caller.
      */
-    private fun emitExtractorClass(
-        construct: ExtractorTry,
-        enclosingScope: MethodScope,
-    ): Pair<List<Pair<LocalSymbol, String>>, String> {
+    private fun emitHandlerMethod(writer: ClassWriter, handler: PendingHandler) {
+        val construct = handler.construct
         val parameters = construct.extractorParameters
-        val arity = parameters.size
-        // A `try` whose extractor yields is worth a value, so it needs the interface whose `invoke`
-        // returns one; everything else uses the void family.
-        val yields = construct.yieldedType != null
-        val interfaceName =
-            if (yields) emitExtractorWithResultInterface(arity) else emitExtractorInterface(arity)
-        val className = "${currentOwner}\$Emit\$${lambdaCounter++}"
-        val identity = construct
-
-        // Whatever the body reads from the enclosing method has to travel in as a field, exactly as
-        // a lambda captures. The extractor's own parameters are locals of the generated `invoke`, so
-        // they are in scope there and must not also be captured.
-        val referenced = LinkedHashSet<LocalSymbol>()
-        collectLocalReferences(construct.extractorBody, referenced)
-        val captures = mutableListOf<Pair<LocalSymbol, String>>()
-        for (symbol in referenced) {
-            if (parameters.any { it.symbol === symbol }) continue
-            if (enclosingScope.slotOf(symbol) == null && enclosingScope.captureOf(symbol) == null) continue
-            captures += symbol to "captured\$${captures.size}"
-        }
+        val signature = construct.handler.signature
+        val returnType = construct.handler.returnType ?: VoidType
 
         val enclosingOwner = currentOwner
-        currentOwner = className
-
-        val writer = NekoClassWriter(ClassWriter.COMPUTE_FRAMES or ClassWriter.COMPUTE_MAXS)
-        writer.visit(
-            V1_8,
-            ACC_FINAL or ACC_SUPER,
-            className,
-            null,
-            "java/lang/Object",
-            arrayOf(interfaceName),
-        )
-        writer.visitSource(currentFile.sourceName(), null)
-
-        for ((symbol, fieldName) in captures) {
-            writer.visitField(
-                ACC_PRIVATE or ACC_FINAL,
-                fieldName,
-                descriptorOf(symbol.type),
-                null,
-                null,
-            ).visitEnd()
-        }
-
-        emitLambdaConstructor(writer, className, captures)
+        currentOwner = handlerOwners[construct] ?: enclosingOwner
 
         val mv = writer.visitMethod(
-            ACC_PUBLIC,
-            "invoke",
-            // The interface erases its type parameters, so every value arrives as an `Object` 鈥攁nd a
-            // yielding one answers an `Object` too.
-            "(" + "Ljava/lang/Object;".repeat(arity) + ")" +
-                if (yields) "Ljava/lang/Object;" else "V",
+            // `public static`: the sample's method is `private`, and it can be, because there its
+            // only caller sits in the same class. Here a `scratch` may live in any class of the
+            // program, and a `private` method is not callable across classes — so the widest access
+            // is the one that works. It is still `static`, which is what a `scratch` needs.
+            ACC_PUBLIC or ACC_STATIC,
+            handler.name,
+            descriptorOf(signature, returnType),
             null,
             null,
+            // No `Exceptions` attribute: `EmitYieldException` is checked, so it *could* be listed, but
+            // a Neko program never catches one by name — the `try` does that structurally — and
+            // listing it would only make the generated class noisier than the source.
         )
         mv.visitCode()
 
         val scope = MethodScope(
-            owner = className,
+            owner = currentOwner,
             mv = mv,
-            lambdaIdentity = identity,
-            firstSlot = 1,
-            captures = captures.associate { it.first to it.second },
-            static = false,
-            builderPrefix = "invoke",
-            extractorResult = yields,
+            lambdaIdentity = construct,
+            firstSlot = 0,
+            static = true,
+            returnType = returnType,
+            extractorResult = construct.yieldedType != null,
         )
 
-        // Each `Object` parameter is unboxed into a typed local the body reads.
-        //
-        // The *interface* passes one `Object` per parameter, and those are the first slots 鈥?`this`,
-        // then `arity` references. The *locals* the body reads are typed, so a `long` or a `double`
-        // among them needs two slots, and they are therefore allocated after that block rather than
-        // over it: unboxing a `long` into the parameter slots would put its second half on top of the
-        // next incoming `Object`, and the verifier rejects the method outright.
-        val firstLocal = 1 + parameters.size
-        var nextSlot = firstLocal
+        // The parameters arrive typed — no `Object[]` to unpack — so each is simply reserved in
+        // place. A `long` or `double` among them takes two slots, which is why the total is walked
+        // rather than counted.
+        var slot = 0
         parameters.forEachIndexed { index, parameter ->
-            val symbol = parameter.symbol ?: return@forEachIndexed
-            mv.visitVarInsn(ALOAD, index + 1)
-            emitUnbox(parameter.resolvedType ?: ErrorType, mv)
-            mv.visitVarInsn(storeOpcode(symbol.type), nextSlot)
-            scope.reserve(symbol, nextSlot)
-            nextSlot += BuiltinTypes.slotCountOf(symbol.type)
+            val symbol = parameter.symbol
+            if (symbol != null) {
+                scope.reserve(symbol, slot)
+            }
+            slot += BuiltinTypes.slotCountOf(signature.getOrElse(index) { ErrorType })
         }
-        // Whatever the body allocates next must not land inside the block just written, so the scope
-        // is told how far it now reaches 鈥?a `long` parameter extends it by two rather than one.
-        scope.advancePast(nextSlot)
+        scope.advancePast(slot)
 
         for (inner in construct.extractorBody.statements) {
             emitStatement(inner, scope)
         }
-        // A body whose `yield` is inside a branch can reach here; the interface has to answer
-        // something, and `null` is the value a missing `yield` already means.
-        if (yields) mv.visitInsn(ACONST_NULL)
-        mv.visitInsn(RETURN)
+
+        // A handler that answers nothing, or a value-answering one whose `nyan` is inside a branch,
+        // can reach here. The statement list may already have `return`ed, so the trailing return is
+        // only needed when control can still arrive — but emitting it is always verifiable and always
+        // correct, so it is not conditional.
+        if (returnType == VoidType || returnType === ErrorType) {
+            mv.visitInsn(RETURN)
+        } else {
+            pushDefault(returnType, mv)
+            mv.visitInsn(returnOpcode(returnType))
+        }
 
         mv.visitMaxs(0, 0)
         mv.visitEnd()
 
-        // A `raise` written inside the extractor body was compiled into *this* class, so its builder
-        // belongs here too and must be written before the writer closes.
-        drainBuilders(writer, className)
-
-        writer.visitEnd()
-
-        output[className] = writer.toByteArray()
+        // A `try` written inside the handler body has its own handler, compiled into this class too.
+        drainHandlers(writer, currentOwner)
         currentOwner = enclosingOwner
-
-        return captures to className
     }
 
     /**
@@ -2663,8 +2709,9 @@ class BytecodeGenerator(
      * alone.
      *
      * Every primitive gets a `valueOf`, including `byte`, `short` and `char`, whose wrappers have had
-     * one since Java 5: a `raise` that carried a `short` has to hand the extractor an object, and the
-     * extractor casts back to whatever the `emit` clause declared.
+     * one since Java 5: a value that has to be an `Object` — the payload a `yield` throws, or the
+     * `collect`ed slot a `try` expression meets at — is boxed here, and unboxed to whatever the `emit`
+     * clause or the `try`'s own type declared.
      */
     private fun emitBox(type: NekoType, mv: MethodVisitor) {
         if (!BuiltinTypes.isPrimitive(type)) return
@@ -2682,9 +2729,9 @@ class BytecodeGenerator(
      * Unboxes an `Object` on the stack into [type]; reference types are left alone.
      *
      * The checkcast is what makes the cast safe rather than hopeful: the value arriving here came from
-     * a `raise` or an erased type parameter, so its static type is `Object` and only the `emit`
-     * clause's declared type says what it really is. A `ClassCastException` from a mismatch is the
-     * right answer 鈥?the alternative is a silently wrong value.
+     * a `yield`'s boxed payload or an erased type parameter, so its static type is `Object` and only
+     * the declared type says what it really is. A `ClassCastException` from a mismatch is the right
+     * answer 鈥?the alternative is a silently wrong value.
      */
     private fun emitUnbox(type: NekoType, mv: MethodVisitor) {
         when (type) {
@@ -2824,6 +2871,7 @@ class BytecodeGenerator(
             is IndexExpression -> emitIndex(expression, scope)
             is NyaExpression -> emitNyaExpression(expression, scope)
             is TryExpression -> emitTryExpression(expression, scope)
+            is ScratchExpression -> emitScratch(expression, scope)
         }
     }
 
@@ -4319,8 +4367,6 @@ class BytecodeGenerator(
          * non-static method.
          */
         val static: Boolean = true,
-        /** The function whose name prefixes the `raise` builders this method registers. */
-        val builderPrefix: String = "emit",
         /**
          * The type this method answers, which is what a `return` inside it has to be narrowed to.
          *
@@ -4451,20 +4497,27 @@ class BytecodeGenerator(
         /** Prefix of the generated function-type interfaces, e.g. `Neko$Function$0`. */
         const val INTERFACE_PREFIX = "Neko\$Function\$"
 
-        /** Simple name of the standard library exception a `raise` throws and a `try` catches. */
-        const val EARLY_EMIT_EXCEPTION_CLASS = "EarlyEmitException"
+        /**
+         * Internal name of `EmitYieldException`, the checked exception a `yield` throws.
+         *
+         * Unlike everything else the effect machinery touches, this one is shipped with the compiler
+         * as a plain Java class rather than compiled from Neko, so its name is fixed here instead of
+         * being looked up in the program. It extends `Exception` rather than `RuntimeException` on
+         * purpose: a `yield` is an ordinary control transfer the compiler itself generates and
+         * catches, and a checked exception keeps it from being quietly swallowed by a `catch` written
+         * for a genuine failure.
+         */
+        const val EMIT_YIELD_EXCEPTION_CLASS =
+            "com/github/kusa233/neko/stdlib/emit/EmitYieldException"
 
-        /** Simple name of the standard library interface every `EmitExtractorN` extends. */
-        const val EMIT_EXTRACTOR_CLASS = "EmitExtractor"
-
-        /** Prefix of the value-returning extractor family, e.g. `EmitExtractorWithResult2`. */
-        const val EMIT_EXTRACTOR_WITH_RESULT_PREFIX = "EmitExtractorWithResult"
+        /** The field of [EMIT_YIELD_EXCEPTION_CLASS] holding the value the `yield` carried. */
+        const val EMIT_YIELD_PAYLOAD_FIELD = "data"
 
         /**
          * The JDK error a failed `nya` throws, as an internal name.
          *
          * It belongs to the platform rather than to the Neko standard library, so unlike
-         * [EARLY_EMIT_EXCEPTION_CLASS] it needs no lookup: `java.lang` is on every JVM that could
+         * [EMIT_YIELD_EXCEPTION_CLASS] it needs no lookup: `java.lang` is on every JVM that could
          * load the class this code goes into. Using the same error Java's own `assert` throws is
          * what makes a Neko check and a Java one fail in the way a reader already expects.
          */

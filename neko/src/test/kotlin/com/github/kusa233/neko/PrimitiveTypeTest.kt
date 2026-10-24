@@ -754,17 +754,17 @@ class PrimitiveTypeTest {
     }
 
     @Test
-    fun `an emit clause carries wide values through its builder`() {
-        // A `raise` is the one construct that carries several values of declared types through an
-        // `Object[]`, and the builder it generates is where a two-slot parameter would be read from
-        // the wrong slot if `long` were treated as one: the `long` is boxed from slots 0 and 1, and
-        // the `int` after it is read from slot 2.
+    fun `an emit clause carries wide values through its parameters`() {
+        // An `emit` clause is the one construct that carries several values of declared types, and the
+        // handler method's parameters are where a two-slot type would be read from the wrong slot if
+        // `long` were treated as one: the `long` occupies slots 0 and 1, so the `int` after it is
+        // parameter 2. Running the program is what proves the values actually arrive.
         val program = TestSupport.loadWithLibrary(
             TestSupport.file(
                 "class Test {",
                 "    static {",
                 "        fun give() {",
-                "            raise 4000000000L, 7, 'q', 2.5",
+                "            scratch 4000000000L, 7, 'q', 2.5",
                 "        } emit [long, int, char, double]",
                 "",
                 "        fun main() {",

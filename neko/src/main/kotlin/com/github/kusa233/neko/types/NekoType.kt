@@ -89,9 +89,8 @@ data object ObjectType : NekoType {
  * `Throwable` — the type of anything the JVM can throw, and what a `try` handler catches.
  *
  * Nothing in the language names it as a catch type any more: the `try`/`catch` statement was removed.
- * It survives as the declared type of a throwable that crosses a frame boundary — the standard
- * library's carrier for `raise` is declared as one — and as the erased type of the local a generated
- * handler stores its exception in.
+ * It survives as the erased type of the local a generated handler stores the `EmitYieldException` in,
+ * and as the declared type of any throwable that crosses a frame boundary.
  */
 data object ThrowableType : NekoType {
     override val displayName: String get() = "Throwable"
@@ -218,8 +217,8 @@ val NekoType.isError: Boolean get() = this === ErrorType
  *  * [ErrorType] is accepted in both directions, so one mistake does not cascade.
  *  * A primitive is assignable to [ObjectType], and every reference type is too. `Object` is what a
  *    type parameter erases to, so a value of *any* type can be stored as one — an `int` or a `long`
- *    arrives boxed, exactly as it would in Java's generics. That is what makes `Object[]` usable as
- *    the carrier a `raise` boxes its values into.
+ *    arrives boxed, exactly as it would in Java's generics. That is what lets a `yield` carry any
+ *    value in one `Object` field, and what `EmitYieldException`'s payload is declared as.
  *
  * Nothing else is: in particular two different numeric primitives are not assignable to each other
  * in either direction, which is what makes `x: long = someInt` an error. A *literal* is the one thing

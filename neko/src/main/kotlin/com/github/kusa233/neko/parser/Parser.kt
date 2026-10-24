@@ -1178,7 +1178,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         TokenType.PLUS_PLUS, TokenType.MINUS_MINUS -> parseIncrementStatement()
         TokenType.WHEN -> parseWhenStatement()
         TokenType.NYA -> parseNyaStatementForm()
-        TokenType.RAISE -> parseRaiseStatement()
+        TokenType.NYAN -> parseNyanStatement()
         TokenType.TRY -> parseTryStatement()
         TokenType.PURR, TokenType.PURRED,
         TokenType.PURRCLS, TokenType.PURREDCLS,
@@ -1196,27 +1196,36 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
     }
 
     /**
-     * Reports a `throw` as the removed keyword it is, rather than as the unknown name it parses to.
+     * Reports a `throw`/`throws`/`raise` as the removed keyword it is, rather than as an unknown name.
      *
-     * `throw` and `throws` are no longer keywords, so `throw X()` would otherwise be read as a call
-     * and reported as "there is no function named 'throw'" — true, but it leaves the reader guessing.
+     * None of the three is a keyword any more, so `throw X()` would otherwise be read as a call and
+     * reported as "there is no function named 'throw'" — true, but it leaves the reader guessing.
      * Recognising the word here, at the start of a statement, is what keeps the diagnostic actionable
-     * while the language deliberately treats both as ordinary identifiers everywhere else.
+     * while the language deliberately treats them as ordinary identifiers everywhere else.
+     *
+     * `raise` is the interesting one: it was the word `scratch` replaced, and the two do not mean the
+     * same thing, so pointing at `scratch` without saying why would be misleading. It says what
+     * changed — `scratch` is a call that returns, not a departure — so a program ported from `raise`
+     * fails with an explanation rather than with a silent change of meaning.
      *
      * Returns true when a diagnostic was reported, so the caller stops before parsing on.
      */
     private fun rejectRemovedThrow(): Boolean {
         val token = current()
         if (token.type != TokenType.IDENTIFIER) return false
-        if (token.text != "throw" && token.text != "throws") return false
+        if (token.text != "throw" && token.text != "throws" && token.text != "raise") return false
 
-        val replacement = if (token.text == "throw") {
-            "Neko leaves a function early with 'raise <value>, ...', which the caller receives " +
-                "with 'try f(...) { a, b -> ... }'; to let a JVM exception out, there is nothing " +
-                "to write — an uncaught exception already propagates"
-        } else {
-            "Neko records that a function can leave early in its 'emit [...]' clause rather than " +
-                "in a 'throws' clause, and a function that raises always declares one"
+        val replacement = when (token.text) {
+            "throw" -> "Neko enters a 'try' handler with 'scratch <value>, ...' and leaves it with " +
+                "'nyan <value>'; to let a JVM exception out, there is nothing to write — an " +
+                "uncaught exception already propagates"
+            "raise" -> "'scratch <value>, ...' replaced it, but the meaning changed: a 'scratch' " +
+                "calls the handler and carries on with its answer, so it does not leave the " +
+                "function. Write 'nyan <value>' inside the handler to answer the site, or " +
+                "'yield <value>' to leave through the 'try'"
+            else -> "Neko records that a function can reach a 'try' handler in its 'emit [...]' " +
+                "clause rather than in a 'throws' clause, and a function that writes 'scratch' " +
+                "always declares one"
         }
         diagnostics.error("'${token.text}' is not an Neko keyword: $replacement", token.span)
         synchronizeToStatement()
@@ -1911,13 +1920,19 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         )
     }
 
-    /** `raise e1, e2`, or a bare `raise` for a function whose `emit` clause names no values. */
-    private fun parseRaiseStatement(): RaiseStatement? {
+    /**
+     * `scratch e1, e2`, or a bare `scratch` for a handler whose `emit` clause names no values.
+     *
+     * An expression rather than a statement: `v: int = scratch 1, 2` keeps what the handler answers.
+     * The caller's `parseAssignmentOrExpression` path reaches it through the expression table, so this
+     * is only the operand shape — the values follow, comma-separated.
+     */
+    private fun parseScratchExpression(): ScratchExpression? {
         val keyword = advance()
         val values = mutableListOf<Expression>()
         var end = keyword.span.end
 
-        if (!atStatementEnd()) {
+        if (!atStatementEnd() && !at(TokenType.COMMA)) {
             while (true) {
                 val value = parseExpression() ?: run {
                     synchronizeToStatement()
@@ -1934,11 +1949,35 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             }
         }
 
-        expectStatementEnd("raise statement")
-        return RaiseStatement(
+        return ScratchExpression(
             keywordSpan = keyword.span,
             values = values,
             span = Span(source, keyword.span.start, end),
+        )
+    }
+
+    /** `nyan value` — leaves the enclosing `try` handler, answering the value. */
+    private fun parseNyanStatement(): NyanStatement? {
+        val keyword = advance()
+        if (atStatementEnd()) {
+            error(
+                "'nyan' must be followed by the value the enclosing 'try' handler answers; " +
+                    "write 'yield' to leave through the 'try' that declared it instead",
+                current().span,
+            )
+            synchronizeToStatement()
+            return null
+        }
+
+        val value = parseExpression() ?: run {
+            synchronizeToStatement()
+            return null
+        }
+        expectStatementEnd("nyan statement")
+        return NyanStatement(
+            keywordSpan = keyword.span,
+            value = value,
+            span = Span(source, keyword.span.start, value.span.end),
         )
     }
 
@@ -2001,9 +2040,9 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
 
         if (at(TokenType.LEFT_BRACE)) {
             error(
-                "a 'try' block no longer exists: 'try' only receives the values a function " +
-                    "'raise's, written 'try call(...) { values -> ... }', and an exception nothing " +
-                    "catches already propagates",
+                "a 'try' block no longer exists: 'try' only declares a handler for a call, " +
+                    "written 'try call(...) { values -> ... }', and an exception nothing catches " +
+                    "already propagates",
                 keyword.span,
             )
             synchronizeToStatement()
@@ -2017,10 +2056,9 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
     }
 
     /**
-     * `try call(args) { a, b -> ... }` — calls a function that may `raise`, and runs the extractor
-     * body with the raised values if it does.
+     * `try call(args) { a, b -> ... }` — wraps a call in a handler that its `scratch` sites reach.
      *
-     * The extractor is written like a lambda parameter list, so the same `{ a, b -> ... }` shape is
+     * The handler is written like a lambda parameter list, so the same `{ a, b -> ... }` shape is
      * reused; there it is parsed as an expression, here as the second half of the statement.
      */
     private fun parseExtractorTry(keyword: Token): TryStatement? {
@@ -2072,7 +2110,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
     private fun parseExtractorTryParts(keyword: Token): ExtractorTryParts? {
         val call = parseExpression() as? CallExpression ?: run {
             error(
-                "'try' must be followed by a block, or by a call to a function that may 'raise'",
+                "'try' must be followed by a block, or by a call to a function with an 'emit' clause",
                 current().span,
             )
             synchronizeToStatement()
@@ -2088,8 +2126,8 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         val parameters = mutableListOf<LambdaParameter>()
         var arrowSpan: Span? = null
 
-        // The extractor may name fewer values than the callee raises, and may name none at all:
-        // `try f(1) { -> ... }`. Parse the parameter list only when an arrow follows it.
+        // The handler may name fewer values than the callee's clause declares, and may name none at
+        // all: `try f(1) { -> ... }`. Parse the parameter list only when an arrow follows it.
         if (!at(TokenType.ARROW)) {
             if (!at(TokenType.RIGHT_BRACE)) {
                 parseExtractorParameters(parameters)
@@ -2480,6 +2518,9 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             }
 
             TokenType.LEFT_BRACE -> parseLambdaExpression()
+
+            // `v: int = scratch 1, 2` — an expression, because the handler it enters answers a value.
+            TokenType.SCRATCH -> parseScratchExpression()
 
             // `result: int = nya a == b { yield 2 } else { yield 1 }` asks for a value, so the parser
             // demands both blocks here and refuses the two forms that would leave one answer missing.
@@ -3010,7 +3051,8 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         val NAME_SEGMENT_KEYWORDS: Set<TokenType> = setOf(
             TokenType.EMIT,
             TokenType.NYA,
-            TokenType.RAISE,
+            TokenType.NYAN,
+            TokenType.SCRATCH,
             TokenType.YIELD,
             TokenType.ELSE,
             TokenType.THIS,

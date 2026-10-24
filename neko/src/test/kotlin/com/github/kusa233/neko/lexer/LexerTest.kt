@@ -39,7 +39,7 @@ class LexerTest {
         val keywords = listOf(
             "locate", "import", "meow", "class", "interface", "constructor", "fun", "val", "var",
             "private", "public", "protected", "static", "return", "yield", "if", "else", "while",
-            "when", "nya", "try", "raise", "emit", "this", "true", "false",
+            "when", "nya", "try", "scratch", "nyan", "emit", "this", "true", "false",
         )
         for (keyword in keywords) {
             val scanned = types(keyword).single()

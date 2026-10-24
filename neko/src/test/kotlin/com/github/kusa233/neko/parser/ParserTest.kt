@@ -184,7 +184,7 @@ class ParserTest {
             """
             class Sample {
                 fun method() {
-                    raise 1, 2
+                    scratch 1, 2
                 } emit [int, string]
             }
             """.trimIndent() + "\n",
@@ -205,7 +205,7 @@ class ParserTest {
             """
             class Sample {
                 fun method() {
-                    raise
+                    scratch
                 } emit []
             }
             """.trimIndent() + "\n",
@@ -223,7 +223,7 @@ class ParserTest {
             """
             class Sample {
                 fun first() {
-                    raise 1
+                    scratch 1
                 } emit [int]
 
                 fun second() {
