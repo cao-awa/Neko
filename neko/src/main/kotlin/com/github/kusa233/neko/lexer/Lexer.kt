@@ -348,12 +348,18 @@ class Lexer(private val source: SourceFile, private val diagnostics: DiagnosticB
             ';' -> emit(TokenType.SEMICOLON, start)
             '.' -> emit(TokenType.DOT, start)
             '?' -> emit(TokenType.QUESTION, start)
-            '+' -> emit(TokenType.PLUS, start)
+            '+' -> if (match('+')) emit(TokenType.PLUS_PLUS, start) else emit(TokenType.PLUS, start)
             '*' -> emit(TokenType.STAR, start)
             '/' -> emit(TokenType.SLASH, start)
             '%' -> emit(TokenType.PERCENT, start)
 
-            '-' -> if (match('>')) emit(TokenType.ARROW, start) else emit(TokenType.MINUS, start)
+            // `->` is checked before `--`, so `a -> b` keeps lexing as an arrow; the two never compete
+            // for the same second character.
+            '-' -> when {
+                match('>') -> emit(TokenType.ARROW, start)
+                match('-') -> emit(TokenType.MINUS_MINUS, start)
+                else -> emit(TokenType.MINUS, start)
+            }
             '=' -> if (match('=')) emit(TokenType.EQUALS_EQUALS, start) else emit(TokenType.ASSIGN, start)
             '!' -> if (match('=')) emit(TokenType.BANG_EQUALS, start) else emit(TokenType.BANG, start)
             '<' -> if (match('=')) emit(TokenType.LESS_EQUALS, start) else emit(TokenType.LESS, start)

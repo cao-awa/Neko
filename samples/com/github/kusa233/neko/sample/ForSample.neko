@@ -1,0 +1,177 @@
+locate com.github.kusa233.neko.sample
+
+/**
+ * `for`, `for ... in`, and `++`/`--`.
+ *
+ * The three-part loop is Java's, spelled the same way: `for (i: int = 0; i < 100; i++)`. All three
+ * parts may be left out, which is how `for (;;)` is written; that one cannot fall out of itself, so the
+ * only way it ends is a `return` or a `raise` inside it.
+ *
+ * `for (element: int in xs)` is the other spelling, and `in` is the one word that tells the two apart.
+ * It walks an array directly, or a class implementing the standard library's `Iterable` — `Words` below.
+ *
+ * `while` is not shown: it is Java's `while` already, and needs no new syntax.
+ */
+class ForSample {
+    static {
+        fun main(args: string[]) {
+            showCountUp()
+            showCountdown()
+            showUpdateByAssignment()
+            showEveryOtherStep()
+            showNestedLoops()
+            showForEachOverAnArray(args)
+            showForEachOverAnIterable()
+            showIncrementAndDecrement()
+            showEndlessLoop()
+        }
+
+        /** The plainest form: a counter, a test, and a step. */
+        fun showCountUp() {
+            total: int = 0
+            for (i: int = 1; i <= 5; i++) {
+                total = total + i
+            }
+            println(total) // 15
+        }
+
+        /**
+         * Both directions work: `--` is an ordinary statement the header may hold, and the condition
+         * is an ordinary test, so counting down is the same loop read backwards.
+         */
+        fun showCountdown() {
+            for (i: int = 3; i > 0; i--) {
+                println(i) // 3, then 2, then 1
+            }
+        }
+
+        /** The step need not be one: an assignment is accepted wherever `i++` is. */
+        fun showUpdateByAssignment() {
+            steps: int = 0
+            for (i: int = 1; i < 40; i = i * 3) {
+                steps++
+            }
+            // 1 -> 3 -> 9 -> 27 -> 81, so four passes ran before the test failed.
+            println(steps) // 4
+        }
+
+        /**
+         * A step of two is an assignment rather than `i += 2`, because Neko has no compound assignment.
+         */
+        fun showEveryOtherStep() {
+            sum: int = 0
+            for (i: int = 0; i < 6; i = i + 2) {
+                sum = sum + i
+            }
+            println(sum) // 0 + 2 + 4 = 6
+        }
+
+        /** A loop inside a loop, each declaring its own variable. */
+        fun showNestedLoops() {
+            pairs: int = 0
+            for (row: int = 0; row < 2; row++) {
+                for (column: int = 0; column < 3; column++) {
+                    pairs++
+                }
+            }
+            println(pairs) // 2 * 3 = 6
+        }
+
+        /**
+         * An array is walked directly, with no interface to implement — the JVM gives arrays none.
+         *
+         * `args` is this program's own `main` parameter, which is the only array a Neko program is
+         * handed rather than having to pass around itself.
+         */
+        fun showForEachOverAnArray(args: string[]) {
+            for (name: string in args) {
+                println(name)
+            }
+        }
+
+        /** A class becomes iterable by implementing the library's `Iterable`, and by nothing else. */
+        fun showForEachOverAnIterable() {
+            words: Words = Words()
+            total: int = 0
+            for (word: string in words) {
+                println(word)
+                total++
+            }
+            println(total) // 3
+        }
+
+        /**
+         * `++` and `--` are statements, not expressions: they produce no value, so `x = i++` is not
+         * something this language can say, and neither can appear inside a condition.
+         */
+        fun showIncrementAndDecrement() {
+            count: int = 10
+            count++
+            println(count) // 11
+            count--
+            count--
+            println(count) // 9
+
+            // `byte` and `long` work too; the value is narrowed back into the variable's own type,
+            // exactly as an assignment to it would be.
+            small: byte = 1
+            small++
+            println(small) // 2
+            big: long = 100
+            big++
+            println(big) // 101
+        }
+
+        /**
+         * `for (;;)` has no test at all, so it runs until something inside it leaves.
+         *
+         * A function whose body ends in one needs no `return`: the loop cannot fall through.
+         */
+        fun showEndlessLoop() {
+            println(firstSquareOver(50)) // 64
+        }
+
+        fun firstSquareOver(limit: int): int {
+            for (i: int = 1;; i++) {
+                if (i * i > limit) {
+                    return i * i
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Three fixed words, as an `Iterable`.
+ *
+ * `next()` answers `Object` because that is what the library's protocol declares: Neko erases its
+ * generics without emitting the bridge methods a parameterised interface would need, so the erased
+ * shape has to *be* the declared one. The `for` that walks this still declares `string`, and the
+ * compiler inserts the cast — so the loop reads a `string` without the program casting anything.
+ */
+class Words: Iterable {
+    fun iterator(): Iterator {
+        return WordsCursor()
+    }
+}
+
+/** A cursor over [Words], so each loop over the same object starts from the beginning again. */
+class WordsCursor: Iterator {
+    var index: int = 0
+
+    fun hasNext(): bool {
+        return index < 3
+    }
+
+    fun next(): Object {
+        value: string = "miao"
+        if (index == 1) {
+            value = "nya"
+        }
+        if (index == 2) {
+            value = "purr"
+        }
+        index++
+        return value
+    }
+}

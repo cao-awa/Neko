@@ -42,6 +42,11 @@ class SampleEndToEndTest {
             "samples/com/github/kusa233/neko/sample/PurrSample.neko",
         )
 
+    private fun forSamplePath(): Path =
+        TestSupport.projectDirectory.resolve(
+            "samples/com/github/kusa233/neko/sample/ForSample.neko",
+        )
+
     /**
      * Compiles one sample together with the Neko standard library, as the build does.
      *
@@ -61,6 +66,18 @@ class SampleEndToEndTest {
         )
     }
 
+    /**
+     * Whether [internalName] belongs to the standard library rather than to the sample under test.
+     *
+     * The library is compiled together with every program, so its classes are always among the output;
+     * a test that asserts *which* classes a sample produced has to leave them out. Matching on the
+     * package rather than on a list of names keeps that true as the library grows.
+     */
+    private fun isStandardLibraryClass(internalName: String): Boolean =
+        internalName.contains("EmitExtractor") ||
+            internalName.endsWith("/EarlyEmitException") ||
+            internalName.startsWith("com/github/kusa233/neko/stdlib/")
+
     @Test
     fun `the sample compiles without errors`() {
         val result = compileSample(samplePath())
@@ -75,7 +92,7 @@ class SampleEndToEndTest {
         val result = compileSample(samplePath())
         // The sample's own class, its lambda's class, and the interface that lambda's function type
         // needs. The library's classes are emitted too, because the library is compiled with it.
-        val emitted = result.classes.keys.filterNot { it.contains("EmitExtractor") || it.endsWith("/EarlyEmitException") }
+        val emitted = result.classes.keys.filterNot { isStandardLibraryClass(it) }
         assertEquals(
             setOf(
                 "com/github/kusa233/neko/sample/Sample",
@@ -139,7 +156,7 @@ class SampleEndToEndTest {
         // The sample's own class and the extractor literal's class. The `EmitExtractorN` interfaces
         // and `EarlyEmitException` come from `samples/library`, which is compiled in the same run, so
         // they are emitted alongside rather than supplied from outside.
-        val emitted = result.classes.keys.filterNot { it.contains("EmitExtractor") || it.endsWith("/EarlyEmitException") }
+        val emitted = result.classes.keys.filterNot { isStandardLibraryClass(it) }
         assertEquals(
             setOf(
                 "com/github/kusa233/neko/sample/ExceptionSample",
@@ -355,6 +372,52 @@ class SampleEndToEndTest {
             ),
             buffer.toString(Charsets.UTF_8).replace("\r\n", "\n").trim().lines(),
             "the sample should print the totals its comments claim",
+        )
+    }
+
+    @Test
+    fun `the for sample runs and prints the values its comments claim`() {
+        // The comments in `ForSample.neko` each name the value the `println` above them should print,
+        // so this checks the language against its own documentation. Running it is what makes that a
+        // real check: a loop that iterates once too often, or an `iinc` on the wrong type, still
+        // compiles and only shows up as a wrong number here.
+        val directory = Files.createTempDirectory("neko-for-sample")
+        val result = compileSample(forSamplePath(), outputDirectory = directory)
+        assertTrue(
+            !result.hasErrors,
+            "the for sample must compile:\n${result.renderDiagnostics().joinToString("\n")}",
+        )
+
+        val loader = java.net.URLClassLoader(arrayOf(directory.toUri().toURL()), javaClass.classLoader)
+        val type = Class.forName("com.github.kusa233.neko.sample.ForSample", true, loader)
+        val main = type.getMethod("main", Array<String>::class.java)
+
+        val original = System.out
+        val buffer = java.io.ByteArrayOutputStream()
+        System.setOut(java.io.PrintStream(buffer, true, Charsets.UTF_8))
+        try {
+            // The array loop prints this program's own `main` arguments, so passing none is what makes
+            // that section print nothing — which is itself the assertion that an empty array iterates
+            // zero times rather than once with a null element.
+            main.invoke(null, arrayOf<String>())
+        } finally {
+            System.setOut(original)
+        }
+
+        assertEquals(
+            listOf(
+                "15",   // 1 + 2 + 3 + 4 + 5
+                "3", "2", "1", // counting down
+                "4",    // 1, 3, 9, 27
+                "6",    // 0 + 2 + 4
+                "6",    // 2 * 3 rows and columns
+                "miao", "nya", "purr", // the Iterable
+                "3",    // how many words it yielded
+                "11", "9", "2", "101", // ++ and -- on int, byte and long
+                "64",   // 8 * 8 is the first square over 50
+            ),
+            buffer.toString(Charsets.UTF_8).replace("\r\n", "\n").trim().lines(),
+            "the sample should print the values its comments claim",
         )
     }
 

@@ -100,6 +100,7 @@ val nekoPrograms: Map<String, String> = mapOf(
     "NyaSample" to "com.github.kusa233.neko.sample.NyaSample",
     "EnumSample" to "com.github.kusa233.neko.sample.EnumSample",
     "PurrSample" to "com.github.kusa233.neko.sample.PurrSample",
+    "ForSample" to "com.github.kusa233.neko.sample.ForSample",
 )
 
 /**

@@ -4,6 +4,8 @@ import com.github.kusa233.neko.ast.BlockStatement
 import com.github.kusa233.neko.ast.ClassDeclaration
 import com.github.kusa233.neko.ast.ConstructorDeclaration
 import com.github.kusa233.neko.ast.ExpressionStatement
+import com.github.kusa233.neko.ast.ForEachStatement
+import com.github.kusa233.neko.ast.ForStatement
 import com.github.kusa233.neko.ast.FunctionDeclaration
 import com.github.kusa233.neko.ast.IfStatement
 import com.github.kusa233.neko.ast.LambdaExpression
@@ -135,6 +137,26 @@ private fun collectStatements(
             }
 
             is WhileStatement -> descend(statement.body, offset, into)
+
+            // `for (i: int = 0; ...)` — the header declares `i` for the whole loop, so it is in scope
+            // in the condition, the update and the body, and nowhere afterwards. The initializer is a
+            // declaration statement like any other, so it is collected by the same rule.
+            is ForStatement -> {
+                statement.initializer?.let { initializer ->
+                    into[initializer.name] =
+                        LocalName(initializer.name, initializer.resolvedType, false)
+                }
+                descend(statement.body, offset, into)
+            }
+
+            // `for (e: int in xs)` — `e` is bound by the loop rather than declared in it, and is
+            // visible in the body alone. It is read-only, which completion has no way to show, so it
+            // is offered like any other name.
+            is ForEachStatement -> {
+                into[statement.name] =
+                    LocalName(statement.name, statement.resolvedElementType, false)
+                descend(statement.body, offset, into)
+            }
 
             // `purr { ... }` holds ordinary statements, so a variable declared inside is visible in
             // that block alone — the same rule an `if` branch follows.

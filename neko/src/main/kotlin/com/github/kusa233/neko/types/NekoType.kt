@@ -177,6 +177,18 @@ data class ClassType(
     val internalName: String,
     /** Name as written in the source, used in diagnostics. */
     override val displayName: String,
+    /**
+     * The type arguments written on a use of this type: the `<string>` in `Iterable<string>`.
+     *
+     * Erasure means the JVM never sees these, and member lookup never consults them — a `T` parameter
+     * is `Object` at run time whatever was written. They are kept anyway because `for ... in` has to
+     * know what an iterable yields *before* generating code: the loop variable's type is checked
+     * against the argument, and `next()` is unboxed into it. That check is the only place the argument
+     * is read, which is why it can be a bare list here rather than a full generic type system.
+     *
+     * Empty for a use that wrote none, and for every type that is not generic.
+     */
+    val arguments: List<NekoType> = emptyList(),
 ) : NekoType {
     /**
      * The class' name without its package, which is what the analyzer keys declared classes by.

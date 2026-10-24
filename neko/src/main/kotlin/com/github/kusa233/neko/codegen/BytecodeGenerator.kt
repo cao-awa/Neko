@@ -1,4 +1,4 @@
-﻿package com.github.kusa233.neko.codegen
+package com.github.kusa233.neko.codegen
 
 import com.github.kusa233.neko.ast.*
 import com.github.kusa233.neko.diagnostics.DiagnosticBag
@@ -446,6 +446,9 @@ class BytecodeGenerator(
             }
 
             is WhileStatement -> collectPurrLocks(statement.body, used)
+            is ForStatement -> collectPurrLocks(statement.body, used)
+            is ForEachStatement -> collectPurrLocks(statement.body, used)
+            is IncrementStatement -> Unit
             is WhenStatement -> statement.branches.forEach { collectPurrLocks(it.body, used) }
             is TryStatement -> collectPurrLocks(statement.extractorBody, used)
             is ExpressionStatement -> collectPurrLocks(statement.expression, used)
@@ -1348,6 +1351,9 @@ class BytecodeGenerator(
             is YieldStatement -> emitYield(statement, scope)
             is IfStatement -> emitIf(statement, scope)
             is WhileStatement -> emitWhile(statement, scope)
+            is ForStatement -> emitFor(statement, scope)
+            is ForEachStatement -> emitForEach(statement, scope)
+            is IncrementStatement -> emitIncrement(statement, scope)
             is WhenStatement -> emitWhen(statement, scope)
             is RaiseStatement -> emitRaise(statement, scope)
             is TryStatement -> emitTry(statement, scope)
@@ -1574,6 +1580,340 @@ class BytecodeGenerator(
         emitStatement(statement.body, scope)
         mv.visitJumpInsn(GOTO, startLabel)
         mv.visitLabel(endLabel)
+    }
+
+    /**
+     * `for (i: int = 0; i < 100; i++) body` — the same shape as [emitWhile], with the two extra parts
+     * pinned around it.
+     *
+     * ```
+     *   <initializer>
+     *   start: if (!condition) goto end
+     *          <body>
+     *   update: <update>
+     *          goto start
+     *   end:
+     * ```
+     *
+     * The update label sits between the body and the back edge, which is what makes `continue` (if the
+     * language ever grows one) run the update and why the label is emitted even though nothing jumps to
+     * it yet. A missing condition emits no test at all, which is what makes `for (;;)` an endless loop
+     * rather than a loop that never starts.
+     */
+    private fun emitFor(statement: ForStatement, scope: MethodScope) {
+        val mv = scope.mv
+        val startLabel = Label()
+        val endLabel = Label()
+
+        statement.initializer?.let { emitStatement(it, scope) }
+
+        mv.visitLabel(startLabel)
+        val condition = statement.condition
+        if (condition != null) {
+            markLine(mv, condition)
+            emitExpression(condition, scope)
+            mv.visitJumpInsn(IFEQ, endLabel)
+        }
+
+        emitStatement(statement.body, scope)
+        statement.update?.let { update ->
+            markLine(mv, update)
+            emitStatement(update, scope)
+        }
+        mv.visitJumpInsn(GOTO, startLabel)
+        mv.visitLabel(endLabel)
+    }
+
+    /**
+     * `for (element: type in iterable) body` — the array case and the `Iterable` case are different
+     * lowerings, chosen by the type the analyzer recorded.
+     *
+     * **An array** is walked with an index, because the JVM gives arrays no interface to implement:
+     *
+     * ```
+     *   idx = 0
+     *   start: if (idx >= xs.length) goto end
+     *          element = xs[idx]
+     *          <body>
+     *          idx++
+     *          goto start
+     *   end:
+     * ```
+     *
+     * **An `Iterable`** is walked with the three protocol calls, evaluated once for `iterator()` so the
+     * body cannot accidentally restart the sequence:
+     *
+     * ```
+     *   it = iterable.iterator()
+     *   start: if (!it.hasNext()) goto end
+     *          element = it.next()
+     *          <body>
+     *          goto start
+     *   end:
+     * ```
+     *
+     * Both bind the element into a local slot of the element's own type, so the body reads it exactly
+     * as it reads any other local — including an unboxing for a reference element type, done once here
+     * rather than on every read.
+     */
+    private fun emitForEach(statement: ForEachStatement, scope: MethodScope) {
+        val mv = scope.mv
+        val iterableType = statement.iterableType
+        val elementType = statement.resolvedElementType ?: statement.elementType.let { ErrorType }
+
+        markLine(mv, statement.iterable)
+        emitExpression(statement.iterable, scope)
+
+        if (iterableType is ArrayType) {
+            emitForEachOverArray(statement, scope, elementType)
+        } else {
+            emitForEachOverIterable(statement, scope, elementType)
+        }
+    }
+
+    /**
+     * Gives the loop variable its slot and returns it.
+     *
+     * The name is a real local to everything inside the body — `println(element)` resolves to this
+     * symbol — so the slot has to come from the same allocator every other local uses. A temporary
+     * would compile the reads to a *different* slot and the body would see zero.
+     */
+    private fun declareLoopVariable(
+        statement: ForEachStatement,
+        elementType: NekoType,
+        scope: MethodScope,
+    ): Int {
+        val symbol = statement.symbol
+            ?: return scope.allocateTemp(elementType).also { statement.elementSlot = it }
+        val slot = scope.slotOf(symbol) ?: scope.allocate(symbol)
+        statement.elementSlot = slot
+        return slot
+    }
+
+    /** The array lowering described at [emitForEach]; the array is already on the stack. */
+    private fun emitForEachOverArray(
+        statement: ForEachStatement,
+        scope: MethodScope,
+        elementType: NekoType,
+    ) {
+        val mv = scope.mv
+        val arrayType = statement.iterableType as ArrayType
+        val arraySlot = scope.allocateTemp(arrayType)
+        val indexSlot = scope.allocateTemp(IntType)
+        val startLabel = Label()
+        val endLabel = Label()
+
+        mv.visitVarInsn(ASTORE, arraySlot)
+        mv.visitInsn(ICONST_0)
+        mv.visitVarInsn(ISTORE, indexSlot)
+
+        mv.visitLabel(startLabel)
+        mv.visitVarInsn(ILOAD, indexSlot)
+        mv.visitVarInsn(ALOAD, arraySlot)
+        mv.visitInsn(ARRAYLENGTH)
+        mv.visitJumpInsn(IF_ICMPGE, endLabel)
+
+        mv.visitVarInsn(ALOAD, arraySlot)
+        mv.visitVarInsn(ILOAD, indexSlot)
+        mv.visitInsn(arrayLoadOpcode(arrayType.element))
+        // An `int[]` read answers an `int`, and the loop variable was checked against it by the
+        // analyzer, so the value goes straight into the slot that name resolves to.
+        emitStoreValue(arrayType.element, elementType, mv)
+
+        val elementSlot = declareLoopVariable(statement, elementType, scope)
+        mv.visitVarInsn(storeOpcode(elementType), elementSlot)
+
+        emitStatement(statement.body, scope)
+
+        mv.visitIincInsn(indexSlot, 1)
+        mv.visitJumpInsn(GOTO, startLabel)
+        mv.visitLabel(endLabel)
+    }
+
+    /** The `Iterable` lowering described at [emitForEach]; the iterable is already on the stack. */
+    private fun emitForEachOverIterable(
+        statement: ForEachStatement,
+        scope: MethodScope,
+        elementType: NekoType,
+    ) {
+        val mv = scope.mv
+        val iteratorSlot = scope.allocateTemp(ObjectType)
+        val startLabel = Label()
+        val endLabel = Label()
+
+        // `iterator()` is called once, so the body cannot restart the sequence by asking again.
+        mv.visitMethodInsn(INVOKEINTERFACE, ITERABLE_INTERFACE, "iterator", "()L$ITERATOR_INTERFACE;", true)
+        mv.visitVarInsn(ASTORE, iteratorSlot)
+
+        mv.visitLabel(startLabel)
+        mv.visitVarInsn(ALOAD, iteratorSlot)
+        mv.visitMethodInsn(INVOKEINTERFACE, ITERATOR_INTERFACE, "hasNext", "()Z", true)
+        mv.visitJumpInsn(IFEQ, endLabel)
+
+        mv.visitVarInsn(ALOAD, iteratorSlot)
+        // `next()` erases to `Object` in the interface, whatever `T` was written as, so the descriptor
+        // is the erased one and the value is unboxed below into the loop variable's own type.
+        mv.visitMethodInsn(INVOKEINTERFACE, ITERATOR_INTERFACE, "next", "()Ljava/lang/Object;", true)
+        // `next()` hands back an erased `Object`, so the element is turned into the loop variable's own
+        // type here — once per element, not once per read. A reference type gets a `checkcast`, a
+        // primitive its `xxxValue()` call.
+        emitUnbox(elementType, mv)
+
+        val elementSlot = declareLoopVariable(statement, elementType, scope)
+        mv.visitVarInsn(storeOpcode(elementType), elementSlot)
+
+        emitStatement(statement.body, scope)
+        mv.visitJumpInsn(GOTO, startLabel)
+        mv.visitLabel(endLabel)
+    }
+
+    /**
+     * The `Iterable<T>` argument of [type], for deciding what `next()` is unwrapped from.
+     *
+     * The protocol's `next()` returns its type argument, which erases to `Object`; the analyzer has
+     * already checked the loop variable against it, so this only has to find the argument back.
+     */
+    private fun iterableElementTypeOf(type: ClassType): NekoType? =
+        type.arguments.firstOrNull()
+
+    /**
+     * `i++` / `i--` — read the variable, add or subtract one, write it back.
+     *
+     * Constants are folded into a single `iinc` when they can be: `iinc` takes a signed byte, so the
+     * `int` case uses it and every other type goes through the general path. Either way the type's own
+     * conversion is applied on the way back in, so a `byte` variable does not silently widen to `int`.
+     */
+    private fun emitIncrement(statement: IncrementStatement, scope: MethodScope) {
+        val mv = scope.mv
+        // `holder.count++` names a field through a receiver, so the field path is taken even though the
+        // resolution here is the field symbol rather than a local.
+        val member = statement.memberTarget
+        if (member != null) {
+            val field = member.resolvedField ?: return
+            emitIncrementOfReachedField(statement, member, field, scope)
+            return
+        }
+
+        val symbol = statement.target.resolution ?: return
+        val type = symbol.type
+
+        val slot = when (symbol) {
+            is LocalSymbol -> scope.slotOf(symbol) ?: scope.allocate(symbol)
+            is FieldSymbol -> {
+                emitIncrementOfField(statement, symbol, type, scope)
+                return
+            }
+
+            else -> return
+        }
+
+        val delta = if (statement.operator == "++") 1 else -1
+        if (type === IntType) {
+            // `iinc` does the read, the add and the store in one instruction, which is what `javac`
+            // emits for the same statement.
+            mv.visitIincInsn(slot, delta)
+            return
+        }
+
+        mv.visitVarInsn(loadOpcode(type), slot)
+        if (delta > 0) {
+            mv.visitInsn(if (type === LongType) LCONST_1 else ICONST_1)
+            mv.visitInsn(if (type === LongType) LADD else IADD)
+        } else {
+            mv.visitInsn(if (type === LongType) LCONST_1 else ICONST_1)
+            mv.visitInsn(if (type === LongType) LSUB else ISUB)
+        }
+        // `byte` and `short` are computed as `int` and narrowed back, exactly as an assignment to them
+        // would do; skipping this would store a value the type cannot hold.
+        emitStoreValue(if (type === LongType) LongType else IntType, type, mv)
+        mv.visitVarInsn(storeOpcode(type), slot)
+    }
+
+    /**
+     * `this.count++` — the field case, which no local slot can serve.
+     *
+     * Only an instance field on `this` reaches here: the parser accepts a bare name as the target, and
+     * the analyzer resolves it to whichever symbol the name means, so a `static` field or one reached
+     * through a receiver is filled in by the field's own access path.
+     */
+    private fun emitIncrementOfField(
+        statement: IncrementStatement,
+        field: FieldSymbol,
+        type: NekoType,
+        scope: MethodScope,
+    ) {
+        val mv = scope.mv
+        val delta = if (statement.operator == "++") 1 else -1
+        val owner = field.enclosingClass.jvmInternalName
+        val descriptor = descriptorOf(type)
+
+        if (!field.isStatic) mv.visitVarInsn(ALOAD, 0)
+        if (field.isStatic) {
+            mv.visitFieldInsn(GETSTATIC, owner, field.name, descriptor)
+        } else {
+            mv.visitInsn(DUP)
+            mv.visitFieldInsn(GETFIELD, owner, field.name, descriptor)
+        }
+        mv.visitInsn(if (type === LongType) LCONST_1 else ICONST_1)
+        mv.visitInsn(
+            when {
+                type === LongType && delta > 0 -> LADD
+                type === LongType -> LSUB
+                delta > 0 -> IADD
+                else -> ISUB
+            },
+        )
+        emitStoreValue(if (type === LongType) LongType else IntType, type, mv)
+        if (field.isStatic) {
+            mv.visitFieldInsn(PUTSTATIC, owner, field.name, descriptor)
+        } else {
+            mv.visitFieldInsn(PUTFIELD, owner, field.name, descriptor)
+        }
+    }
+
+    /**
+     * `holder.count++` — the field is reached through a receiver, so the receiver is evaluated once and
+     * its reference is kept on the stack under both the read and the write.
+     *
+     * `getfield`/`putfield` both consume the object reference, so the sequence is
+     * `receiver; dup; getfield; <one>; add; putfield`: the `dup` leaves one copy for the read and one
+     * for the write, which is what makes the whole increment a single evaluation of the receiver. That
+     * matters when the receiver is itself a call — `next().count++` must not call `next()` twice.
+     */
+    private fun emitIncrementOfReachedField(
+        statement: IncrementStatement,
+        member: MemberAccessExpression,
+        field: FieldSymbol,
+        scope: MethodScope,
+    ) {
+        val mv = scope.mv
+        val type = field.type
+        val delta = if (statement.operator == "++") 1 else -1
+        val owner = field.enclosingClass.jvmInternalName
+        val descriptor = descriptorOf(type)
+
+        if (field.isStatic) {
+            mv.visitFieldInsn(GETSTATIC, owner, field.name, descriptor)
+        } else {
+            emitExpression(member.receiver, scope)
+            mv.visitInsn(DUP)
+            mv.visitFieldInsn(GETFIELD, owner, field.name, descriptor)
+        }
+        mv.visitInsn(if (type === LongType) LCONST_1 else ICONST_1)
+        mv.visitInsn(
+            when {
+                type === LongType && delta > 0 -> LADD
+                type === LongType -> LSUB
+                delta > 0 -> IADD
+                else -> ISUB
+            },
+        )
+        emitStoreValue(if (type === LongType) LongType else IntType, type, mv)
+        if (field.isStatic) {
+            mv.visitFieldInsn(PUTSTATIC, owner, field.name, descriptor)
+        } else {
+            mv.visitFieldInsn(PUTFIELD, owner, field.name, descriptor)
+        }
     }
 
     /**
@@ -3883,6 +4223,23 @@ class BytecodeGenerator(
                 collectLocalReferences(node.body, into)
             }
 
+            is ForStatement -> {
+                node.initializer?.let { collectLocalReferences(it, into) }
+                node.condition?.let { collectLocalReferences(it, into) }
+                node.update?.let { collectLocalReferences(it, into) }
+                collectLocalReferences(node.body, into)
+            }
+
+            is ForEachStatement -> {
+                collectLocalReferences(node.iterable, into)
+                collectLocalReferences(node.body, into)
+            }
+
+            is IncrementStatement -> {
+                node.memberTarget?.let { collectLocalReferences(it, into) }
+                collectLocalReferences(node.target, into)
+            }
+
             is WhenStatement -> {
                 collectLocalReferences(node.subject, into)
                 for (branch in node.branches) {
@@ -4131,6 +4488,17 @@ class BytecodeGenerator(
          * carry.
          */
         const val STAMPED_LOCK_CLASS = "java/util/concurrent/locks/StampedLock"
+
+        /**
+         * The standard library's iteration protocol, by JVM internal name.
+         *
+         * `for (e: T in xs)` over an `Iterable` compiles to `iterator()`, then `hasNext()`/`next()` on
+         * the answer — the same three calls Java's own for-each makes. A Neko interface rather than
+         * `java.lang.Iterable` so the calls are generated against a declaration the compiler can also
+         * check, and so a reader can see what the loop does.
+         */
+        const val ITERABLE_INTERFACE = "com/github/kusa233/neko/stdlib/collection/Iterable"
+        const val ITERATOR_INTERFACE = "com/github/kusa233/neko/stdlib/collection/Iterator"
     }
 }
 

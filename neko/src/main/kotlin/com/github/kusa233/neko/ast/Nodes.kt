@@ -1,6 +1,7 @@
 package com.github.kusa233.neko.ast
 
 import com.github.kusa233.neko.source.Span
+import com.github.kusa233.neko.lexer.TokenType
 import com.github.kusa233.neko.symbols.ClassSymbol
 import com.github.kusa233.neko.symbols.FieldSymbol
 import com.github.kusa233.neko.symbols.FunctionSymbol
@@ -234,6 +235,14 @@ class SuperTypeReference(
     val nameSpan: Span,
     /** `null` when no parenthesis followed the name, i.e. this names an interface. */
     val arguments: List<Expression>?,
+    /**
+     * The type arguments written on the supertype: the `<int>` in `class Numbers: Iterable<int>`.
+     *
+     * Erased from the class file like every other generic, but read by `for ... in` to know what an
+     * iterable yields. Empty when none were written — including for a superclass, whose arguments a
+     * Neko declaration does not spell out.
+     */
+    val typeArguments: List<TypeReference> = emptyList(),
     override val span: Span,
 ) : Node {
     /** Filled in by the analyzer: the resolved supertype. */
@@ -353,7 +362,20 @@ class Parameter(
 sealed interface TypeReference : Node
 
 /** `int`, `string`, `bool` */
-class NamedTypeReference(val name: String, val nameSpan: Span, override val span: Span) : TypeReference
+/**
+ * A type written by name: `int`, `Color`, `Iterable<string>`.
+ *
+ * [arguments] carries whatever was written between `<` and `>` — the `string` in `Iterable<string>`.
+ * Neko erases generics, so these never reach the class file; they are kept because `for ... in` has to
+ * know what an iterable yields in order to check the loop variable against it and to unbox `next()`.
+ * Everywhere else the list is simply empty.
+ */
+class NamedTypeReference(
+    val name: String,
+    val nameSpan: Span,
+    val arguments: List<TypeReference> = emptyList(),
+    override val span: Span,
+) : TypeReference
 
 /** `string[]` */
 class ArrayTypeReference(val element: TypeReference, override val span: Span) : TypeReference
@@ -465,6 +487,100 @@ class WhileStatement(
     val body: Statement,
     override val span: Span,
 ) : Statement
+
+/**
+ * `for (i: int = 0; i < 100; i++) body` — the three-part loop, spelled as Java spells it.
+ *
+ * The four pieces are Java's: [initializer] runs once, [condition] is checked before every pass,
+ * [update] runs after every pass, and [body] runs in between. All three of the first are optional,
+ * which is what makes `for (;;)` an infinite loop rather than a syntax error.
+ *
+ * [initializer] declares the loop variable, and that declaration is scoped to the loop: its type is
+ * the variable's type, and it is not visible after the loop ends. That is why it is a whole
+ * [VariableDeclarationStatement] rather than a name — a `for` that could only reuse an existing
+ * variable would make the two forms of `i` in `for (i: int = 0; ...)` and `for (i = 0; ...)` differ
+ * only by a colon, and the scoping question that raises is not worth asking a reader to answer.
+ */
+class ForStatement(
+    /** Span of the `for` keyword, for pointing at the loop rather than at its parts. */
+    val keywordSpan: Span,
+    /** `i: int = 0`, or `null` when the loop is written `for (; ...)`. */
+    val initializer: VariableDeclarationStatement?,
+    /** Checked before each pass; `null` means "always", i.e. `for (;;)`. */
+    val condition: Expression?,
+    /**
+     * Run after each pass. Restricted to the two increments and an assignment, because a `for`'s
+     * update is a statement and those are the only statements that fit between the semicolons.
+     */
+    val update: Statement?,
+    val body: Statement,
+    override val span: Span,
+) : Statement
+
+/**
+ * `for (element: int in list) body` — run the body once per element, front to back.
+ *
+ * Two things may be iterated: an array, whose elements are read inline, and any type that implements
+ * the standard library's `Iterable<T>`, which is walked with `iterator()`/`hasNext()`/`next()` the way
+ * Java's own for-each is. An array needs no `iterator()` because the JVM has no interface it could
+ * implement, so the two cases are genuinely different lowerings rather than one behind the other.
+ *
+ * [element] is **read-only**. It is bound afresh on every pass and the next pass overwrites it, so an
+ * assignment to it inside the body would be a value the program computes and immediately throws away —
+ * almost always a mistake, and one no compiler-free reader would spot.
+ */
+class ForEachStatement(
+    val keywordSpan: Span,
+    /** The loop variable's name, as written. */
+    val name: String,
+    val nameSpan: Span,
+    /** The declared element type, resolved by the analyzer. */
+    val elementType: TypeReference,
+    val iterable: Expression,
+    val body: Statement,
+    override val span: Span,
+) : Statement {
+    /** Filled in by the analyzer: the type [iterable] was found to have. */
+    var iterableType: NekoType? = null
+
+    /** Filled in by the analyzer: the type each element is bound as, after a widening or unboxing. */
+    var resolvedElementType: NekoType? = null
+
+    /** Filled in by the analyzer: the read-only local the loop variable names. */
+    var symbol: LocalSymbol? = null
+
+    /** Filled in by the code generator: the local slot the loop variable lives in. */
+    var elementSlot: Int = -1
+}
+
+/**
+ * `i++` / `i--` — add one to, or subtract one from, a variable in place.
+ *
+ * A statement rather than an expression: there is no value to read back. Java's `i++` has one, and it
+ * has to be told which — the old value or the new — and nothing here would use either. Keeping it a
+ * statement also means `i++` cannot be smuggled into a condition where a reader expects no side
+ * effect.
+ *
+ * Only a variable may be incremented, and only a numeric one: `a[i]++` and `f()++` are refused, since
+ * neither is a variable and neither has a slot to write back to.
+ */
+class IncrementStatement(
+    /** The word itself, `++` or `--`, kept so a diagnostic can quote what was written. */
+    val operator: String,
+    val target: NameExpression,
+    /** Span of the operator, so "wrong type here" points at `++` rather than at the name. */
+    val operatorSpan: Span,
+    override val span: Span,
+) : Statement {
+    /**
+     * The field access this statement increments, when it was written `holder.count++`.
+     *
+     * [target] is then the field's bare name, which is not a local in scope — so the receiver is kept
+     * here and the code generator reads and writes the field through it. `null` for `count++` on a
+     * field of `this`, where the access needs no receiver, and for a plain local.
+     */
+    var memberTarget: MemberAccessExpression? = null
+}
 
 /**
  * `when (subject) { 3 -> ...; 2 -> { ... } }`

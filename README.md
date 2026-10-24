@@ -89,6 +89,17 @@ modelled as an ordinary function so the analyzer and the emitter share one resol
 `short` and `char` have no `PrintStream` method of their own, so those three are declared with the
 Neko type and emitted as the `int` overload Java widens them to anyway.
 
+`stdlib/com/github/kusa233/neko/stdlib/emit/` holds what `raise` and `try` lower to. Nothing else is
+required to use the language: a program that never raises compiles without the library at all.
+
+`stdlib/com/github/kusa233/neko/stdlib/collection/` holds `Iterator` and `Iterable`, the protocol
+`for ... in` walks. A program needs them only by *implementing* them; a `for` over an array does not
+mention them at all. `Iterator.next()` answers `Object` rather than a type parameter, because Neko
+erases generics without emitting the bridge methods a parameterised interface needs — `fun next(): int`
+would compile to `()I` while `Iterator<int>` declares `()Ljava/lang/Object;`, and the two would never
+meet. `for` inserts the cast and the unboxing instead, so the loop variable's declared type is still
+what the body reads.
+
 ## NekoJ — the IntelliJ IDEA plugin
 
 `plugin/idea` builds **NekoJ**, which gives `.neko` files syntax highlighting, code completion and
@@ -564,6 +575,55 @@ also be a field declared further down the same class.
 The inferred local is mutable, and its name is registered only *after* its value is analysed, so
 `count = count + 1` with no `count` in scope reports the reference rather than quietly declaring a
 variable that starts from itself.
+
+### Loops (`for`, `for ... in`)
+
+`while` is Java's, unchanged:
+
+```neko
+while (count < 10) {
+  count++
+}
+```
+
+`for` comes in two spellings. The three-part one is Java's too:
+
+```neko
+for (i: int = 0; i < 100; i++) {
+  println(i)
+}
+```
+
+All three parts may be left out, so `for (;;)` is an endless loop — it has no test to fail, which is
+why a function whose body ends in one needs no `return`. The step may be `++`, `--`, or an assignment:
+`for (i: int = 1; i < 40; i = i * 3)` is three parts of the same kind.
+
+The other spelling walks a sequence, and `in` is the one word that tells the two apart:
+
+```neko
+for (element: int in values) {
+  println(element)
+}
+```
+
+Two things may be iterated:
+
+* **An array**, walked directly. It needs no interface because the JVM gives arrays none — the
+  compiler emits the length read and the element loads inline.
+* **A class implementing `Iterable`** from the standard library. `Iterator.next()` answers `Object`
+  rather than a type parameter, because Neko erases generics without emitting the bridge methods a
+  parameterised interface would need — so the erased shape has to *be* the declared one. The loop
+  variable's own type still applies: the compiler inserts the cast (and the unboxing, for a
+  primitive), so `for (e: int in numbers)` reads an `int` without the program casting anything.
+
+Whichever form it is, the loop variable is **private to its loop** and **read-only**. Private, so two
+loops in one method may each declare `i` and neither is visible afterwards. Read-only, because the
+next pass rebinds it: an assignment would be computed and then discarded, so it is refused instead.
+
+`++` and `--` are **statements, not expressions**. They produce no value, so `x = i++` cannot be
+written and neither can appear inside a condition. They apply to a whole-number variable — `int`,
+`long`, `short`, `byte` — and to a field reached through a receiver (`holder.count++`). `byte` and
+`short` are narrowed back on the way in, exactly as an assignment to them would be.
 
 ### The entry point
 

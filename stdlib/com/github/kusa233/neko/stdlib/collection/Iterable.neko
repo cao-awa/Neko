@@ -1,0 +1,46 @@
+locate com.github.kusa233.neko.stdlib.collection
+
+/**
+ * The standard library's iteration protocol, written in Neko.
+ *
+ * A `for (element: int in list) { ... }` compiles to three calls — `iterator()` once, then
+ * `hasNext()` and `next()` per element — which is how Java's own for-each is defined, minus `remove()`.
+ *
+ * **Why the elements are `Object` rather than a type parameter.** Neko erases generics without emitting
+ * the bridge methods the JVM needs to line a parameterised interface up with a concrete
+ * implementation: `fun next(): int` compiles to `()I`, while `Iterator<int>` declares
+ * `()Ljava/lang/Object;`, and the two do not meet. Writing the protocol over `Object` instead makes the
+ * erased shape *be* the declared shape, so an implementation compiles to exactly the method the
+ * interface names. The loop variable's own type still applies — the compiler inserts the `checkcast`
+ * and the unboxing when it binds an element — so `for (element: int in numbers)` reads an `int`
+ * without the program having to cast anything.
+ *
+ * An **array** does not implement this and needs no iterator at all: the JVM gives arrays no interface
+ * to implement, so `for` reads their length and elements inline instead.
+ */
+public interface Iterator {
+    /** Whether another element is left. Called once before every `next()`. */
+    fun hasNext(): bool
+
+    /**
+     * The next element, boxed if it is a primitive.
+     *
+     * Called only after `hasNext()` answered true, so an exhausted iterator's answer is never observed.
+     */
+    fun next(): Object
+}
+
+/**
+ * A sequence `for ... in` can walk.
+ *
+ * A class becomes iterable by implementing this — the only requirement the analyzer checks.
+ */
+public interface Iterable {
+    /**
+     * A fresh iterator over this sequence.
+     *
+     * Called exactly once per `for`, before the first test, so a loop cannot restart the sequence by
+     * asking again from inside its body.
+     */
+    fun iterator(): Iterator
+}

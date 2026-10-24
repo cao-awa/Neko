@@ -47,6 +47,28 @@ enum class TokenType(val display: String) {
     IF("'if'"),
     ELSE("'else'"),
     WHILE("'while'"),
+    /**
+     * `'for'` — the classic three-part loop, written exactly as Java writes it.
+     *
+     * `for (i: int = 0; i < 100; i++) { ... }` has the same four pieces as Java's: an initialization
+     * that declares a variable, a condition checked before each pass, an update run after each pass,
+     * and a body. The variable it declares lives in the loop's own scope, so a second `for` may reuse
+     * the name and nothing leaks after the loop.
+     *
+     * The same keyword also opens the for-each form, `for (element: int in list) { ... }`, which is
+     * told apart by the `in` that follows the declared type. Both are `for` because both say "run this
+     * for each step of a sequence"; the bodies are identical and only how the sequence is produced
+     * differs.
+     */
+    FOR("'for'"),
+    /**
+     * `'in'` — the for-each separator: `for (element: int in list)`.
+     *
+     * A keyword rather than an identifier because a statement may not be guessed at: seeing `in` is
+     * what tells the parser the `for` it is reading is the for-each form rather than the three-part
+     * one, and both start with the same tokens up to the type.
+     */
+    IN("'in'"),
     WHEN("'when'"),
     /**
      * `'nya'` — checks that a condition holds, and either runs a recovery block or is worth a value
@@ -158,6 +180,16 @@ enum class TokenType(val display: String) {
     OR_OR("'||'"),
     BANG("'!'"),
 
+    /**
+     * `++` and `--`: add one to, or subtract one from, a variable, in place.
+     *
+     * Both are statements, not expressions — there is no value to read back. That is the same choice
+     * `i++` in a `for`'s update position needs and no more: an expression form would have to decide
+     * whether it answers the old or the new value, and nothing in this language would use the answer.
+     */
+    PLUS_PLUS("'++'"),
+    MINUS_MINUS("'--'"),
+
     /** Physical end of line; significant as a statement terminator. */
     NEWLINE("end of line"),
 
@@ -235,6 +267,8 @@ internal val KEYWORDS: Map<String, TokenType> = mapOf(
     "if" to TokenType.IF,
     "else" to TokenType.ELSE,
     "while" to TokenType.WHILE,
+    "for" to TokenType.FOR,
+    "in" to TokenType.IN,
     "when" to TokenType.WHEN,
     "nya" to TokenType.NYA,
     "raise" to TokenType.RAISE,

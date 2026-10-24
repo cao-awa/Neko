@@ -398,18 +398,30 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
                     end = close?.span?.end ?: name.span.end
                 }
 
-                // Generic arguments written as `EmitExtractor<T>` are accepted and ignored: Neko
-                // erases them, so the only thing that matters is that the name is closed properly.
+                // Generic arguments written as `EmitExtractor<T>` or `Iterable<int>`: captured rather
+                // than skipped, because `for ... in` needs to know what an iterable yields. They are
+                // still erased from the class file — nothing downstream of the analyzer reads them.
+                var typeArguments: List<TypeReference> = emptyList()
                 if (at(TokenType.LESS)) {
-                    var depth = 0
-                    while (!at(TokenType.END_OF_FILE)) {
-                        val token = advance()
-                        if (token.type == TokenType.LESS) depth++
-                        if (token.type == TokenType.GREATER) {
-                            depth--
-                            if (depth == 0) {
-                                end = token.span.end
-                                break
+                    val saveArguments = index
+                    val parsedArguments = parseTypeArguments()
+                    if (parsedArguments.isNotEmpty()) {
+                        typeArguments = parsedArguments
+                        end = parsedArguments.last().span.end
+                    } else {
+                        // Not a type argument list after all (a stray `<`), so leave it for whatever
+                        // comes next to report.
+                        index = saveArguments
+                        var depth = 0
+                        while (!at(TokenType.END_OF_FILE)) {
+                            val token = advance()
+                            if (token.type == TokenType.LESS) depth++
+                            if (token.type == TokenType.GREATER) {
+                                depth--
+                                if (depth == 0) {
+                                    end = token.span.end
+                                    break
+                                }
                             }
                         }
                     }
@@ -419,6 +431,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
                     name = name.text,
                     nameSpan = name.span,
                     arguments = arguments,
+                    typeArguments = typeArguments,
                     span = Span(source, name.span.start, end),
                 )
 
@@ -1161,6 +1174,8 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         TokenType.YIELD -> parseYieldStatement()
         TokenType.IF -> parseIfStatement()
         TokenType.WHILE -> parseWhileStatement()
+        TokenType.FOR -> parseForStatement()
+        TokenType.PLUS_PLUS, TokenType.MINUS_MINUS -> parseIncrementStatement()
         TokenType.WHEN -> parseWhenStatement()
         TokenType.NYA -> parseNyaStatementForm()
         TokenType.RAISE -> parseRaiseStatement()
@@ -1273,6 +1288,43 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             return null
         }
 
+        // `i++` and `holder.count++`. The suffix is read here rather than by the expression parser
+        // because `++` is a statement, not an expression: it produces no value, so it cannot appear
+        // wherever a value is expected. Recognising it after a complete expression is what makes the
+        // trailing spelling work, and the leading spelling is handled in `parseIncrementStatement`.
+        if (at(TokenType.PLUS_PLUS) || at(TokenType.MINUS_MINUS)) {
+            val operator = advance()
+            expectStatementEnd("'${operator.text}'")
+            val member = expression as? MemberAccessExpression
+            val target = when (expression) {
+                is NameExpression -> expression
+                is MemberAccessExpression -> NameExpression(
+                    expression.memberName,
+                    expression.memberSpan,
+                    expression.span,
+                )
+
+                else -> {
+                    error(
+                        "'${operator.text}' applies to a variable or a field, but found " +
+                            current().describe(),
+                        expression.span,
+                    )
+                    return null
+                }
+            }
+            val statement = IncrementStatement(
+                operator = operator.text,
+                target = target,
+                operatorSpan = operator.span,
+                span = Span(source, start.span.start, operator.span.end),
+            )
+            // A member target keeps its receiver, so `holder.count++` reaches the field through
+            // `holder` rather than treating `count` as a name in this method's scope.
+            statement.memberTarget = member
+            return statement
+        }
+
         if (at(TokenType.ASSIGN)) {
             advance()
             // A name assigns a local; a member access assigns a field through its receiver; an index
@@ -1378,6 +1430,31 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         return IfStatement(condition, thenBranch, elseBranch, Span(source, keyword.span.start, end))
     }
 
+    /**
+     * `i++` — a statement that adds one to a variable in place.
+     *
+     * The target has to be a bare name. `a[i]++` and `f()++` are refused because neither is a variable:
+     * there would be no slot to write the result back to, and the value the expression produced would
+     * be discarded, which is never what the reader meant.
+     */
+    private fun parseIncrementStatement(): Statement? {
+        val operator = advance()
+        val target = current()
+        if (target.type != TokenType.IDENTIFIER) {
+            error("'${operator.text}' applies to a variable, but found ${target.describe()}", target.span)
+            synchronizeToStatement()
+            return null
+        }
+        advance()
+        expectStatementEnd("'${operator.text}'")
+        return IncrementStatement(
+            operator = operator.text,
+            target = NameExpression(target.text, target.span, target.span),
+            operatorSpan = operator.span,
+            span = Span(source, operator.span.start, target.span.end),
+        )
+    }
+
     /** `while (condition) statement` */
     private fun parseWhileStatement(): WhileStatement? {
         val keyword = advance()
@@ -1391,6 +1468,246 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             return null
         }
         return WhileStatement(condition, body, Span(source, keyword.span.start, body.span.end))
+    }
+
+    /**
+     * `for (i: int = 0; i < 100; i++) { ... }`, or `for (element: int in list) { ... }`.
+     *
+     * The two forms agree up to the declared type: both write `name: type`, and what follows decides
+     * which loop this is. `in` means for-each, and that is the whole reason `in` is a keyword — seeing
+     * it is what tells the two apart without guessing, since an ordinary three-part `for` also has a
+     * name and a type first.
+     *
+     * The three-part form parses its header inside the loop's own scope: the declared variable must be
+     * visible to the condition and the update, and must stop being visible after the body.
+     */
+    private fun parseForStatement(): Statement? {
+        val keyword = advance()
+        if (!expectLeftParen("'for'")) {
+            synchronizeToStatement()
+            return null
+        }
+        skipNewlines()
+
+        // Both forms declare their variable with `name: type`, so the two are told apart by the token
+        // after the type rather than by trying one parse and backing out of it.
+        val looksLikeDeclaration = at(TokenType.IDENTIFIER) && peek(1).type == TokenType.COLON
+        if (looksLikeDeclaration) {
+            // The look-ahead is undone by rewinding [index]: a `for` header is a handful of tokens, so
+            // re-reading it costs nothing and keeps one parse path per form.
+            val save = index
+            val nameToken = advance()
+            advance() // the colon
+            val type = parseType()
+            if (type != null && at(TokenType.IN)) {
+                return parseForEachRest(keyword, nameToken, type)
+            }
+            // Not a for-each, so it was an ordinary declaration after all and the header parser wants
+            // to read the `=` itself.
+            index = save
+        }
+
+        return parseForLoopRest(keyword)
+    }
+
+    /**
+     * The initializer of a three-part `for`, which a `;` ends rather than a newline.
+     *
+     * This mirrors `parseVariableDeclaration` but stops before the `;`: a declaration's own parser
+     * insists on a newline at the end of the statement, and inside a `for` header the separator is the
+     * semicolon instead. Sharing the code is not possible without teaching that parser about two
+     * different terminators, so the small amount of duplication is deliberate.
+     */
+    private fun parseForInitializer(): VariableDeclarationStatement? {
+        val start = current()
+        var kind = VariableKind.VAR
+        var kindSpan: Span? = null
+        if (at(TokenType.VAL) || at(TokenType.VAR)) {
+            val keyword = advance()
+            kind = if (keyword.type == TokenType.VAL) VariableKind.VAL else VariableKind.VAR
+            kindSpan = keyword.span
+        }
+
+        val nameToken = expect(TokenType.IDENTIFIER, "expected a variable name but found ${current().describe()}")
+            ?: return null
+        if (!expectColon("variable '${nameToken.text}'")) return null
+
+        val type = parseType() ?: return null
+
+        var initializer: Expression? = null
+        var end = type.span.end
+        if (at(TokenType.ASSIGN)) {
+            advance()
+            skipNestedNewlines()
+            initializer = parseExpression() ?: return null
+            end = initializer.span.end
+        }
+
+        return VariableDeclarationStatement(
+            kind = kind,
+            kindSpan = kindSpan,
+            name = nameToken.text,
+            nameSpan = nameToken.span,
+            declaredType = type,
+            initializer = initializer,
+            span = Span(source, start.span.start, end),
+        )
+    }
+
+    /**
+     * The rest of `for (element: type in iterable) body`, after the type has already been read.
+     *
+     * The declared variable is read-only, so no `val`/`var` is accepted — `for (var e: int in xs)`
+     * would claim a mutability the loop does not offer, and silently ignoring the word would be worse
+     * than refusing it.
+     */
+    private fun parseForEachRest(
+        keyword: Token,
+        nameToken: Token,
+        elementType: TypeReference,
+    ): Statement? {
+        advance() // `in`
+        skipNestedNewlines()
+        val iterable = parseExpression() ?: run {
+            synchronizeToStatement()
+            return null
+        }
+        if (expectRightParen("'for' header") == null) {
+            synchronizeToStatement()
+            return null
+        }
+        skipNewlines()
+        val body = parseStatement() ?: run {
+            synchronizeToStatement()
+            return null
+        }
+        return ForEachStatement(
+            keywordSpan = keyword.span,
+            name = nameToken.text,
+            nameSpan = nameToken.span,
+            elementType = elementType,
+            iterable = iterable,
+            body = body,
+            span = Span(source, keyword.span.start, body.span.end),
+        )
+    }
+
+    /**
+     * The rest of the three-part loop, from its initializer to its body.
+     *
+     * All three of the header's parts are optional, so `for (;;)` parses: Java allows it and it is the
+     * idiomatic way to write an endless loop with a `return` inside.
+     */
+    private fun parseForLoopRest(keyword: Token): Statement? {
+        // The header is one logical line: its parts are separated by `;`, not by newlines, so the
+        // three parts are read without the newline-sensitivity a statement has.
+        val initializer = if (at(TokenType.SEMICOLON)) null else parseForInitializer()
+        if (initializer == null && !at(TokenType.SEMICOLON)) {
+            synchronizeToStatement()
+            return null
+        }
+        advance() // the `;` after the initializer
+        skipNestedNewlines()
+
+        val condition = if (at(TokenType.SEMICOLON)) null else parseExpression()
+        if (condition == null && !at(TokenType.SEMICOLON)) {
+            synchronizeToStatement()
+            return null
+        }
+        advance() // the `;` after the condition
+        skipNestedNewlines()
+
+        val update = if (at(TokenType.RIGHT_PAREN)) null else parseForUpdate()
+        if (expectRightParen("'for' header") == null) {
+            synchronizeToStatement()
+            return null
+        }
+        skipNewlines()
+
+        val body = parseStatement() ?: run {
+            synchronizeToStatement()
+            return null
+        }
+        return ForStatement(
+            keywordSpan = keyword.span,
+            initializer = initializer,
+            condition = condition,
+            update = update,
+            body = body,
+            span = Span(source, keyword.span.start, body.span.end),
+        )
+    }
+
+    /**
+     * The update clause: an increment, a decrement, or an assignment.
+     *
+     * Only these three, because the update sits between two semicolons and has no block of its own: a
+     * `return` or a `try` there would have nowhere to belong. Restricting it here means the analyzer
+     * and the emitter see three known statement types instead of any statement at all.
+     */
+    private fun parseForUpdate(): Statement? {
+        val start = current()
+        if (at(TokenType.PLUS_PLUS) || at(TokenType.MINUS_MINUS)) {
+            val operator = advance()
+            val target = advance()
+            if (target.type != TokenType.IDENTIFIER) {
+                diagnostics.error(
+                    "'${operator.text}' applies to a variable, but found ${target.describe()}",
+                    target.span,
+                )
+                return null
+            }
+            return IncrementStatement(
+                operator = operator.text,
+                target = NameExpression(target.text, target.span, target.span),
+                operatorSpan = operator.span,
+                span = Span(source, operator.span.start, target.span.end),
+            )
+        }
+
+        // A trailing `i++` rather than a leading one: `i++` is the way the loop was written in the
+        // request and the way Java writes it, so both spellings are accepted.
+        val expression = parseExpression() ?: return null
+        if (at(TokenType.PLUS_PLUS) || at(TokenType.MINUS_MINUS)) {
+            val operator = advance()
+            if (expression !is NameExpression) {
+                diagnostics.error(
+                    "'${operator.text}' applies to a variable, but found an expression",
+                    operator.span,
+                )
+                return null
+            }
+            return IncrementStatement(
+                operator = operator.text,
+                target = expression,
+                operatorSpan = operator.span,
+                span = Span(source, start.span.start, operator.span.end),
+            )
+        }
+
+        if (!at(TokenType.ASSIGN)) {
+            diagnostics.error(
+                "the update part of a 'for' must increment, decrement or assign but found " +
+                    current().describe(),
+                current().span,
+            )
+            return null
+        }
+        advance()
+        skipNestedNewlines()
+        val value = parseExpression() ?: return null
+        if (expression !is NameExpression) {
+            diagnostics.error(
+                "the update part of a 'for' must assign to a variable",
+                expression.span,
+            )
+            return null
+        }
+        return AssignmentStatement(
+            target = expression,
+            value = value,
+            span = Span(source, start.span.start, value.span.end),
+        )
     }
 
     /**
@@ -2270,6 +2587,42 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
     // -------------------------------------------------------------------- types
 
     /**
+     * `<string>`, `<T1, T2>` — the type arguments written after a type's name, or an empty list.
+     *
+     * The list is empty when no `<` is present. Nested brackets are read by recursion, so
+     * `Iterable<Iterator<int>>` closes at the right `>` rather than at the first one.
+     */
+    private fun parseTypeArguments(): List<TypeReference> {
+        if (!at(TokenType.LESS)) return emptyList()
+        advance()
+
+        val arguments = mutableListOf<TypeReference>()
+        // A newline inside `<...>` is not a statement boundary; the delimiters already say where the
+        // list ends, so long argument lists may be wrapped.
+        skipNestedNewlines()
+        while (!at(TokenType.GREATER) && !at(TokenType.END_OF_FILE)) {
+            val argument = parseType() ?: return arguments
+            arguments += argument
+            skipNestedNewlines()
+            if (at(TokenType.COMMA)) {
+                advance()
+                skipNestedNewlines()
+            } else {
+                break
+            }
+        }
+        if (!at(TokenType.GREATER)) {
+            error(
+                "expected '>' to close the type arguments but found ${current().describe()}",
+                current().span,
+            )
+            return arguments
+        }
+        advance()
+        return arguments
+    }
+
+    /**
      * Parses a type: `int`, `string[]`, `[int, int] -> int`.
      *
      * Returns `null` (after reporting) when no valid type is present.
@@ -2280,7 +2633,11 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             TokenType.LEFT_BRACKET -> parseFunctionTypeFromBrackets() ?: return null
             TokenType.IDENTIFIER -> {
                 advance()
-                NamedTypeReference(start.text, start.span, start.span)
+                // `<...>` on a type: captured rather than skipped, because `for ... in` needs the
+                // argument to know what an iterable yields. The JVM still erases it.
+                val arguments = parseTypeArguments()
+                val end = arguments.lastOrNull()?.span?.end ?: start.span.end
+                NamedTypeReference(start.text, start.span, arguments, Span(source, start.span.start, end))
             }
 
             // `([int] -> int)?` — parentheses, so that a `?` can apply to the function type as a
@@ -2356,7 +2713,8 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
 
     /** [reference] with its span replaced by [span], keeping its structure. */
     private fun withSpan(reference: TypeReference, span: Span): TypeReference = when (reference) {
-        is NamedTypeReference -> NamedTypeReference(reference.name, reference.nameSpan, span)
+        is NamedTypeReference ->
+            NamedTypeReference(reference.name, reference.nameSpan, reference.arguments, span)
         is ArrayTypeReference -> ArrayTypeReference(reference.element, span)
         is FunctionTypeReference -> FunctionTypeReference(reference.parameters, reference.returnType, span)
         is NullableTypeReference -> NullableTypeReference(reference.inner, reference.questionSpan, span)

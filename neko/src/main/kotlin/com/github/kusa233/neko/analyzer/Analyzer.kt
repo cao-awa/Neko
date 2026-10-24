@@ -340,7 +340,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         val superclass = declaration.superclass
         if (superclass != null && !declaration.isMiao) {
             val type = resolveType(
-                NamedTypeReference(superclass.name, superclass.nameSpan, superclass.span),
+                NamedTypeReference(superclass.name, superclass.nameSpan, superclass.typeArguments, superclass.span),
             )
             superclass.resolvedType = type
             if (type is ClassType) {
@@ -359,7 +359,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
         for (implemented in declaration.interfaces) {
             val type = resolveType(
-                NamedTypeReference(implemented.name, implemented.nameSpan, implemented.span),
+                NamedTypeReference(implemented.name, implemented.nameSpan, implemented.typeArguments, implemented.span),
             )
             implemented.resolvedType = type
             if (type is ClassType) {
@@ -1114,6 +1114,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             is YieldStatement -> analyzeYield(statement)
             is IfStatement -> analyzeIf(statement)
             is WhileStatement -> analyzeWhile(statement)
+            is ForStatement -> analyzeFor(statement)
+            is ForEachStatement -> analyzeForEach(statement)
+            is IncrementStatement -> analyzeIncrement(statement)
             is WhenStatement -> analyzeWhen(statement)
             is RaiseStatement -> analyzeRaise(statement)
             is TryStatement -> analyzeTry(statement)
@@ -2217,6 +2220,208 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         analyzeStatement(statement.body)
         restoreNarrowings(incoming)
     }
+
+    /**
+     * `for (i: int = 0; i < 100; i++) body`
+     *
+     * The loop gets a scope of its own, which is what makes the loop variable private to it: `i` is
+     * declared before the condition is analysed, so the condition, the update and the body all see it,
+     * and nothing sees it afterwards. That is the same rule Java's `for` follows, and it is what lets
+     * two loops in one method both declare `i`.
+     *
+     * Every part is optional. A missing condition means "always", so there is no test to require a
+     * `bool` of — `for (;;)` is an endless loop, and the only way out is a `return` or a `raise`.
+     */
+    private fun analyzeFor(statement: ForStatement) {
+        pushScope(statement)
+        try {
+            // The initializer declares the loop variable, so it is analysed first: everything after it
+            // may refer to that variable.
+            statement.initializer?.let { analyzeVariableDeclaration(it) }
+
+            val condition = statement.condition
+            if (condition != null) {
+                requireBool(analyzeExpression(condition), condition.span, "for")
+            }
+
+            // The body may lean on a condition that has not failed yet, exactly as a `while` body can.
+            val incoming = saveNarrowings()
+            if (condition != null) applyFacts(factsTrue(condition))
+
+            // The update runs after the body and before the next test. It is analysed inside the
+            // body's accumulated facts, because it can only ever run after a pass that passed the
+            // test — and any assignment in it is picked up where it lands.
+            statement.body.let { analyzeStatement(it) }
+            statement.update?.let { analyzeStatement(it) }
+
+            restoreNarrowings(incoming)
+        } finally {
+            popScope()
+        }
+    }
+
+    /**
+     * `for (element: int in list) body`
+     *
+     * Two things may be iterated: an array, and a type implementing the standard library's
+     * `Iterable<T>`. The array case needs no interface because the JVM has no array interface to
+     * implement, so it is a separate rule rather than a special case of the other one.
+     *
+     * The element variable is introduced as a **read-only** local, which is what makes an assignment
+     * to it an error rather than a no-op: the next pass overwrites it, so the stored value would be
+     * computed and thrown away.
+     */
+    private fun analyzeForEach(statement: ForEachStatement) {
+        val declaredType = resolveType(statement.elementType)
+        statement.resolvedElementType = declaredType
+
+        val iterableType = analyzeExpression(statement.iterable)
+        statement.iterableType = iterableType
+
+        // The element type the iterable yields, or `null` after reporting that it yields nothing.
+        // An iterable's `next()` answers `Object`, so there is nothing to check the declared type
+        // against: the compiler unboxes or casts into whatever the loop declared, and a mismatch is a
+        // `ClassCastException` at run time — the same promise a cast makes anywhere else.
+        val produced = elementTypeOf(iterableType, statement.iterable.span) ?: return
+
+        if (produced !== ObjectType && declaredType !== ErrorType && produced !== ErrorType &&
+            !isAssignable(produced, declaredType)
+        ) {
+            diagnostics.error(
+                "the elements of this ${iterableType.displayName} have type " +
+                    "${produced.displayName}, which cannot be bound to '${statement.name}' of type " +
+                    declaredType.displayName,
+                statement.nameSpan,
+            )
+        }
+
+        pushScope(statement)
+        try {
+            val symbol = LocalSymbol(
+                name = statement.name,
+                type = declaredType,
+                span = statement.nameSpan,
+                // Read-only, so an assignment to it is refused by the same check that refuses one to a
+                // `val`.
+                kind = VariableKind.VAL,
+                enclosingLambda = currentLambda?.identity,
+            )
+            statement.symbol = symbol
+            scopes.last().symbols[statement.name] = symbol
+            analyzeStatement(statement.body)
+        } finally {
+            popScope()
+        }
+    }
+
+    /**
+     * The element type [type] yields when iterated, or `null` after reporting that it yields nothing.
+     *
+     * An array answers its component type, which is a genuine check: `for (e: string in ints)` is a
+     * mistake the compiler can see. An iterable answers `Object`, because that is what its `next()`
+     * declares — the loop variable's own type is then the promise, checked by the cast the compiler
+     * emits. Anything else is an error: `for (e: int in 5)` has no elements, and saying so here is more
+     * useful than letting the code generator emit a call to a method that is not there.
+     */
+    private fun elementTypeOf(type: NekoType, span: Span): NekoType? {
+        if (type === ErrorType) return ErrorType
+        if (type is ArrayType) return type.element
+
+        val classType = type as? ClassType
+        if (classType != null && iterableSupertypeOf(classType) != null) return ObjectType
+
+        diagnostics.error(
+            "${type.displayName} has no elements to iterate: 'for ... in' takes an array or a type " +
+                "that implements Iterable",
+            span,
+        )
+        return null
+    }
+
+    /**
+     * The `Iterable<...>` a class implements, or the class itself when it *is* one, or `null`.
+     *
+     * Walks both the superclass and the interfaces, transitively, because a class may reach `Iterable`
+     * indirectly — `interface Named: Iterable<string>` is a perfectly ordinary way to say it, and a
+     * direct-implementation check would report it as not iterable. [ClassType] carries no symbol of
+     * its own, so the walk goes through [classes], which is what the analyzer keeps for
+     * exactly this sort of question.
+     */
+    private fun iterableSupertypeOf(type: ClassType, seen: MutableSet<String> = mutableSetOf()): ClassType? {
+        if (type.internalName == ITERABLE_INTERFACE) return type
+        if (!seen.add(type.internalName)) return null
+
+        val symbol = classes[type.simpleName] ?: return null
+        // A class's own type is the one carrying the type arguments; `Iterable` reached through the
+        // superclass chain keeps whichever arguments were written along the way.
+        for (interfaceType in symbol.interfaces) {
+            iterableSupertypeOf(interfaceType, seen)?.let { return it }
+        }
+        symbol.superclass?.let { superclassType ->
+            iterableSupertypeOf(superclassType, seen)?.let { return it }
+        }
+        return null
+    }
+
+    /**
+     * `i++` — checks that the target is a numeric variable that may be written.
+     *
+     * Only `int`, `long`, `short` and `byte` are accepted: there is no `++` for a `double`, matching the
+     * fact that this language has no `double` arithmetic that would keep a whole number whole. A `val`
+     * and a for-each element are refused for the same reason an assignment to them is.
+     */
+    private fun analyzeIncrement(statement: IncrementStatement) {
+        // `holder.count++` — the target is a field, reached through the member access that was kept
+        // beside it. Analysing that access is what resolves the field and checks the receiver, so it
+        // is done first and the field's own type decides everything else.
+        val member = statement.memberTarget
+        if (member != null) {
+            analyzeExpression(member)
+            statement.target.resolution = member.resolvedField
+            val fieldType = member.resolvedField?.type ?: return
+            statement.target.resolvedType = fieldType
+            if (!isIncrementable(fieldType)) {
+                diagnostics.error(
+                    "'${statement.operator}' needs a whole-number field, but " +
+                        "'${member.memberName}' is of type ${fieldType.displayName}",
+                    statement.operatorSpan,
+                )
+            }
+            return
+        }
+
+        val target = statement.target
+        val symbol = lookup(target.name)
+        if (symbol == null) {
+            diagnostics.error("unresolved reference '${target.name}'", target.nameSpan)
+            return
+        }
+        target.resolution = symbol
+
+        val type = symbol.type
+        target.resolvedType = type
+
+        if (!isIncrementable(type)) {
+            diagnostics.error(
+                "'${statement.operator}' needs a whole-number variable, but '${target.name}' is " +
+                    "of type ${type.displayName}",
+                statement.operatorSpan,
+            )
+            return
+        }
+
+        if (symbol is LocalSymbol && symbol.kind == VariableKind.VAL) {
+            diagnostics.error(
+                "'${target.name}' is read-only, so '${statement.operator}' cannot change it",
+                target.nameSpan,
+                notes = listOf(diagnostics.note("'${target.name}' is declared here", symbol.span)),
+            )
+        }
+    }
+
+    /** Whether `++`/`--` may be applied to a value of [type]. */
+    private fun isIncrementable(type: NekoType): Boolean =
+        type === IntType || type === LongType || type === ShortType || type === ByteType
 
     /**
      * `when (a) { 3 -> ...; 2 -> { ... } }`
@@ -4051,8 +4256,22 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 // passes", which is exactly `Object` once the JVM erases it. That is all the
                 // standard library's extractors need, since their bodies only forward values.
                 val owner = currentClass
-                if (owner != null && reference.name in owner.typeParameters) ObjectType
-                else resolveClassType(reference.name, reference.nameSpan)
+                if (owner != null && reference.name in owner.typeParameters) {
+                    ObjectType
+                } else {
+                    // The arguments are kept on the type rather than discarded with the erasure:
+                    // `for ... in` reads them to know what an iterable yields. They are resolved here
+                    // so a mistake inside `<...>` is reported like any other bad type.
+                    val resolved = resolveClassType(reference.name, reference.nameSpan)
+                    val arguments = reference.arguments.map { resolveType(it) }
+                    // Only a class may carry arguments; a name that resolved to something else (an
+                    // error type, say) keeps the arguments on the floor rather than failing here.
+                    if (arguments.isEmpty() || resolved !is ClassType) {
+                        resolved
+                    } else {
+                        ClassType(resolved.internalName, resolved.displayName, arguments)
+                    }
+                }
             }
         }
 
@@ -4210,6 +4429,15 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         const val MAX_EMIT_VALUES = 9
 
         /**
+         * The standard library interface a `for ... in` walks, by JVM internal name.
+         *
+         * An array needs nothing like it — the JVM has no array interface to implement, so the
+         * compiler emits `length`/index reads inline for that case and this interface only ever
+         * appears for a class that declares it.
+         */
+        const val ITERABLE_INTERFACE = "com/github/kusa233/neko/stdlib/collection/Iterable"
+
+        /**
          * The standard library declarations `raise` and `try` are lowered against.
          *
          * A program that uses either needs every one of these present, because the generated code
@@ -4313,6 +4541,14 @@ private fun Statement.alwaysReturns(): Boolean = when (this) {
     is IfStatement -> elseBranch != null && thenBranch.alwaysReturns() && elseBranch.alwaysReturns()
     is WhenStatement -> hasElseBranch && branches.all { it.body.alwaysReturns() }
     is WhileStatement -> false
+    // A `for` loop leaves through its condition, its body or its update. With no condition there is no
+    // test to fail, so the only way out is a transfer inside the body — and since the body repeats,
+    // one that *can* return on some pass is enough: the next pass offers the same chance. That is why
+    // `for (;;) { if (c) { return 1 } }` counts, even though the `if` alone would not.
+    is ForStatement ->
+        condition == null && (body.containsReturn() || (update?.containsReturn() == true))
+    // A `for ... in` over an array or an iterable may always have zero elements, so it falls through.
+    is ForEachStatement -> false
     // A `purr` block always runs its body, so it can only fall through if the body can. (A `try` is
     // different: its extractor may not run at all.)
     is PurrStatement -> body.alwaysReturns()
@@ -4320,6 +4556,29 @@ private fun Statement.alwaysReturns(): Boolean = when (this) {
     // tell; reporting "maybe falls through" is the safe answer.
     is YieldStatement, is VariableDeclarationStatement, is AssignmentStatement,
     is ExpressionStatement, is TryStatement, is IndexAssignmentStatement,
+    is IncrementStatement,
+    -> false
+}
+
+/**
+ * Whether any path through this statement transfers control out of the enclosing function.
+ *
+ * Weaker than [alwaysReturns]: this answers "can", not "must". It exists for an endless `for` loop,
+ * where a `return` reachable on any pass is enough to stop the loop falling through — the next pass
+ * repeats the same test, so a chance that does not depend on the loop variable is a chance that comes.
+ */
+private fun Statement.containsReturn(): Boolean = when (this) {
+    is ReturnStatement, is RaiseStatement -> true
+    is BlockStatement -> statements.any { it.containsReturn() }
+    is IfStatement -> thenBranch.containsReturn() || elseBranch?.containsReturn() == true
+    is WhenStatement -> branches.any { it.body.containsReturn() }
+    is WhileStatement -> body.containsReturn()
+    is ForStatement -> body.containsReturn() || update?.containsReturn() == true
+    is ForEachStatement -> body.containsReturn()
+    is PurrStatement -> body.containsReturn()
+    is YieldStatement, is VariableDeclarationStatement, is AssignmentStatement,
+    is ExpressionStatement, is TryStatement, is IndexAssignmentStatement,
+    is IncrementStatement,
     -> false
 }
 
@@ -4362,6 +4621,8 @@ private fun Statement.containsRaise(): Boolean = when (this) {
     is IfStatement -> thenBranch.containsRaise() || elseBranch?.containsRaise() == true
     is WhenStatement -> branches.any { it.body.containsRaise() }
     is WhileStatement -> body.containsRaise()
+    is ForStatement -> body.containsRaise() || update?.containsRaise() == true
+    is ForEachStatement -> body.containsRaise()
     // A `raise` in a `try` body belongs to that body's own function; the values it carries are
     // handed to this statement's extractor instead.
     is TryStatement -> extractorBody.statements.any { it.containsRaise() }
