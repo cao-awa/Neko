@@ -12,12 +12,12 @@ that using one does not drag in the other: the plugin depends on the compiler, n
 |-----------------|----------------|--------------------------------------------------------------|
 | `neko/`         | `:neko`        | The compiler: lexer, parser, AST, analyzer, bytecode emitter  |
 | `plugin/idea/`  | `:plugin:idea` | NekoJ, the IntelliJ IDEA plugin, built on `:neko`             |
-| `stdlib/`       | —              | The Neko standard library, written in Neko                    |
 | `samples/`      | —              | Example programs                                              |
 | `neko-compile/` | —              | Compiler output; not checked in                               |
 
-`stdlib/` and `samples/` are source, not modules: they are read by the build and compiled by Neko
-itself, so a new file there needs no build change.
+`samples/` is source, not a module: it is read by the build and compiled by Neko itself, so a
+new file there needs no build change. There is no `stdlib/`: the language borrows the JDK's
+iteration protocol rather than shipping one of its own.
 
 ## Building and running
 
@@ -32,22 +32,20 @@ Tasks are module-qualified now that there is more than one module.
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # Tests.
-./gradlew :neko:test                     # the compiler: 403 tests
-./gradlew :plugin:idea:test              # the plugin: 37 tests, in a real IDE instance
+./gradlew :neko:test                     # the compiler: 440 tests
+./gradlew :plugin:idea:test              # the plugin: 49 tests, in a real IDE instance
 ```
 
 Compiled classes are written to `neko-compile/classes`, relative to the project directory. The path
 and the directories that are compiled come from `gradle.properties`:
 
 ```properties
-neko.libraryDirectories=stdlib
 neko.sourceDirectories=samples/com/github/kusa233/neko/sample
 neko.outputDirectory=neko-compile/classes
 ```
 
 Every directory listed is searched recursively, so adding a source file means adding it to a
-directory. The standard library is listed separately from the programs because the two play
-different roles, though both are compiled in the same run.
+directory.
 
 `ExceptionSample` prints:
 
@@ -81,17 +79,24 @@ the constants, the values they can carry, and `values()`/`valueOf()` — and `Pu
 
 ## Standard library
 
-The standard library is written in Neko, in `stdlib/`, and is **not** embedded in the compiler: a
-program that uses it is compiled against it, and if it cannot be found the compiler reports that as an
-error rather than substituting a built-in.
+There is **no Neko standard library source tree**. Two things a program might expect from one are
+supplied elsewhere, and the distinction is deliberate:
 
-There is exactly one built-in that is not written in Neko: `println`, in one overload per built-in
-type — the seven numeric ones, `string`, `bool` and `Object`. It mirrors `System.out.println` and is
-modelled as an ordinary function so the analyzer and the emitter share one resolution path. `byte`,
-`short` and `char` have no `PrintStream` method of their own, so those three are declared with the
-Neko type and emitted as the `int` overload Java widens them to anyway.
+- the iteration protocol `for ... in` walks is the JDK's — `java.lang.Iterable` and
+  `java.util.Iterator` — so there is nothing to compile against;
+- the effect mechanism's one Java class, `EmitYieldException`, ships **with the compiler** rather than
+  with a program's sources.
 
-The effect mechanism is deliberately *not* in `stdlib/`. `yield` throws
+Nothing is embedded in the emitted class files either: a program that names a platform class must
+import its package, and the compiler says which one when it does not.
+
+There is exactly one built-in that is not Java's: `println`, in one overload per built-in type — the
+seven numeric ones, `string`, `bool` and `Object`. It mirrors `System.out.println` and is modelled as
+an ordinary function so the analyzer and the emitter share one resolution path. `byte`, `short` and
+`char` have no `PrintStream` method of their own, so those three are declared with the Neko type and
+emitted as the `int` overload Java widens them to anyway.
+
+The effect mechanism is deliberately *not* a library source either. `yield` throws
 `com.github.kusa233.neko.stdlib.emit.EmitYieldException`, which ships with the compiler as a Java class
 — it is the one thing a program cannot write for itself, because it has to be caught by the `try` that
 declared the handler. Everything else the mechanism needs is generated: a `try`'s `{ ... }` block
@@ -99,13 +104,21 @@ becomes a `static` method of the class holding the `try`, and `scratch` compiles
 `invokestatic` against it. So a program that uses `scratch`, `nyan` or `try` compiles with no library
 on the path at all.
 
-`stdlib/com/github/kusa233/neko/stdlib/collection/` holds `Iterator` and `Iterable`, the protocol
-`for ... in` walks. A program needs them only by *implementing* them; a `for` over an array does not
-mention them at all. `Iterator.next()` answers `Object` rather than a type parameter, because Neko
-erases generics without emitting the bridge methods a parameterised interface needs — `fun next(): int`
-would compile to `()I` while `Iterator<int>` declares `()Ljava/lang/Object;`, and the two would never
-meet. `for` inserts the cast and the unboxing instead, so the loop variable's declared type is still
-what the body reads.
+The iteration protocol `for ... in` walks is **the JDK's own**: `java.lang.Iterable` and
+`java.util.Iterator`. There is no Neko copy of either, and no library to compile alongside a program —
+a class becomes iterable by implementing the interface the JVM already has, which is what makes a Neko
+object usable as a Java `Iterable` and lets a Neko `for` walk a `java.util.List` handed over by the
+platform.
+
+`Iterable` needs no import because it is in `java.lang`; `Iterator` is in `java.util`, so a file that
+writes `fun iterator(): Iterator` says `import java.util`. That is the ordinary rule for a platform
+name, not a special case for the loop.
+
+`next()` returns `Object` because that is what the erased interface declares. Neko erases generics
+without emitting the bridge methods a parameterised interface needs — `fun next(): int` would compile
+to `()I` while `Iterator<T>` declares `()Ljava/lang/Object;`, and the two would never meet. So `Object`
+is not a workaround against the JDK, it *is* the erased signature; `for` inserts the cast and the
+unboxing, and the loop variable's declared type is still what the body reads.
 
 ## NekoJ — the IntelliJ IDEA plugin
 
@@ -209,6 +222,23 @@ Note what the language itself requires: **the import is compulsory**. `HashMap` 
 `import java.util` is an error, not a warning — the compiler cannot know a class from a package it was
 never told to look in, and resolving it silently would make the name's package invisible in the source.
 The IDE writes the clause; it does not stand in for one.
+
+### Unresolved names
+
+A name the compiler could not resolve is **painted**, not just underlined. A squiggle says "something
+on this line is wrong"; a red identifier says *which* name — and on a line holding five names, that is
+the difference between a hint and an answer.
+
+The colour comes from the platform's own `CodeInsightColors.WRONG_REFERENCES_ATTRIBUTES`, the key
+Java and Kotlin use for the same thing, so Neko needs no colour scheme of its own and inherits the
+reader's theme.
+
+What decides it is `Diagnostic.unresolved`, a flag the compiler sets in the check that failed to find
+the declaration. It is *not* implied by the severity, and that distinction is load-bearing: "class
+'X' implements 'Y' but does not provide 'f()'" is an error anchored on `X`, a name that resolved
+perfectly well — painting it would send the reader to fix the wrong thing. Marking the four shapes
+that really are unresolved (a bare name, a called name, a member name, a type name) keeps the paint
+honest.
 
 ### How highlighting works
 
@@ -686,11 +716,13 @@ Two things may be iterated:
 
 * **An array**, walked directly. It needs no interface because the JVM gives arrays none — the
   compiler emits the length read and the element loads inline.
-* **A class implementing `Iterable`** from the standard library. `Iterator.next()` answers `Object`
-  rather than a type parameter, because Neko erases generics without emitting the bridge methods a
-  parameterised interface would need — so the erased shape has to *be* the declared one. The loop
-  variable's own type still applies: the compiler inserts the cast (and the unboxing, for a
-  primitive), so `for (e: int in numbers)` reads an `int` without the program casting anything.
+* **A class implementing `java.lang.Iterable`** — the JDK's interface, not a Neko one. Its
+  `iterator()` must answer a `java.util.Iterator`, which is why such a file writes `import java.util`
+  and not `import java.lang`. `next()` answers `Object` rather than a type parameter, because Neko
+  erases generics without emitting the bridge methods a parameterised interface would need — so the
+  erased shape has to *be* the declared one. The loop variable's own type still applies: the compiler
+  inserts the cast (and the unboxing, for a primitive), so `for (e: int in numbers)` reads an `int`
+  without the program casting anything.
 
 Whichever form it is, the loop variable is **private to its loop** and **read-only**. Private, so two
 loops in one method may each declare `i` and neither is visible afterwards. Read-only, because the

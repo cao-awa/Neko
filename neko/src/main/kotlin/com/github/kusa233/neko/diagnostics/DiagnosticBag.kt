@@ -31,14 +31,18 @@ class DiagnosticBag {
      * [suggestedImport] is the machine-readable form of "write this `import`": the message says it in
      * words for a human, and the field says it in a form an editor can insert. It is filled in only
      * where exactly one clause is correct.
+     *
+     * [unresolved] marks a diagnostic whose span *is* the name that could not be found, so an editor
+     * can paint that token rather than only underline it.
      */
     fun error(
         message: String,
         span: Span? = null,
         notes: List<Diagnostic> = emptyList(),
         suggestedImport: String? = null,
+        unresolved: Boolean = false,
     ) {
-        report(Diagnostic(Severity.ERROR, message, span, notes, suggestedImport))
+        report(Diagnostic(Severity.ERROR, message, span, notes, suggestedImport, unresolved))
     }
 
     fun warning(message: String, span: Span? = null, notes: List<Diagnostic> = emptyList()) {

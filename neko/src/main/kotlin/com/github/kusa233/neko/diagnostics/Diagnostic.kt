@@ -34,6 +34,20 @@ class Diagnostic(
      * right answer to offer.
      */
     val suggestedImport: String? = null,
+    /**
+     * Whether the span covers a name the compiler could not resolve.
+     *
+     * This is what lets an editor paint the token itself rather than only underline it: a squiggle
+     * says "something is wrong here", while a red identifier says *which* name is wrong, which is
+     * what a reader needs when a line holds five names. The flag is set by whichever check failed to
+     * find a declaration, so it is a fact the compiler established rather than a guess made from the
+     * message text.
+     *
+     * It is deliberately not implied by [severity]: an error about a missing interface method is
+     * anchored on the class name, which *did* resolve, and painting that one red would point at the
+     * wrong thing.
+     */
+    val unresolved: Boolean = false,
 ) {
     /** Convenience factory for the secondary locations attached to a primary diagnostic. */
     fun note(message: String, span: Span?): Diagnostic = Diagnostic(Severity.NOTE, message, span)

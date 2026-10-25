@@ -94,33 +94,23 @@ object TestSupport {
     }
 
     /**
-     * Compiles [source] together with the Neko standard library.
+     * Compiles [source] the same way a program is compiled.
      *
-     * `raise` lowers to the library's `EarlyEmitException` and `EmitExtractorN`, which are themselves
-     * Neko sources under `stdlib`. A program that raises therefore has to be compiled with
-     * them, just as the build compiles the sample and the library in one run. The library is read
-     * from disk rather than inlined so these tests exercise the real files the build uses.
+     * There is no longer a Neko standard library to add: the iteration protocol is the JDK's own
+     * `java.lang.Iterable`/`java.util.Iterator`, and the effect machinery ships with the compiler as
+     * Java classes. This is kept as a named entry point so tests say *why* they compile the ordinary
+     * way, and so a future library can be threaded in here once rather than at sixteen call sites.
      */
     fun loadWithLibrary(source: String, name: String = "Test.neko"): LoadedProgram =
-        load(standardLibrarySources() + SourceFile.of(name, source))
+        load(source, name)
 
-    /** Every Neko source under `stdlib`, in a stable order. */
-    fun standardLibrarySources(): List<SourceFile> {
-        val root = projectDirectory.resolve("stdlib")
-        check(Files.isDirectory(root)) { "expected the standard library at $root" }
-        return Files.walk(root).use { stream ->
-            stream.filter { it.toString().endsWith(".neko") }
-                .sorted()
-                .map { path ->
-                    SourceFile(
-                        name = path.fileName.toString(),
-                        content = Files.readString(path),
-                        path = path,
-                    )
-                }
-                .toList()
-        }
-    }
+    /**
+     * Nothing to add, for the same reason as [loadWithLibrary].
+     *
+     * Returned as an empty list rather than deleted so every caller keeps compiling, and so the
+     * `stdlib/`-shaped assumption is visible in one place instead of being scattered.
+     */
+    fun standardLibrarySources(): List<SourceFile> = emptyList()
 
     /** A compiled program, loaded and ready to be invoked. */
     class LoadedProgram(

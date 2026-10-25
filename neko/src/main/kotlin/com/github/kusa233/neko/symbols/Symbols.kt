@@ -180,10 +180,20 @@ class ClassSymbol(
             superclassSymbol?.isSubtypeOf(other) == true ||
             interfaceSymbols.any { it.isSubtypeOf(other) }
 
-    /** `true` when this type, or one of its supertypes, is named [jvmInternalName]. */
+    /**
+     * `true` when this type, or one of its supertypes, is named [jvmInternalName].
+     *
+     * Both the declared interfaces and their symbols are walked, and that pair is not redundant: an
+     * interface the program declares has a symbol, so `interfaceSymbols` can follow its own
+     * supertypes; one it merely names — `java.util.Iterator` in `class Cursor: Iterator` — has no
+     * symbol at all, because the program does not compile the JDK. In that case the [interfaces]
+     * type is the only record of what was written, and skipping it would make implementing a JDK
+     * interface invisible to every subtype question.
+     */
     fun descendsFrom(jvmInternalName: String): Boolean =
         this.jvmInternalName == jvmInternalName ||
             superclass?.internalName == jvmInternalName ||
+            interfaces.any { it.internalName == jvmInternalName } ||
             superclassSymbol?.descendsFrom(jvmInternalName) == true ||
             interfaceSymbols.any { it.descendsFrom(jvmInternalName) }
 

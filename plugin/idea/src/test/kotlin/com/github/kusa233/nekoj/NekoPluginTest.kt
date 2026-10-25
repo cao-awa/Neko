@@ -768,6 +768,117 @@ class NekoPluginTest : BasePlatformTestCase() {
         assertContainsElements(completeAtCaret(), "ArrayList")
     }
 
+
+    // ------------------------------------------------------------------------ unresolved names
+
+    fun testAnUnknownNameIsPaintedNotMerelyUnderlined() {
+        // The distinction this test exists for: a squiggle says "something on this line is wrong",
+        // while a painted identifier says *which* name. `green` below is a plain local that resolves,
+        // and it must not be painted -- only `missingName` may be.
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main(args: string[]) {
+                        val green: int = 1
+                        println(green)
+                        println(missingName)
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        val painted = paintedSpans()
+
+        assertTrue(
+            "the unresolved name should be painted, but the painted spans were: $painted",
+            "missingName" in painted,
+        )
+        assertTrue(
+            "a name that resolves must not be painted, but the painted spans were: $painted",
+            "green" !in painted,
+        )
+    }
+
+    fun testAnUnknownMemberIsPainted() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main(args: string[]) {
+                        val s: string = "hi"
+                        println(s.missingMember)
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        val painted = paintedSpans()
+
+        // The exact span matters: the compiler anchors this on the member name alone, so the
+        // receiver `s` -- which resolved fine -- is left unpainted.
+        assertTrue(
+            "expected 'missingMember' to be painted, but the painted spans were: $painted",
+            "missingMember" in painted,
+        )
+        assertTrue(
+            "the receiver resolved, so it must not be painted: $painted",
+            "s" !in painted,
+        )
+    }
+
+    fun testAnUnknownTypeIsPainted() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun make(other: HashMap): int {
+                        return 1
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        assertTrue(
+            "an unresolvable type name should be painted too",
+            "HashMap" in paintedSpans(),
+        )
+    }
+
+    fun testAnErrorAboutSomethingElseIsNotPainted() {
+        // Not every error is an unresolved name. This one is about an interface method that was not
+        // written, and it is anchored on `Sample` -- a name that resolved perfectly well. Painting it
+        // would tell the reader the class name is wrong, which is the opposite of the truth.
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample: Runnable {
+            }
+            """.trimIndent(),
+        )
+
+        val painted = paintedSpans()
+
+        assertTrue(
+            "a resolved class name must not be painted: $painted",
+            "Sample" !in painted,
+        )
+    }
+
+    /** The text of every span the editor painted with a colour key, in document order. */
+    private fun paintedSpans(): List<String> {
+        val text = myFixture.editor.document.text
+        return myFixture.doHighlighting()
+            .filter { it.forcedTextAttributesKey != null }
+            .map { text.substring(it.startOffset, it.endOffset) }
+    }
+
     // ------------------------------------------------------------------------- automatic imports
 
     fun testCompletionOffersAClassThatNeedsAnImportOnceTheReaderStartsTypingIt() {

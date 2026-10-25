@@ -59,9 +59,6 @@ fun nekoPaths(property: String): List<String> =
 /** The directories holding the programs to compile. */
 val nekoSourceDirectories: List<String> = nekoPaths("neko.sourceDirectories")
 
-/** The directories holding the standard library every program is compiled against. */
-val nekoLibraryDirectories: List<String> = nekoPaths("neko.libraryDirectories")
-
 /**
  * Where the compiler writes the `.class` files, relative to the root project directory.
  *
@@ -88,9 +85,8 @@ fun existingDirectories(directories: List<String>): List<String> = directories
     .filter { it.isDirectory }
     .map { it.absolutePath }
 
-/** The programs and the library, each as the absolute paths of the directories that exist. */
+/** The programs, as the absolute paths of the directories that exist. */
 val nekoSourcePaths: List<String> = existingDirectories(nekoSourceDirectories)
-val nekoLibraryPaths: List<String> = existingDirectories(nekoLibraryDirectories)
 
 /** The name each runnable program is known by, paired with its fully-qualified class. */
 val nekoPrograms: Map<String, String> = mapOf(
@@ -105,23 +101,21 @@ val nekoPrograms: Map<String, String> = mapOf(
 )
 
 /**
- * Compiles every configured source and library directory into [nekoOutputPath].
+ * Compiles every configured source directory into [nekoOutputPath].
  *
- * The library is passed as well as the programs, because compilation is per *program*: a program's
- * classes are resolved against the ones compiled earlier in the same run, so a program that calls
- * into the library only compiles if the library is part of it.
+ * Compilation is per *program*: a class is resolved against the ones compiled earlier in the same
+ * run, so all the sources are handed to the compiler together rather than file by file.
  */
 tasks.register<JavaExec>("compileNeko") {
     group = "neko"
-    description = "Compiles ${nekoSourceDirectories.joinToString(", ")} and the library in " +
-        "${nekoLibraryDirectories.joinToString(", ")} into $nekoOutputDirectory"
+    description = "Compiles ${nekoSourceDirectories.joinToString(", ")} into $nekoOutputDirectory"
     dependsOn(tasks.named("classes"))
     mainClass.set("com.github.kusa233.neko.MainKt")
     classpath = sourceSets["main"].runtimeClasspath
     // The absolute output path is passed, and `workingDir` is pinned to the root as well, so a
     // relative `--output` would mean the same thing here as it does on the command line.
     workingDir = rootDirectory.asFile
-    args = nekoSourcePaths + nekoLibraryPaths + listOf("--output", nekoOutputPath.absolutePath)
+    args = nekoSourcePaths + listOf("--output", nekoOutputPath.absolutePath)
     // Gradle cannot see the `.neko` files through the task's command line, so it cannot tell whether
     // they changed; the task always runs rather than being skipped as up to date.
     outputs.upToDateWhen { false }
@@ -129,10 +123,6 @@ tasks.register<JavaExec>("compileNeko") {
         check(nekoSourcePaths.isNotEmpty()) {
             "none of the directories in neko.sourceDirectories exist: " +
                 nekoSourceDirectories.joinToString(", ")
-        }
-        check(nekoLibraryPaths.isNotEmpty()) {
-            "none of the directories in neko.libraryDirectories exist: " +
-                nekoLibraryDirectories.joinToString(", ")
         }
     }
 }

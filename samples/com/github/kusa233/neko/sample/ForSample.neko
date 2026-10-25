@@ -1,5 +1,7 @@
 locate com.github.kusa233.neko.sample
 
+import java.util
+
 /**
  * `for`, `for ... in`, and `++`/`--`.
  *
@@ -8,7 +10,10 @@ locate com.github.kusa233.neko.sample
  * only way it ends is a `return` or a `raise` inside it.
  *
  * `for (element: int in xs)` is the other spelling, and `in` is the one word that tells the two apart.
- * It walks an array directly, or a class implementing the standard library's `Iterable` — `Words` below.
+ * It walks an array directly, or a class implementing the JDK's `Iterable` — `Words` below.
+ *
+ * `import java.util` is here for `Iterator`, which lives in that package. `Iterable` needs no clause:
+ * it is in `java.lang`, which every file can name.
  *
  * `while` is not shown: it is Java's `while` already, and needs no new syntax.
  */
@@ -144,9 +149,10 @@ class ForSample {
 /**
  * Three fixed words, as an `Iterable`.
  *
- * `next()` answers `Object` because that is what the library's protocol declares: Neko erases its
- * generics without emitting the bridge methods a parameterised interface would need, so the erased
- * shape has to *be* the declared one. The `for` that walks this still declares `string`, and the
+ * `next()` answers `Object` because that is what `java.lang.Iterable`'s protocol declares: Neko erases
+ * its generics without emitting the bridge methods a parameterised interface would need, so the erased
+ * shape has to *be* the declared one. Writing `Object` is therefore not a workaround against the JDK,
+ * it is the erased signature itself. The `for` that walks this still declares `string`, and the
  * compiler inserts the cast — so the loop reads a `string` without the program casting anything.
  */
 class Words: Iterable {

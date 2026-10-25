@@ -4543,15 +4543,21 @@ class BytecodeGenerator(
         const val STAMPED_LOCK_CLASS = "java/util/concurrent/locks/StampedLock"
 
         /**
-         * The standard library's iteration protocol, by JVM internal name.
+         * The interface a `for ... in` walks, by JVM internal name.
          *
          * `for (e: T in xs)` over an `Iterable` compiles to `iterator()`, then `hasNext()`/`next()` on
-         * the answer — the same three calls Java's own for-each makes. A Neko interface rather than
-         * `java.lang.Iterable` so the calls are generated against a declaration the compiler can also
-         * check, and so a reader can see what the loop does.
+         * the answer — the same three calls Java's own for-each makes, because it is the same
+         * interface. Emitting against `java.lang.Iterable` rather than a Neko copy is what makes the
+         * protocol interoperable: a Neko class becomes something Java code can walk, and a Neko `for`
+         * can walk a `java.util.List` handed over by the platform.
+         *
+         * The declared descriptor is `()Ljava/util/Iterator;`, so a class implementing this must
+         * return exactly that — which is why `Iterator` is a separate constant below.
          */
-        const val ITERABLE_INTERFACE = "com/github/kusa233/neko/stdlib/collection/Iterable"
-        const val ITERATOR_INTERFACE = "com/github/kusa233/neko/stdlib/collection/Iterator"
+        const val ITERABLE_INTERFACE = "java/lang/Iterable"
+
+        /** What `iterator()` answers: `java.util.Iterator`, in a package Neko must import. */
+        const val ITERATOR_INTERFACE = "java/util/Iterator"
     }
 }
 

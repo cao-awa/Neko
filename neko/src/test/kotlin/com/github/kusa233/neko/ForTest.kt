@@ -407,10 +407,16 @@ class ForTest {
     // ---------------------------------------------------------------- for ... in over an Iterable
 
     /**
-     * A program implementing the standard library's two interfaces, written the way a program would:
+     * A program implementing the JDK's two iteration interfaces, written the way a program would:
      * `iterator()` answers a fresh cursor, so each loop sees the whole sequence.
+     *
+     * `Iterable` needs no import because it is in `java.lang`; `Iterator` is in `java.util`, so the
+     * file has to say so — which is the language's ordinary rule and not a special case for the loop.
+     * [`TestSupport.file`] supplies `locate`, so the clause is written here, above the classes.
      */
     private fun iterableProgram(vararg body: String): String = TestSupport.file(
+        "import java.util",
+        "",
         "class Cursor: Iterator {",
         "    val items: string[]",
         "    val upto: int",
@@ -500,6 +506,72 @@ class ForTest {
         assertTrue(
             messages.any { "no elements" in it },
             "iterating an int should be refused, but the errors were: $messages",
+        )
+    }
+
+    @Test
+    fun `a Neko iterable really is a java Iterable`() {
+        // The point of using the JDK's interfaces rather than a Neko copy: the class the compiler
+        // emits is something Java code can consume. This asserts the emitted type, so a regression
+        // that reintroduced a private protocol would fail here rather than only going unnoticed.
+        val program = TestSupport.loadWithLibrary(
+            iterableProgram("val words: Words = Words(ws, 3)"),
+        )
+        assertEquals(emptyList(), TestSupport.messages(program.result))
+
+        val words = program.typeOf("com.github.kusa233.test.Words")
+        val cursor = program.typeOf("com.github.kusa233.test.Cursor")
+
+        assertTrue(
+            words.interfaces.any { it.name == "java.lang.Iterable" },
+            "Words should implement java.lang.Iterable, but its interfaces are " +
+                words.interfaces.map { it.name },
+        )
+        assertTrue(
+            cursor.interfaces.any { it.name == "java.util.Iterator" },
+            "Cursor should implement java.util.Iterator, but its interfaces are " +
+                cursor.interfaces.map { it.name },
+        )
+    }
+
+    @Test
+    fun `java walks a Neko iterable`() {
+        // The other half of interoperability, and the reason `next()` returning `Object` is correct
+        // rather than a limitation: Java's own for-each drives the class through the JDK interface,
+        // with no Neko code involved on the reading side.
+        val program = TestSupport.loadWithLibrary(
+            iterableProgram("val words: Words = Words(ws, 3)"),
+        )
+        assertEquals(emptyList(), TestSupport.messages(program.result))
+
+        val wordsClass = program.typeOf("com.github.kusa233.test.Words")
+        val instance = wordsClass.getConstructor(Array<String>::class.java, Int::class.javaPrimitiveType)
+            .newInstance(arrayOf("a", "b", "c"), 3)
+
+        val seen = mutableListOf<Any?>()
+        for (element in instance as Iterable<*>) seen += element
+
+        assertEquals(listOf<Any?>("a", "b", "c"), seen)
+    }
+
+    @Test
+    fun `the iterator supertype needs no Neko library`() {
+        // `Iterable` is in `java.lang`, so it needs no import; `Iterator` is in `java.util`, so it
+        // does. Both are ordinary platform-name rules, which is the point: the loop is not a special
+        // case, it just names two classes the JDK already has.
+        //
+        // Written as whole declarations rather than through `messagesOf`, which wraps its lines in a
+        // function body where a `class` cannot appear.
+        val result = TestSupport.compile(TestSupport.file(
+            "class Cursor: Iterator {",
+            "    fun hasNext(): bool { return false }",
+            "    fun next(): Object { return \"x\" }",
+            "}",
+        ))
+        val messages = TestSupport.messages(result)
+        assertTrue(
+            messages.any { "is java.util.Iterator" in it && "import java.util" in it },
+            "Iterator without its import should be reported, but the errors were: $messages",
         )
     }
 

@@ -7,6 +7,7 @@ import com.intellij.lang.annotation.AnnotationHolder
 import com.intellij.lang.annotation.Annotator
 import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.editor.Editor
+import com.intellij.openapi.editor.colors.CodeInsightColors
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Key
 import com.intellij.openapi.util.TextRange
@@ -77,6 +78,18 @@ class NekoAnnotator : Annotator {
         // Notes carry the extra detail the compiler attached — a hint at the declaration, say — and
         // each becomes its own annotation when it has a location, so the reader can jump to it.
         val annotation = holder.newAnnotation(severity, diagnostic.message).range(range)
+
+        // A name the compiler could not resolve is painted, not merely underlined. The squiggle says
+        // "something here is wrong"; colouring the identifier says *which* name, which matters on a
+        // line holding several. `UNRESOLVED_REFERENCE` is the platform's own key for this, so Neko
+        // inherits whatever the reader's theme already uses for Java and Kotlin.
+        //
+        // The flag comes from the compiler rather than from the message text: only the check that
+        // failed to find a declaration knows whether the span is the missing name or a nearby
+        // declaration that resolved fine.
+        if (diagnostic.unresolved) {
+            annotation.textAttributes(CodeInsightColors.WRONG_REFERENCES_ATTRIBUTES)
+        }
 
         // A diagnostic that names the `import` to write becomes an Alt+Enter action. The clause comes
         // from the compiler rather than being re-derived here: only the analyzer knows which packages

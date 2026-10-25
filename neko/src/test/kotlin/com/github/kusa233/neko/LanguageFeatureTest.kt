@@ -520,27 +520,19 @@ class LanguageFeatureTest {
     // ------------------------------------------------------------------ the standard library
 
     @Test
-    fun `the standard library compiles on its own`() {
-        // It is ordinary Neko, so it has to satisfy every rule a program does — including the
-        // interface check that each abstract method is implemented.
+    fun `the standard library holds no sources any more`() {
+        // The Neko standard library used to be ordinary Neko source under `stdlib/`: `Iterable`,
+        // `Iterator` and then the `emit` extractors. Both have moved out of the language runtime:
+        // the iteration protocol is the JDK's own `java.lang.Iterable`/`java.util.Iterator`, and the
+        // effect machinery ships with the compiler as Java classes (`EmitYieldException`), because a
+        // `yield` has to throw something the JVM already knows how to catch.
         //
-        // The effect machinery is deliberately absent from this list. `EmitYieldException` ships with
-        // the compiler as a Java class, because `yield` has to throw something the JVM already knows
-        // how to catch; nothing in the Neko library is involved, which is why a program can use
-        // `scratch`/`nyan` with no library on the path at all.
-        val result = Compiler.compileProgram(TestSupport.standardLibrarySources())
-        assertTrue(
-            !result.hasErrors,
-            "the standard library must compile:\n" +
-                result.renderDiagnostics().joinToString("\n"),
-        )
-        assertTrue(
-            result.classes.containsKey("com/github/kusa233/neko/stdlib/collection/Iterator"),
-            "unexpected classes: ${result.classes.keys}",
-        )
-        assertTrue(
-            result.classes.keys.none { it.contains("/emit/") },
-            "the Neko library should no longer carry effect classes: ${result.classes.keys}",
+        // Asserted rather than merely observed so that a library reintroduced later has to update
+        // this test: the point of the assertion is that a program needs no library on its path.
+        assertEquals(
+            emptyList(),
+            TestSupport.standardLibrarySources(),
+            "a Neko program should need no library sources of its own",
         )
     }
 }

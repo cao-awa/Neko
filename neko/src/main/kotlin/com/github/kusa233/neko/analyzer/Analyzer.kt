@@ -2683,7 +2683,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         val target = statement.target
         val symbol = lookup(target.name)
         if (symbol == null) {
-            diagnostics.error("unresolved reference '${target.name}'", target.nameSpan)
+            diagnostics.error(
+                "unresolved reference '${target.name}'",
+                target.nameSpan,
+                unresolved = true,
+            )
             return
         }
         target.resolution = symbol
@@ -2778,9 +2782,23 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // fact available about it is that everything below it is named by a class the program
         // declares, which is what this arm answers for an explicitly `Throwable`-typed slot.
         if (supertype === ThrowableType) return sub === ThrowableType
-        val subSymbol = (sub as? ClassType)?.let { classes[it.simpleName] } ?: return false
-        val superSymbol = (supertype as? ClassType)?.let { classes[it.simpleName] } ?: return false
-        return subSymbol.isSubtypeOf(superSymbol)
+
+        val subClass = sub as? ClassType ?: return false
+        val superClass = supertype as? ClassType ?: return false
+        val subSymbol = classes[subClass.simpleName] ?: return false
+
+        // The supertype may be a platform class the program never declares — `java.util.Iterator` is
+        // what `class Cursor: Iterator` names, and there is no `ClassSymbol` for it because the
+        // program does not compile the JDK. Its internal name is all there is to compare against, so
+        // the declared-supertypes walk in `descendsFrom` answers instead of `isSubtypeOf`. Without
+        // this, implementing a JDK interface would satisfy the `for ... in` check and then fail the
+        // assignability check on the very `iterator()` method that makes it work.
+        val superSymbol = classes[superClass.simpleName]
+        return if (superSymbol != null) {
+            subSymbol.isSubtypeOf(superSymbol)
+        } else {
+            subSymbol.descendsFrom(superClass.internalName)
+        }
     }
 
     /**
@@ -3486,7 +3504,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             // the reader unsure whether the call or the name was the problem.
             val value = lookup(callee.name)
             if (value == null) {
-                diagnostics.error("there is no function named '${callee.name}'", callee.span)
+                diagnostics.error(
+                "there is no function named '${callee.name}'",
+                callee.span,
+                unresolved = true,
+            )
                 for (argument in expression.arguments) analyzeExpression(argument)
                 return ErrorType
             }
@@ -3616,6 +3638,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 diagnostics.error(
                     "$receiverName has no member named '${callee.memberName}'",
                     callee.memberSpan,
+                    unresolved = true,
                 )
             }
             return ErrorType
@@ -4067,6 +4090,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         diagnostics.error(
             "${present.displayName} has no member named '${expression.memberName}'",
             expression.memberSpan,
+            unresolved = true,
         )
         return ErrorType
     }
@@ -4168,6 +4192,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         diagnostics.error(
             "$className has no member named '${expression.memberName}'",
             expression.memberSpan,
+            unresolved = true,
         )
         return ErrorType
     }
@@ -4178,7 +4203,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private fun resolveName(expression: NameExpression): Symbol? {
         val symbol = lookup(expression.name)
         if (symbol == null) {
-            diagnostics.error("unresolved reference '${expression.name}'", expression.span)
+            diagnostics.error(
+                "unresolved reference '${expression.name}'",
+                expression.span,
+                unresolved = true,
+            )
             return null
         }
         if (!checkMemberReachable(symbol, expression.span)) return symbol
@@ -4653,6 +4682,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                     "types such as '[int] -> int'; and class types, whose names start with a capital " +
                     "letter",
                 span,
+                unresolved = true,
             )
             return ErrorType
         }
@@ -4672,6 +4702,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                     "import — write 'import $packageName' to reach it",
                 span,
                 suggestedImport = packageName,
+                unresolved = true,
             )
             return ErrorType
         }
@@ -4798,13 +4829,31 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         const val MAX_EMIT_VALUES = 9
 
         /**
-         * The standard library interface a `for ... in` walks, by JVM internal name.
+         * The interface a `for ... in` walks, by JVM internal name.
+         *
+         * `java.lang.Iterable` rather than a Neko interface of our own: the protocol the loop needs is
+         * exactly Java's, so implementing it is what lets a Neko class be handed to Java code that
+         * expects an `Iterable` — and what lets a Neko program walk a `java.util.List` it obtained from
+         * the platform. A private copy would satisfy the loop and nothing else.
+         *
+         * It needs no `import` because it is in `java.lang`, which every file can name. [ITERATOR] is
+         * not, so a program that writes the `iterator()` signature itself has to import `java.util`;
+         * the loop does not, since the compiler emits that call.
          *
          * An array needs nothing like it — the JVM has no array interface to implement, so the
          * compiler emits `length`/index reads inline for that case and this interface only ever
          * appears for a class that declares it.
          */
-        const val ITERABLE_INTERFACE = "com/github/kusa233/neko/stdlib/collection/Iterable"
+        const val ITERABLE_INTERFACE = "java/lang/Iterable"
+
+        /**
+         * The interface `iterator()` answers, by JVM internal name.
+         *
+         * Named separately because it is what the code generator emits the `hasNext`/`next` calls
+         * against, and because the two live in different packages: a source file that writes
+         * `fun iterator(): Iterator` needs `import java.util` for the latter but not the former.
+         */
+        const val ITERATOR_INTERFACE = "java/util/Iterator"
 
         /**
          * Simple name of the exception a `yield` throws, shipped with the compiler.
