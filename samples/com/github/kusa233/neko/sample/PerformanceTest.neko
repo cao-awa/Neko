@@ -1,0 +1,12 @@
+locate com.github.kusa233.neko.sample
+
+class PerformanceTest {
+    static {
+        fun main() {
+            start: long = System.currentTimeMillis()
+            for (i: int = 0; i < 1000000; i++) {
+
+            }
+        }
+    }
+}

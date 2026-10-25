@@ -7,6 +7,7 @@ import com.github.kusa233.neko.diagnostics.Diagnostic
 import com.github.kusa233.neko.diagnostics.DiagnosticBag
 import com.github.kusa233.neko.parser.Parser
 import com.github.kusa233.neko.source.SourceFile
+import com.github.kusa233.neko.source.StandardLibrary
 import com.github.kusa233.neko.symbols.ClassSymbol
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.roots.ProjectRootModificationTracker
@@ -93,12 +94,21 @@ class NekoProgramModel(
             EMPTY
         }
 
-        /** Parses and analyses [sources] exactly as the compiler does, minus code generation. */
+        /**
+         * Parses and analyses [sources] exactly as the compiler does, minus code generation.
+         *
+         * The standard library is prepended here just as [com.github.kusa233.neko.Compiler] prepends
+         * it. This class drives `Parser` and `Analyzer` directly — it does not go through the compiler,
+         * because it wants the symbols rather than class files — so the prepend has to be repeated.
+         * Skipping it would make the editor report every `scratch`, `nyan` and `yield` in the project
+         * as missing its exception, while `gradlew compileNeko` compiled the very same files cleanly.
+         */
         private fun analyse(sources: List<SourceFile>): NekoProgramModel {
+            val withLibrary = StandardLibrary.sources() + sources
             val diagnostics = DiagnosticBag()
-            val files = sources.map { Parser(it, diagnostics).parseFile() }
+            val files = withLibrary.map { Parser(it, diagnostics).parseFile() }
             if (diagnostics.hasErrors) {
-                return NekoProgramModel(sources, files, emptyMap(), diagnostics.diagnostics)
+                return NekoProgramModel(withLibrary, files, emptyMap(), diagnostics.diagnostics)
             }
 
             // The analyzer is what reports type errors AND what resolves the classes, fields and
@@ -109,7 +119,7 @@ class NekoProgramModel(
             } catch (error: RuntimeException) {
                 emptyMap()
             }
-            return NekoProgramModel(sources, files, classes, diagnostics.diagnostics)
+            return NekoProgramModel(withLibrary, files, classes, diagnostics.diagnostics)
         }
     }
 }

@@ -520,19 +520,50 @@ class LanguageFeatureTest {
     // ------------------------------------------------------------------ the standard library
 
     @Test
-    fun `the standard library holds no sources any more`() {
-        // The Neko standard library used to be ordinary Neko source under `stdlib/`: `Iterable`,
-        // `Iterator` and then the `emit` extractors. Both have moved out of the language runtime:
-        // the iteration protocol is the JDK's own `java.lang.Iterable`/`java.util.Iterator`, and the
-        // effect machinery ships with the compiler as Java classes (`EmitYieldException`), because a
-        // `yield` has to throw something the JVM already knows how to catch.
-        //
-        // Asserted rather than merely observed so that a library reintroduced later has to update
-        // this test: the point of the assertion is that a program needs no library on its path.
+    fun `the standard library ships with the compiler and is compiled first`() {
+        // The library used to be ordinary Neko source under `stdlib/` that a *caller* had to pass. It is
+        // still Neko, but the compiler now carries it: the sources are packaged into the compiler's own
+        // resources, and every compilation prepends them. Both halves are asserted here, because either
+        // one alone would leave a program that compiles in this repository and nowhere else.
+        val library = TestSupport.standardLibrarySources()
+        assertTrue(
+            library.isNotEmpty(),
+            "the compiler should carry the standard library's sources, but it carried none",
+        )
+
+        // `EmitYieldException` is what `scratch`, `nyan` and `yield` are built on, so a library without
+        // it is not a library for this language.
+        assertTrue(
+            library.any { "EmitYieldException" in it.content },
+            "the library should declare EmitYieldException, but it declared: " +
+                library.joinToString { it.name },
+        )
+
+        // The point of carrying it: a caller that passes nothing at all still compiles. `scratch` needs
+        // a function that declares an `emit` clause and a `try` whose handler matches it, so the
+        // smallest honest program has both — and it names the library nowhere.
+        val result = TestSupport.compile(
+            TestSupport.file(
+                "class Uses {",
+                "    static {",
+                "        fun caller(): int {",
+                "            v: int = try f() { a ->",
+                "                nyan a",
+                "            }",
+                "            return v",
+                "        }",
+                "",
+                "        fun f(): int {",
+                "            return scratch 1, 2",
+                "        } emit [int, int]",
+                "    }",
+                "}",
+            ),
+        )
         assertEquals(
             emptyList(),
-            TestSupport.standardLibrarySources(),
-            "a Neko program should need no library sources of its own",
+            TestSupport.errors(result).map { it.message },
+            "a program using 'scratch' should compile with no library passed by the caller",
         )
     }
 }

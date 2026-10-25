@@ -161,12 +161,13 @@ class BytecodeGenerator(
     /**
      * The JVM name of `EmitYieldException`, the checked exception a `yield` throws.
      *
-     * Unlike everything else in the standard library this one is *not* written in Neko: it is a plain
-     * Java class shipped with the compiler, because the value it carries is a single `Object` and a
-     * Neko class would only add a layer for nothing. So its name is the one fixed internal name in
-     * this file, taken from [EMIT_YIELD_EXCEPTION_CLASS] rather than from a declaration.
+     * Written in Neko like the rest of the standard library, so its package comes from the source that
+     * declares it — `standardLibraryClass` reads the symbol the analyzer resolved. A program compiled
+     * without that source therefore names a class that does not exist, which is the correct failure:
+     * the analyzer reports the missing declaration by name rather than this file inventing a location
+     * for it.
      */
-    private fun emitYieldExceptionClass(): String = EMIT_YIELD_EXCEPTION_CLASS
+    private fun emitYieldExceptionClass(): String = standardLibraryClass("EmitYieldException")
 
     private fun packagePrefix(): String = currentClass?.packagePrefix ?: ""
 
@@ -2932,6 +2933,21 @@ class BytecodeGenerator(
         val mv = scope.mv
         val field = expression.resolvedField
 
+        // A static field of a **JDK** class: `System.out`. There is no `FieldSymbol` for it — the
+        // program never compiled `java.lang.System` — so the analyzer recorded the owner and the
+        // descriptor is taken from the access's own type. That is enough for `getstatic`, which is
+        // the whole read.
+        val platformOwner = expression.resolvedPlatformFieldOwner
+        if (platformOwner != null) {
+            mv.visitFieldInsn(
+                if (expression.resolvedPlatformFieldIsStatic) GETSTATIC else GETFIELD,
+                platformOwner,
+                expression.memberName,
+                descriptorOf(expression.type),
+            )
+            return
+        }
+
         if (field == null) {
             // Analysis reported it; keep the operand stack consistent for the verifier.
             emitExpression(expression.receiver, scope)
@@ -3643,11 +3659,17 @@ class BytecodeGenerator(
                 }
             } else {
                 emitArguments(expression.arguments, instanceMethod.parameterTypes, scope)
+                // A JDK method's descriptor comes from reflection rather than from the symbol: the
+                // analyzer recorded the exact descriptor, and rebuilding it from Neko types could
+                // differ in a way the JVM would reject at run time (`Object` versus a parameter's real
+                // class, say). A Neko declaration has no such field and is described as before.
+                val descriptor = instanceMethod.builtin?.jvmDescriptor
+                    ?: descriptorOf(instanceMethod.parameterTypes, instanceMethod.returnType)
                 mv.visitMethodInsn(
                     INVOKESTATIC,
                     instanceMethod.jvmOwner,
                     instanceMethod.name,
-                    descriptorOf(instanceMethod.parameterTypes, instanceMethod.returnType),
+                    descriptor,
                     false,
                 )
             }
@@ -4498,28 +4520,21 @@ class BytecodeGenerator(
         const val INTERFACE_PREFIX = "Neko\$Function\$"
 
         /**
-         * Internal name of `EmitYieldException`, the checked exception a `yield` throws.
+         * The field of the `yield` carrier holding the value the `yield` carried.
          *
-         * Unlike everything else the effect machinery touches, this one is shipped with the compiler
-         * as a plain Java class rather than compiled from Neko, so its name is fixed here instead of
-         * being looked up in the program. It extends `Exception` rather than `RuntimeException` on
-         * purpose: a `yield` is an ordinary control transfer the compiler itself generates and
-         * catches, and a checked exception keeps it from being quietly swallowed by a `catch` written
-         * for a genuine failure.
+         * Only the *field* is fixed here. The class it belongs to is looked up in the program like any
+         * other standard library class — see [emitYieldExceptionClass] — because the library is Neko
+         * source compiled into the program, not a class the compiler ships pre-built.
          */
-        const val EMIT_YIELD_EXCEPTION_CLASS =
-            "com/github/kusa233/neko/stdlib/emit/EmitYieldException"
-
-        /** The field of [EMIT_YIELD_EXCEPTION_CLASS] holding the value the `yield` carried. */
         const val EMIT_YIELD_PAYLOAD_FIELD = "data"
 
         /**
          * The JDK error a failed `nya` throws, as an internal name.
          *
-         * It belongs to the platform rather than to the Neko standard library, so unlike
-         * [EMIT_YIELD_EXCEPTION_CLASS] it needs no lookup: `java.lang` is on every JVM that could
-         * load the class this code goes into. Using the same error Java's own `assert` throws is
-         * what makes a Neko check and a Java one fail in the way a reader already expects.
+         * It belongs to the platform rather than to the Neko standard library, so unlike the `yield`
+         * carrier it needs no lookup: `java.lang` is on every JVM that could load the class this code
+         * goes into. Using the same error Java's own `assert` throws is what makes a Neko check and a
+         * Java one fail in the way a reader already expects.
          */
         const val ASSERTION_ERROR_CLASS = "java/lang/AssertionError"
 

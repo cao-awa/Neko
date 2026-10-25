@@ -216,7 +216,7 @@ class SampleEndToEndTest {
         // `emitTest` declares an `emit` clause and throws `EmitYieldException` to leave by it, so the
         // attribute has to say so for a caller to know it may need catching.
         assertEquals<List<String>>(
-            listOf("com/github/kusa233/neko/stdlib/emit/EmitYieldException"),
+            listOf(TestSupport.emitYieldExceptionClass()),
             methods["emitTest:thrown"].orEmpty(),
             "a function whose 'emit' clause is left by throwing must record the exception",
         )
@@ -550,7 +550,7 @@ class SampleEndToEndTest {
             org.objectweb.asm.ClassReader.SKIP_CODE,
         )
         assertEquals(
-            listOf("com/github/kusa233/neko/stdlib/emit/EmitYieldException"),
+            listOf(TestSupport.emitYieldExceptionClass()),
             exceptions,
             "an 'emit' clause belongs in the class file's Exceptions attribute",
         )

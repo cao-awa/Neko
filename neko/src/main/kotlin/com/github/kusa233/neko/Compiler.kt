@@ -10,6 +10,7 @@ import com.github.kusa233.neko.diagnostics.DiagnosticRenderer
 import com.github.kusa233.neko.diagnostics.Severity
 import com.github.kusa233.neko.parser.Parser
 import com.github.kusa233.neko.source.SourceFile
+import com.github.kusa233.neko.source.StandardLibrary
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.createDirectories
@@ -89,19 +90,28 @@ object Compiler {
     /**
      * Compiles several files that name each other.
      *
+     * **The standard library is compiled first, always.** It is written in Neko and a program that
+     * uses `scratch`, `nyan` or `yield` needs its declarations in the same program, so the library's
+     * sources are prepended here rather than being something a caller has to remember to pass. A
+     * caller that *does* pass them is not punished for it: [mergeLibrary] drops a library file whose
+     * text a caller already supplied, so the declarations appear once and the duplicate-class error
+     * that would otherwise follow never happens.
+     *
      * Every file is parsed first, and analysis only starts when all of them parsed, so a syntax error
      * in the standard library is reported before a program's own type errors — which is the order a
      * reader needs, because until the library parses nothing it declares can be resolved.
      */
     fun compileProgram(sources: List<SourceFile>, outputDirectory: Path? = null): CompilationResult {
-        if (sources.isEmpty()) {
+        val allSources = mergeLibrary(StandardLibrary.sources(), sources)
+
+        if (allSources.isEmpty()) {
             val diagnostics = DiagnosticBag()
             diagnostics.error("there are no .neko files to compile", null)
             return CompilationResult(emptyList(), diagnostics.diagnostics, emptyMap(), null)
         }
 
         val diagnostics = DiagnosticBag()
-        val files = sources.map { Parser(it, diagnostics).parseFile() }
+        val files = allSources.map { Parser(it, diagnostics).parseFile() }
 
         if (diagnostics.hasErrors) {
             // Parsing already failed; analysing a partial tree would only add noise.
@@ -136,6 +146,34 @@ object Compiler {
         content = Files.readString(path),
         path = path,
     )
+
+    /**
+     * Puts the standard library in front of [sources], dropping any library file the caller repeated.
+     *
+     * A caller wrote those files out for its own reasons — the build compiles `samples/` and a test
+     * hands over a program — and neither is expected to know the compiler already carries the library.
+     * Without this, passing `stdlib/` explicitly and letting the compiler add it would declare every
+     * library class twice and fail with "'EmitYieldException' is already declared", which would blame
+     * the caller for doing exactly what used to be required.
+     *
+     * A file counts as the same one when its *content and simple name* match a library entry, not when
+     * its path does: the copy inside the jar has no path at all, and a copy on disk has a different
+     * one, yet they must be recognised as one file. Content is the honest test, because two files with
+     * the same name and different text really are a program overriding the library — and that is
+     * allowed to proceed.
+     */
+    private fun mergeLibrary(library: List<SourceFile>, sources: List<SourceFile>): List<SourceFile> {
+        if (library.isEmpty()) return sources
+
+        val repeated = sources.filterTo(HashSet()) { source ->
+            library.any { it.name == source.name && it.content == source.content }
+        }
+        if (repeated.isEmpty()) return library + sources
+
+        return library + sources.filterNot { source ->
+            library.any { it.name == source.name && it.content == source.content }
+        }
+    }
 
     /** Writes each class file, creating the package directories as needed. */
     private fun writeClasses(outputDirectory: Path, classes: Map<String, ByteArray>): Path {

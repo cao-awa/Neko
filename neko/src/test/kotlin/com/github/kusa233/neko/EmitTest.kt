@@ -776,7 +776,7 @@ class EmitTest {
         assertTrue(!result.hasErrors, "the program must compile first: ${TestSupport.messages(result)}")
 
         assertEquals(
-            listOf("com/github/kusa233/neko/stdlib/emit/EmitYieldException"),
+            listOf(TestSupport.emitYieldExceptionClass()),
             thrownTypesOf(
                 result.classes.getValue("com/github/kusa233/neko/sample/Emitter"),
                 "inner",

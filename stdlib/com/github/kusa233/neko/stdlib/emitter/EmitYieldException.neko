@@ -1,0 +1,32 @@
+locate com.github.kusa233.neko.stdlib.emitter
+
+/**
+ * The carrier a `yield` throws.
+ *
+ * It is checked rather than unchecked on purpose: a `yield` is only legal inside a handler that a
+ * `try` declared, and every method between them therefore has to say it may pass one on. That is what
+ * makes the effect visible in the class file rather than a surprise at run time.
+ *
+ * One field is enough: the `try` that declared the handler is the only thing that ever catches this,
+ * and it reads `data` to fill the value the `try` expression produces. The handler's other exits answer
+ * by returning, so nothing else has to travel back.
+ *
+ * `data` is `public`, and that is load-bearing rather than incidental. The code that reads it is the
+ * `try`'s generated handler, which is a `static` method of the class the `try` was written in — a
+ * different class from this one, and not a subclass. `private` would emit `ACC_PRIVATE`, and the
+ * `GETFIELD` in that handler would fail with `IllegalAccessError` the first time a `yield` actually
+ * fired — compiling cleanly and breaking only at run time, which is the worst way for this to go
+ * wrong. `public val` also keeps `final`, so the field cannot be reassigned once the value is in.
+ *
+ * The `()` after `Exception` is what makes it a *superclass* rather than an interface: Neko reads
+ * `: Name(...)` as "extends" and a bare `: Name` as "implements", because only a class has a
+ * constructor to call. Without it this compiles to `implements java.lang.Exception`, which the JVM
+ * rejects with `IncompatibleClassChangeError` when the class is loaded.
+ */
+class EmitYieldException: Exception() {
+    public val data: Object
+
+    constructor(data: Object) {
+        this.data = data
+    }
+}

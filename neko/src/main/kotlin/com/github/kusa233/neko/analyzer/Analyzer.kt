@@ -1270,43 +1270,32 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     }
 
     /**
-     * Reports a use of `scratch` or `yield` in a program that cannot see `EmitYieldException`.
+     * Reports a use of `scratch` or `nyan` in a program that does not declare `EmitYieldException`.
      *
-     * Nothing here is lowered to a standard library *Neko* class any more: `scratch` is a call to a
-     * method the compiler generates, and the exception a `yield` throws ships with the compiler as a
-     * Java class rather than being compiled from `stdlib/`. So there is nothing for the program to
-     * include, and this check only catches the one case that can still go wrong — the compiler's own
-     * class missing from its runtime, which is a broken installation rather than a mistake in the
-     * program. It is reported at the first use so the reader sees it in context.
+     * The class is no longer shipped as a Java class with the compiler: it is the one file in `stdlib/`
+     * that the language genuinely needs, and the compiler compiles it ahead of every program. So the
+     * check is now an ordinary one — is the declaration in the program? — asked of the program's own
+     * symbols rather than of the running JVM's classpath.
+     *
+     * The consequence is the useful one: a program that loses the library (a build pointed at sources
+     * it cannot see, an installation whose resources are missing) is told which class is missing and
+     * by name, at the first `scratch` or `nyan` — rather than a `ClassNotFoundException` at run time,
+     * from a class file that named something nothing would ever emit. `yield` needs no such check:
+     * the class is also what `yield` *throws*, so a file that reaches it has already had to name it.
      */
     private fun checkStandardLibrary(span: Span) {
         if (standardLibraryChecked) return
         standardLibraryChecked = true
 
-        if (emitYieldExceptionAvailable()) return
+        if (classes.containsKey(EMIT_YIELD_EXCEPTION_SIMPLE_NAME)) return
 
         diagnostics.error(
-            "'scratch', 'nyan' and 'yield' need ${EMIT_YIELD_EXCEPTION_SIMPLE_NAME}, which ships " +
-                "with the compiler but is missing from this installation — check that the compiler's " +
-                "own classes are on the classpath",
+            "'scratch' and 'nyan' need ${EMIT_YIELD_EXCEPTION_SIMPLE_NAME}, which the compiler " +
+                "compiles from its own standard library ahead of every program — this installation's " +
+                "copy is missing or declares it under another name",
             span,
         )
     }
-
-    /**
-     * Whether [EMIT_YIELD_EXCEPTION_SIMPLE_NAME] can be loaded.
-     *
-     * Asked of the running JVM rather than of the program's declarations, because the class is part of
-     * the compiler: a program never declares it, so `classes[...]` would always answer "missing".
-     */
-    private fun emitYieldExceptionAvailable(): Boolean =
-        runCatching {
-            Class.forName(
-                EMIT_YIELD_EXCEPTION_BINARY_NAME,
-                false,
-                Analyzer::class.java.classLoader,
-            )
-        }.isSuccess
 
     /**
      * `nya condition`, `nya condition { ... }`, `nya condition { ... } else { ... }` — checks the
@@ -3565,6 +3554,20 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             return resolveMemberCall(expression, callee, namedClass, className, viaClass = true)
         }
 
+        // A JDK class named as the receiver — `System.currentTimeMillis()`, `Math.abs(x)`. The program
+        // does not declare it, so there is no symbol to check members against; the reflected class
+        // answers instead. Without this branch these calls were refused as an unresolved *name*, which
+        // is the one thing they are not: `System` is a class, and the reader meant it.
+        val platformType = className
+            ?.takeIf { it.first().isUpperCase() && isPlatformClass(it) }
+            ?.let { ClassType("java/lang/$it", it) }
+        if (platformType != null) {
+            if (callee.isSafeCall) reportSafeCallOnClassName(callee.memberSpan, className!!)
+            callee.receiverIsClass = true
+            callee.receiver.resolvedType = platformType
+            return platformStaticCall(expression, callee, platformType)
+        }
+
         val receiverType = analyzeExpression(callee.receiver)
 
         if (receiverType.isError) {
@@ -4028,6 +4031,13 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private fun analyzeMemberAccess(expression: MemberAccessExpression): NekoType {
         // `Sample.field1` names a class rather than a value, so it is matched before the receiver is
         // analysed: there is no value there to have a type.
+        //
+        // A *platform* class is matched here too, and that is not a detail. `classes` holds only what
+        // the program declares, so `System.currentTimeMillis()` used to fall through to the value path
+        // below, where `System` is a name no scope declares — and the reader was told the name does not
+        // exist, although `System` is exactly the class they meant. Since there is no static-import
+        // syntax and no qualified type syntax, falling through left no way at all to reach a JDK
+        // static member. Resolving the name as a class first is what makes the ordinary spelling work.
         val className = (expression.receiver as? NameExpression)?.name
         val namedClass = className?.let { classes[it] }
         if (namedClass != null) {
@@ -4035,6 +4045,20 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             expression.receiverIsClass = true
             expression.receiver.resolvedType = ClassType(namedClass.jvmInternalName, namedClass.name)
             return staticMemberOf(namedClass, expression, namedClass.name)
+        }
+
+        // A name the program does not declare, but the JVM does: `System`, `Math`, `Integer`. It has no
+        // symbol — the program never compiled the JDK — so its members cannot be checked one by one.
+        // The call form is handled by `analyzeMemberCall`; reaching here means the member was read
+        // rather than called, and the only thing that could be read this way is a static field.
+        val platformType = className
+            ?.takeIf { it.first().isUpperCase() && isPlatformClass(it) }
+            ?.let { ClassType("java/lang/$it", it) }
+        if (platformType != null) {
+            if (expression.isSafeCall) reportSafeCallOnClassName(expression.memberSpan, className!!)
+            expression.receiverIsClass = true
+            expression.receiver.resolvedType = platformType
+            return platformStaticFieldOf(platformType, expression)
         }
 
         val receiverType = analyzeExpression(expression.receiver)
@@ -4150,6 +4174,173 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             "$className is a class name, which is never null",
             "$className.…",
         )
+    }
+
+    /**
+     * `Cls.member` / `Cls.member(...)` where `Cls` is a JDK class the program does not declare.
+     *
+     * There is no symbol for such a class — the program never compiled the JDK — so the members cannot
+     * be checked against a declaration. The platform answers instead, through reflection, exactly as
+     * [isPlatformClass] already asks it whether the class name exists at all.
+     *
+     * The result is modelled as a [BuiltinFunction] rather than an ordinary [FunctionSymbol], because
+     * that is the hook the code generator already has for "a method the language supplies, dispatched
+     * to a fixed owner and descriptor". Nothing here is lowered differently from `println`: the emitter
+     * sees an `invokestatic` against `java/lang/System` and does not need to know it came from the JDK.
+     *
+     * An overload is chosen by arity and by whether each argument's type is assignable to the reflected
+     * parameter. Neko has no implicit numeric widening in arguments, so a mismatch is reported rather
+     * than guessed at — a wrong guess here would emit a descriptor the JVM rejects at run time.
+     */
+    private fun platformStaticCall(
+        expression: CallExpression,
+        callee: MemberAccessExpression,
+        owner: ClassType,
+    ): NekoType {
+        val arguments = expression.arguments.map { analyzeExpression(it) }
+        if (arguments.any { it.isError }) return ErrorType
+
+        // A static method only: an instance method needs an object, and this receiver is a class.
+        val candidates = runCatching {
+            Class.forName(owner.internalName.replace('/', '.'), false, javaClass.classLoader)
+                .methods
+                .filter { java.lang.reflect.Modifier.isStatic(it.modifiers) && it.name == callee.memberName }
+        }.getOrNull().orEmpty()
+
+        if (candidates.isEmpty()) {
+            diagnostics.error(
+                "${owner.simpleName} has no static member named '${callee.memberName}'",
+                callee.memberSpan,
+                unresolved = true,
+            )
+            return ErrorType
+        }
+
+        val chosen = candidates.firstOrNull { method ->
+            method.parameterCount == arguments.size && method.parameterTypes.withIndex().all { (index, parameter) ->
+                argumentFits(arguments[index], parameter)
+            }
+        }
+        if (chosen == null) {
+            val wanted = arguments.joinToString(", ") { it.displayName }
+            diagnostics.error(
+                "${owner.simpleName}.${callee.memberName} has no overload taking ($wanted); it " +
+                    "declares ${candidates.joinToString(", ") { "(${it.parameterTypes.joinToString(", ") { p -> p.simpleName }})" }}",
+                callee.memberSpan,
+            )
+            return ErrorType
+        }
+
+        val returnType = typeOfReflected(chosen.returnType)
+        callee.resolvedFunction = platformFunction(callee, owner, chosen, arguments, returnType)
+        expression.instanceMethod = callee.resolvedFunction
+        return returnType
+    }
+
+    /** Wraps a reflected [method] as the symbol the emitter dispatches on. */
+    private fun platformFunction(
+        callee: MemberAccessExpression,
+        owner: ClassType,
+        method: java.lang.reflect.Method,
+        arguments: List<NekoType>,
+        returnType: NekoType,
+    ): FunctionSymbol = FunctionSymbol(
+        name = callee.memberName,
+        span = callee.memberSpan,
+        parameterTypes = arguments,
+        returnType = returnType,
+        enclosingClass = null,
+        declaration = null,
+        builtin = BuiltinFunction(
+            jvmOwner = owner.internalName,
+            jvmName = method.name,
+            jvmDescriptor = descriptorOfReflected(method),
+            receiverIsSystemOut = false,
+        ),
+    )
+
+    /** Whether a value of Neko type [argument] may be passed where the JVM declares [parameter]. */
+    private fun argumentFits(argument: NekoType, parameter: Class<*>): Boolean {
+        val primitive = parameterPrimitive(parameter)
+        if (primitive != null) return argument == primitive
+        // A reference parameter accepts anything Neko can box into it. The emitter inserts the
+        // conversion, so the exact class is not this check's business; only nullability is.
+        return argument !is VoidType
+    }
+
+    /** The Neko type a reflected [type] corresponds to. */
+    private fun typeOfReflected(type: Class<*>): NekoType {
+        val primitive = parameterPrimitive(type)
+        if (primitive != null) return primitive
+        if (type == java.lang.Void.TYPE) return VoidType
+        return ClassType(type.name.replace('.', '/'), type.simpleName)
+    }
+
+    /** The Neko primitive matching a JVM primitive class, or `null` when [type] is a reference. */
+    private fun parameterPrimitive(type: Class<*>): NekoType? = when (type) {
+        java.lang.Integer.TYPE -> IntType
+        java.lang.Long.TYPE -> LongType
+        java.lang.Short.TYPE -> ShortType
+        java.lang.Byte.TYPE -> ByteType
+        java.lang.Character.TYPE -> CharType
+        java.lang.Float.TYPE -> FloatType
+        java.lang.Double.TYPE -> DoubleType
+        java.lang.Boolean.TYPE -> BoolType
+        else -> null
+    }
+
+    /** The JVM descriptor of [method], which is what the emitter passes to `visitMethodInsn`. */
+    private fun descriptorOfReflected(method: java.lang.reflect.Method): String = buildString {
+        append('(')
+        for (parameter in method.parameterTypes) append(descriptorOfReflected(parameter))
+        append(')')
+        append(descriptorOfReflected(method.returnType))
+    }
+
+    private fun descriptorOfReflected(type: Class<*>): String = when (type) {
+        java.lang.Integer.TYPE -> "I"
+        java.lang.Long.TYPE -> "J"
+        java.lang.Short.TYPE -> "S"
+        java.lang.Byte.TYPE -> "B"
+        java.lang.Character.TYPE -> "C"
+        java.lang.Float.TYPE -> "F"
+        java.lang.Double.TYPE -> "D"
+        java.lang.Boolean.TYPE -> "Z"
+        java.lang.Void.TYPE -> "V"
+        else -> "L" + type.name.replace('.', '/') + ";"
+    }
+
+    /**
+     * `Cls.field` where `Cls` is a JDK class — a static field read through a class name.
+     *
+     * `System.out` is the one every Neko program meets, because `println` is modelled on it. The field
+     * is looked up reflectively and its type taken from the JVM, so a program can read any JDK static
+     * field without the compiler carrying a table.
+     */
+    private fun platformStaticFieldOf(owner: ClassType, expression: MemberAccessExpression): NekoType {
+        val field = runCatching {
+            Class.forName(owner.internalName.replace('/', '.'), false, javaClass.classLoader)
+                .fields
+                .firstOrNull {
+                    java.lang.reflect.Modifier.isStatic(it.modifiers) && it.name == expression.memberName
+                }
+        }.getOrNull()
+
+        if (field == null) {
+            diagnostics.error(
+                "${owner.simpleName} has no static member named '${expression.memberName}'",
+                expression.memberSpan,
+                unresolved = true,
+            )
+            return ErrorType
+        }
+
+        // A field read is emitted from the field's owner and name, which the AST records here. Only a
+        // program-declared field has a symbol, so the JDK case is carried by the receiver's type plus
+        // the member name — see `emitStaticFieldRead`.
+        expression.resolvedPlatformFieldOwner = owner.internalName
+        expression.resolvedPlatformFieldIsStatic = true
+        return typeOfReflected(field.type)
     }
 
     /**
@@ -4856,16 +5047,12 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         const val ITERATOR_INTERFACE = "java/util/Iterator"
 
         /**
-         * Simple name of the exception a `yield` throws, shipped with the compiler.
+         * Simple name of the exception a `yield` throws, declared in the compiler's own standard library.
          *
-         * Not a standard library *Neko* declaration — nothing in `stdlib/` provides it — so it is
-         * never looked up among the program's classes; see [emitYieldExceptionAvailable].
+         * Looked up among the program's classes, because the compiler compiles the library into every
+         * program; see [checkStandardLibrary]. Its package is the library's, so no constant names it.
          */
         const val EMIT_YIELD_EXCEPTION_SIMPLE_NAME = "EmitYieldException"
-
-        /** Binary name of the same class, for asking the JVM whether it is there. */
-        const val EMIT_YIELD_EXCEPTION_BINARY_NAME =
-            "com.github.kusa233.neko.stdlib.emit.EmitYieldException"
 
         /**
          * The methods `java.lang.Enum` declares `final`, which an enum therefore cannot override.

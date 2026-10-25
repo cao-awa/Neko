@@ -12,12 +12,14 @@ that using one does not drag in the other: the plugin depends on the compiler, n
 |-----------------|----------------|--------------------------------------------------------------|
 | `neko/`         | `:neko`        | The compiler: lexer, parser, AST, analyzer, bytecode emitter  |
 | `plugin/idea/`  | `:plugin:idea` | NekoJ, the IntelliJ IDEA plugin, built on `:neko`             |
+| `stdlib/`       | —              | The Neko standard library, compiled by the compiler itself     |
 | `samples/`      | —              | Example programs                                              |
 | `neko-compile/` | —              | Compiler output; not checked in                               |
 
-`samples/` is source, not a module: it is read by the build and compiled by Neko itself, so a
-new file there needs no build change. There is no `stdlib/`: the language borrows the JDK's
-iteration protocol rather than shipping one of its own.
+`stdlib/` and `samples/` are source, not modules: both are compiled by Neko itself, so a new file
+there needs no build change. `stdlib/` is *not* a source directory the build passes to the compiler —
+the compiler prepends it to every compile from the copy packaged into its own jar. Listing it twice
+would declare every library class twice.
 
 ## Building and running
 
@@ -32,8 +34,8 @@ Tasks are module-qualified now that there is more than one module.
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # Tests.
-./gradlew :neko:test                     # the compiler: 440 tests
-./gradlew :plugin:idea:test              # the plugin: 49 tests, in a real IDE instance
+./gradlew :neko:test                     # the compiler: 444 tests
+./gradlew :plugin:idea:test              # the plugin: 51 tests, in a real IDE instance
 ```
 
 Compiled classes are written to `neko-compile/classes`, relative to the project directory. The path
@@ -79,36 +81,39 @@ the constants, the values they can carry, and `values()`/`valueOf()` — and `Pu
 
 ## Standard library
 
-There is **no Neko standard library source tree**. Two things a program might expect from one are
-supplied elsewhere, and the distinction is deliberate:
+The library is written in Neko, in `stdlib/`, and **the compiler carries it**: every compilation
+prepends it to whatever program it was asked to build. A program therefore never names it, and a
+caller never passes it — `gradlew compileNeko`, the command line, the IDE and the tests all get it by
+doing nothing.
 
-- the iteration protocol `for ... in` walks is the JDK's — `java.lang.Iterable` and
-  `java.util.Iterator` — so there is nothing to compile against;
-- the effect mechanism's one Java class, `EmitYieldException`, ships **with the compiler** rather than
-  with a program's sources.
+Its sources are packaged into the compiler's own jar as resources rather than read from `stdlib/` at
+run time. That is what makes a built jar usable from another machine, from the plugin (which receives
+the compiler as a jar on its classpath) and from a test run anywhere — none of which can be assumed to
+sit next to this repository. `StandardLibrary` reads them back by a path that resolves the same way
+whether they came from a jar or from a directory of class files.
 
-Nothing is embedded in the emitted class files either: a program that names a platform class must
-import its package, and the compiler says which one when it does not.
+The library holds only what the language cannot borrow from the JVM:
 
-There is exactly one built-in that is not Java's: `println`, in one overload per built-in type — the
-seven numeric ones, `string`, `bool` and `Object`. It mirrors `System.out.println` and is modelled as
-an ordinary function so the analyzer and the emitter share one resolution path. `byte`, `short` and
+* `EmitYieldException` — the carrier a `yield` throws. It is checked rather than unchecked on purpose:
+  a `yield` is only legal inside a handler a `try` declared, so every method between them has to say
+  it may pass one on. That is what makes the effect visible in the class file instead of a surprise at
+  run time. Its one field is `public` — the code that reads it is the `try`'s generated handler, in a
+  *different* class, so `private` would compile cleanly and fail with `IllegalAccessError` the first
+  time a `yield` fired.
+
+Everything else the effect mechanism needs is generated: a `try`'s `{ ... }` block becomes a `static`
+method of the class holding the `try`, and `scratch` compiles to an ordinary `invokestatic` against it.
+
+There is exactly one built-in that is not Neko source: `println`, in one overload per built-in type —
+the seven numeric ones, `string`, `bool` and `Object`. It mirrors `System.out.println` and is modelled
+as an ordinary function so the analyzer and the emitter share one resolution path. `byte`, `short` and
 `char` have no `PrintStream` method of their own, so those three are declared with the Neko type and
 emitted as the `int` overload Java widens them to anyway.
 
-The effect mechanism is deliberately *not* a library source either. `yield` throws
-`com.github.kusa233.neko.stdlib.emit.EmitYieldException`, which ships with the compiler as a Java class
-— it is the one thing a program cannot write for itself, because it has to be caught by the `try` that
-declared the handler. Everything else the mechanism needs is generated: a `try`'s `{ ... }` block
-becomes a `static` method of the class holding the `try`, and `scratch` compiles to an ordinary
-`invokestatic` against it. So a program that uses `scratch`, `nyan` or `try` compiles with no library
-on the path at all.
-
-The iteration protocol `for ... in` walks is **the JDK's own**: `java.lang.Iterable` and
-`java.util.Iterator`. There is no Neko copy of either, and no library to compile alongside a program —
-a class becomes iterable by implementing the interface the JVM already has, which is what makes a Neko
-object usable as a Java `Iterable` and lets a Neko `for` walk a `java.util.List` handed over by the
-platform.
+The iteration protocol `for ... in` walks is **the JDK's own**, not the library's: `java.lang.Iterable`
+and `java.util.Iterator`. A class becomes iterable by implementing the interface the JVM already has,
+which is what makes a Neko object usable as a Java `Iterable` and lets a Neko `for` walk a
+`java.util.List` handed over by the platform.
 
 `Iterable` needs no import because it is in `java.lang`; `Iterator` is in `java.util`, so a file that
 writes `fun iterator(): Iterator` says `import java.util`. That is the ordinary rule for a platform
@@ -299,6 +304,21 @@ not import — write 'import java.util' to reach it
 
 A package the JDK does not describe — one compiled elsewhere — cannot be checked at all, so it is
 taken on the file's word. That is the case an import exists for in the first place.
+
+The same lookup decides the receiver of a member access, which is what makes a JDK **static** member
+reachable:
+
+```neko
+start: long = System.currentTimeMillis()
+d: double = Math.abs(-3.5)
+out: Object = System.out
+```
+
+The class name is matched before the receiver is treated as a value, because there is no value there.
+Neko has neither static-import syntax nor qualified type syntax, so `Cls.member` is the only spelling
+available — which means recognising a class name as a receiver is not a convenience but the whole
+mechanism. Members of a JDK class are resolved reflectively and dispatched against the reflected
+owner and descriptor; a call that matches no overload is refused and told what the class does declare.
 
 ### Class
 

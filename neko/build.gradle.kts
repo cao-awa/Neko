@@ -31,6 +31,39 @@ kotlin {
     jvmToolchain(21)
 }
 
+/**
+ * Packages the standard library into the compiler's own jar, as resources.
+ *
+ * The library is Neko source, and the compiler compiles it ahead of whatever program it was asked to
+ * build — so the sources have to *travel with the compiler*. Copying them onto the classpath, rather
+ * than reading them from `stdlib/` at run time, is what makes a jar built here usable from another
+ * machine, from the IDE plugin, and from a test: none of those can be assumed to sit next to the
+ * repository.
+ *
+ * They land under `neko/stdlib/`, which `StandardLibrary` reads back by the same relative path both
+ * from the jar (as a resource) and from a directory of class files (as a file), so a test run and a
+ * packaged build take the identical route.
+ *
+ * The destination is exactly the resource root, and the library is nested inside it with an explicit
+ * `into`, so `standardLibraryResources.destinationDir` can be handed to the source set as-is. Letting
+ * `from` infer the layout instead would make the resource path depend on the directory's own name —
+ * `stdlib/com/...` rather than `neko/stdlib/com/...` — which is not where `StandardLibrary` looks.
+ */
+val standardLibraryResources = tasks.register<Copy>("standardLibraryResources") {
+    group = "neko"
+    description = "Copies the Neko standard library sources into the compiler's resources"
+    from(rootProject.layout.projectDirectory.dir(NEKO_STANDARD_LIBRARY_DIRECTORY)) {
+        into(NEKO_STANDARD_LIBRARY_RESOURCE_ROOT)
+    }
+    into(layout.buildDirectory.dir("generated/neko-stdlib"))
+}
+
+sourceSets["main"].resources.srcDir(standardLibraryResources.map { it.destinationDir })
+
+tasks.processResources {
+    dependsOn(standardLibraryResources)
+}
+
 tasks.test {
     useJUnitPlatform()
 }
@@ -48,6 +81,25 @@ tasks.test {
 
 /** The root project directory, against which every configured path is resolved. */
 val rootDirectory = rootProject.layout.projectDirectory
+
+/**
+ * The Neko standard library, relative to the root project directory.
+ *
+ * Read from the root `gradle.properties` like every other Neko path. The compiler gets the same
+ * sources from its own resources rather than from here — see `StandardLibrary` — so this value only
+ * decides what gets packaged.
+ */
+val NEKO_STANDARD_LIBRARY_DIRECTORY: String =
+    findProperty("neko.standardLibraryDirectory") as String
+
+/**
+ * Where the standard library's sources are found on the classpath, as a resource path.
+ *
+ * It must match `StandardLibrary.RESOURCE_ROOT`, which reads it back. Kept as a build-script value
+ * rather than read from Kotlin because the build has to place the files before any Kotlin runs; that
+ * the two agree is asserted by the compiler's own `StandardLibraryTest`.
+ */
+val NEKO_STANDARD_LIBRARY_RESOURCE_ROOT = "neko/stdlib"
 
 /** Reads a comma-separated path list from `gradle.properties`, trimmed and without blanks. */
 fun nekoPaths(property: String): List<String> =

@@ -769,6 +769,72 @@ class NekoPluginTest : BasePlatformTestCase() {
     }
 
 
+    // ------------------------------------------------------------------------- the standard library
+
+    fun testTheEditorSeesTheStandardLibrary() {
+        // The plugin drives `Parser` and `Analyzer` directly rather than going through `Compiler`, so
+        // it has to prepend the library itself. Without that, this program would be reported as
+        // "'scratch' and 'nyan' need EmitYieldException" in the editor while compiling perfectly with
+        // `gradlew compileNeko` — the worst kind of disagreement, because only one of the two is wrong.
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun caller(): int {
+                        v: int = try f() { a ->
+                            nyan a
+                        }
+                        return v
+                    }
+
+                    fun f(): int {
+                        return scratch 1, 2
+                    } emit [int, int]
+                }
+            }
+            """.trimIndent(),
+        )
+
+        val errors = myFixture.doHighlighting()
+            .filter { it.severity == com.intellij.lang.annotation.HighlightSeverity.ERROR }
+
+        assertEquals(
+            "a program using 'scratch' must not be reported as missing its exception: " +
+                errors.map { it.description },
+            0,
+            errors.size,
+        )
+    }
+
+    fun testALibraryDiagnosticIsNotBlamedOnTheOpenFile() {
+        // The library's sources are analysed as part of the program but belong to no file on disk, so
+        // their diagnostics must not be drawn in whichever editor happens to be open. `belongsTo`
+        // compares paths, and a library source has none — this asserts that the comparison is actually
+        // consulted rather than everything being reported against the current file.
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main(args: string[]) {
+                        println(1)
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        val errors = myFixture.doHighlighting()
+            .filter { it.severity == com.intellij.lang.annotation.HighlightSeverity.ERROR }
+
+        assertEquals(
+            "a valid program should show no errors: ${errors.map { it.description }}",
+            0,
+            errors.size,
+        )
+    }
+
     // ------------------------------------------------------------------------ unresolved names
 
     fun testAnUnknownNameIsPaintedNotMerelyUnderlined() {

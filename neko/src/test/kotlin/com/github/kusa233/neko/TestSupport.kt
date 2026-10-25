@@ -3,6 +3,7 @@ package com.github.kusa233.neko
 import com.github.kusa233.neko.diagnostics.Diagnostic
 import com.github.kusa233.neko.diagnostics.Severity
 import com.github.kusa233.neko.source.SourceFile
+import com.github.kusa233.neko.source.StandardLibrary
 import java.io.ByteArrayOutputStream
 import java.io.PrintStream
 import java.net.URLClassLoader
@@ -96,21 +97,39 @@ object TestSupport {
     /**
      * Compiles [source] the same way a program is compiled.
      *
-     * There is no longer a Neko standard library to add: the iteration protocol is the JDK's own
-     * `java.lang.Iterable`/`java.util.Iterator`, and the effect machinery ships with the compiler as
-     * Java classes. This is kept as a named entry point so tests say *why* they compile the ordinary
-     * way, and so a future library can be threaded in here once rather than at sixteen call sites.
+     * The standard library is no longer something a test adds: the compiler compiles its own copy
+     * ahead of every program, so an ordinary [compile] or [load] already has it. This is kept as a
+     * named entry point so a test that reads oddly without an explanation can say *why* it takes the
+     * ordinary route — and so that if the library ever needs threading in per-test again, there is
+     * one place to do it rather than sixteen call sites.
      */
     fun loadWithLibrary(source: String, name: String = "Test.neko"): LoadedProgram =
         load(source, name)
 
+    /** The library the compiler compiles ahead of every program, for tests that assert on it. */
+    fun standardLibrarySources(): List<SourceFile> = StandardLibrary.sources()
+
     /**
-     * Nothing to add, for the same reason as [loadWithLibrary].
+     * The JVM internal name of `EmitYieldException`, as the compiler actually emitted it.
      *
-     * Returned as an empty list rather than deleted so every caller keeps compiling, and so the
-     * `stdlib/`-shaped assumption is visible in one place instead of being scattered.
+     * Read from the library's own declaration rather than written out as a literal, so a test asserting
+     * on an `Exceptions` attribute cannot go stale when the library moves: the name is the library's
+     * package plus the simple name, and both are already known here.
      */
-    fun standardLibrarySources(): List<SourceFile> = emptyList()
+    fun emitYieldExceptionClass(): String {
+        val declaration = standardLibrarySources().firstOrNull {
+            emitYieldExceptionSimpleName in it.content
+        } ?: error("the standard library declares no $emitYieldExceptionSimpleName")
+        // The package comes from the file's own `locate`, which is what the compiler emits against.
+        val packageName = declaration.content.lineSequence()
+            .first { it.trimStart().startsWith("locate ") }
+            .trim()
+            .removePrefix("locate ")
+            .trim()
+        return packageName.replace('.', '/') + "/$emitYieldExceptionSimpleName"
+    }
+
+    private const val emitYieldExceptionSimpleName = "EmitYieldException"
 
     /** A compiled program, loaded and ready to be invoked. */
     class LoadedProgram(

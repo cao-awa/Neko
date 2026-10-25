@@ -1189,6 +1189,22 @@ class MemberAccessExpression(
      * value.
      */
     var receiverIsClass = false
+
+    /**
+     * The JVM owner of a **JDK** static field this access reads, or `null` for a program's own field.
+     *
+     * `System.out` is the case every program meets. It has no [FieldSymbol]: the program never
+     * compiled `java.lang.System`, so there is no declaration to point at, and the emitter needs the
+     * owner and descriptor it cannot derive from a symbol. The analyzer resolves it reflectively and
+     * records the JVM name here, which is exactly the pair `getstatic` requires.
+     *
+     * Kept separate from [resolvedField] rather than folded into a synthetic symbol so that the
+     * distinction stays visible: everything else in a member access is a Neko declaration.
+     */
+    var resolvedPlatformFieldOwner: String? = null
+
+    /** `true` when [resolvedPlatformFieldOwner] names a `getstatic` rather than a `getfield`. */
+    var resolvedPlatformFieldIsStatic = false
 }
 
 /** `this` — the object the enclosing instance member was invoked on. */
