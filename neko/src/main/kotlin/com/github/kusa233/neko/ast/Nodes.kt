@@ -1392,4 +1392,30 @@ class LambdaExpression(
      * which must be captured from an enclosing scope (a field).
      */
     var identity: Any? = null
+
+    /**
+     * Filled in by the analyzer: the single-method interface this lambda implements, if any.
+     *
+     * `null` when the lambda was written where a *function type* was expected, which is the only
+     * shape the language had before. When it is set, the lambda is a value of that interface rather
+     * than of a generated functional interface, and the code generator implements the interface's one
+     * abstract method instead of a synthetic `invoke`. That is what makes `run({ ... })` work against
+     * a parameter declared `Runnable`.
+     *
+     * Both fields are needed downstream: the class to implement, and the method's name — which is
+     * `run` for `Runnable` and something else for every other interface, so it cannot be assumed.
+     */
+    var samInterface: SamTarget? = null
 }
+
+/** What a lambda has to implement to stand as a single-method interface. */
+class SamTarget(
+    /** JVM internal name of the interface, e.g. `java/lang/Runnable`. */
+    val jvmName: String,
+    /** The one abstract method's name, e.g. `run`. */
+    val methodName: String,
+    /** That method's parameter types, which the lambda's parameters are checked against. */
+    val parameterTypes: List<NekoType>,
+    /** What that method returns, which is what the lambda's `yield` has to produce. */
+    val returnType: NekoType,
+)

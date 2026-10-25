@@ -36,7 +36,7 @@ Tasks are module-qualified now that there is more than one module.
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # Tests.
-./gradlew :neko:test                     # the compiler: 525 tests
+./gradlew :neko:test                     # the compiler: 535 tests
 ./gradlew :plugin:idea:test              # the plugin: 56 tests, in a real IDE instance
 
 # The compiler as one self-contained jar.
@@ -513,6 +513,88 @@ Visibility is written on the member (`private val`, `public fun`), not on the bl
 nest, and cannot hold a `constructor`: a constructor builds an instance, so it is never static.
 Members declared outside the block are instance members.
 
+### Lambda
+
+A lambda is `{ parameters -> body }`, and it can be written wherever a function type or a
+single-method interface is expected:
+
+```neko
+f: [int] -> int = { x ->
+  yield x + 1
+}
+```
+
+When the parameters can be inferred from the expected type they may be written without
+annotations; a lambda whose parameters cannot be inferred needs each one annotated.
+
+#### Where a single-method interface is expected
+
+A lambda also stands in for an interface that declares exactly one abstract method — the Java notion
+of a functional interface — so it can be passed straight into a call:
+
+```neko
+interface Action {
+  fun perform(times: int)
+}
+
+class Main {
+  static {
+    fun twice(a: Action) {
+      a.perform(2)
+    }
+
+    fun main() {
+      twice({ n ->
+        println(n)
+      })
+    }
+  }
+}
+```
+
+The interface supplies both the parameter types and the result, exactly as a function type would, so
+the body is checked against `perform`'s signature. At bytecode level the lambda becomes a class that
+implements the interface and defines *its* method — `perform` here, `run` for `Runnable` — rather
+than a synthetic `invoke`.
+
+Nothing has to be written to ask for this: the parameter's declared type is the target. An interface
+with two or more abstract methods is not a target, because there would be no way to say which one the
+body belonged to.
+
+It works against the Java platform's own interfaces as well, including inside a platform constructor
+whose class the program never declares:
+
+```neko
+// `Thread(Runnable)`, picked out from Thread's other one-argument constructors because a lambda can
+// only fit the functional-interface parameter — nothing is guessed.
+t: Thread = Thread({
+  println("thread body")
+})
+```
+
+The generated class implements `java.lang.Runnable` and defines `run`; the method name comes from the
+interface itself rather than from the compiler's convention, which is what makes the result a real
+`Runnable` and not merely something that looks like one. Note that `Thread`'s own methods are still
+not callable from Neko — calling an instance method of a platform type is a separate, older
+limitation, and `"abc".length()` fails the same way.
+
+#### The arrow may be left out when there are no parameters
+
+A lambda with no parameters has nothing for the arrow to introduce, so `{ ... }` is enough:
+
+```neko
+fun main() {
+  performIt({
+    println("no arrow")
+  })
+}
+```
+
+This is decided by whether an `->` appears before the matching `}`, not by guessing from the
+contents. `{ }`, `{ println(1) }` and `{ -> println(1) }` are all the same lambda; only the last one
+spells out that it takes nothing. Passing a lambda whose body is several statements is the ordinary
+use — a body wrapped in an arrow it does not need is the one thing the shorter form exists to avoid.
+
 ### Value class (`meow`)
 
 `meow` before `class` declares the fields in the header and derives `equals`, `hashCode` and `toString`
@@ -986,6 +1068,30 @@ class Neko() {
 
 A `try` used as a value is worth what its call returned when it returned normally. The `nyan` answer
 travels back to the `scratch` site, not to the `try` —so the two are independent:
+
+**A function that declares an `emit` clause need not scratch.** The clause describes a way out that
+*callers* have to provide for; whether this particular body ever takes it is its own business, and a
+body that never does always answers normally:
+
+```neko
+class Neko() {
+  fun test(): int {
+    return 7          // Never scratches, which is fine: the clause is about what callers may expect.
+  } emit [int]
+
+  fun main() {
+    // The call still needs a `try`: that is where a handler would be declared if one were reached.
+    v: int = try test() { x ->
+      nyan x
+    }
+    println(v)        // 7
+  }
+}
+```
+
+The clause is checked in one direction only. What a `scratch` requires is a handler to reach, and a
+`scratch` with none in the whole program is an error — code generation would not know which method to
+call. A clause with no `scratch` behind it is not.
 
 ```neko
 class Neko() {

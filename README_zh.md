@@ -35,7 +35,7 @@ Neko 是一门用来做编译器实验的玩具 JVM 语言：它有类、接口�
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # 测试。
-./gradlew :neko:test                     # 编译器：525 个测试
+./gradlew :neko:test                     # 编译器：535 个测试
 ./gradlew :plugin:idea:test              # 插件：56 个测试，跑在真实 IDE 实例里
 
 # 把编译器打成单个自包含 jar。
@@ -474,6 +474,80 @@ class Neko() {
 可见性写在成员上（`private val`、`public fun`），不写在块上。块不能嵌套，也不能包含
 `constructor`：构造函数创建的是实例，所以它永远不是静态的。在块外面声明的成员是实例成员。
 
+### Lambda
+
+Lambda 写作 `{ 参数 -> 主体 }`，凡是期望函数类型或单抽象方法接口的地方都能写：
+
+```neko
+f: [int] -> int = { x ->
+  yield x + 1
+}
+```
+
+参数类型能从期望类型推断时可以省略注解；推断不出来时，每个参数都必须写类型。
+
+#### 期望单抽象方法接口时
+
+Lambda 也可以充当「只声明一个抽象方法」的接口——也就是 Java 说的函数式接口——因此能直接写进
+调用里：
+
+```neko
+interface Action {
+  fun perform(times: int)
+}
+
+class Main {
+  static {
+    fun twice(a: Action) {
+      a.perform(2)
+    }
+
+    fun main() {
+      twice({ n ->
+        println(n)
+      })
+    }
+  }
+}
+```
+
+接口同时提供参数类型和返回值，和函数类型的作用完全一样，因此主体是按 `perform` 的签名检查的。
+在字节码层面，lambda 变成一个实现该接口的类，定义的是**接口自己的**方法——这里是 `perform`，
+`Runnable` 就是 `run`——而不是统一的 `invoke`。
+
+不需要写任何东西来「要求」这件事：参数声明的类型就是目标。声明了两个及以上抽象方法的接口不能作为
+目标，因为无法说明主体属于哪一个。
+
+Java 平台自带的接口同样可用，包括写进程序从未声明过的平台构造函数里：
+
+```neko
+// `Thread(Runnable)`：从 Thread 那些同样只有一个参数的重载里挑出它，靠的是「lambda 只能塞进
+// 函数式接口参数」这一条——没有靠猜。
+t: Thread = Thread({
+  println("thread body")
+})
+```
+
+生成的类实现 `java.lang.Runnable`、定义 `run`。方法名取自接口本身而不是编译器的约定，这才让它是一个
+真正的 `Runnable` 而不只是「看起来像」。要注意 `Thread` 自己的方法仍然不能从 Neko 调用——调用平台
+类型的实例方法是另一件事，也是更早就存在的限制，`"abc".length()` 同样会失败。
+
+#### 没有参数时 `->` 可以省略
+
+没有参数的 lambda 没什么需要 `->` 分隔，所以 `{ ... }` 就够了：
+
+```neko
+fun main() {
+  performIt({
+    println("没有箭头")
+  })
+}
+```
+
+判断依据是**在匹配的 `}` 之前是否出现 `->`**，而不是猜内容。`{ }`、`{ println(1) }` 和
+`{ -> println(1) }` 是同一个 lambda，只有最后一种明确写出了「它不接收任何东西」。主体有多条语句时
+照常写即可——多余地套一个箭头，正是这种短写法要消除的东西。
+
 ### 值类（`meow`）
 
 `class` 前面的 `meow` 在头部声明字段，并据此生成 `equals`、`hashCode` 和 `toString`：
@@ -902,6 +976,28 @@ class Neko() {
 
 用作值的 `try`，在调用正常返回时就值那次调用返回的东西。`nyan` 的答案回到的是 `scratch` 点，
 而不是 `try`——所以两者是独立的：
+
+**声明了 `emit` 子句的函数不一定要真的 scratch。** 子句描述的是**调用方**必须准备的另一条出路；
+这个函数体是否真的走那条路是它自己的事，从不走的主体总是正常返回：
+
+```neko
+class Neko() {
+  fun test(): int {
+    return 7          // 从不 scratch，这没问题：子句说的是调用方可以期待什么。
+  } emit [int]
+
+  fun main() {
+    // 调用仍然需要 `try`：万一真的走到了 handler，那才是声明它的地方。
+    v: int = try test() { x ->
+      nyan x
+    }
+    println(v)        // 7
+  }
+}
+```
+
+这条子句只在一个方向上被检查。`scratch` 需要的是一处可到达的 handler，而全程序都没有 handler 的
+`scratch` 会报错——否则代码生成不知道要调用哪个方法。反过来，没有 `scratch` 支撑的子句不算错。
 
 ```neko
 class Neko() {

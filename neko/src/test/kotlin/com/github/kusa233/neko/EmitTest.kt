@@ -516,24 +516,43 @@ class EmitTest {
         )
     }
 
+    /**
+     * An `emit` clause is worth what its signature says, not what its body happens to do.
+     *
+     * This used to be an error — "declares an 'emit' clause but can never reach a 'try' handler" —
+     * and the check was retired because it enforced the wrong rule. Whether a function *can* leave by
+     * scratching is a property of its declared signature, which is what a caller matches on; a body
+     * that never scratches is simply a function that always answers normally, which is a perfectly
+     * good implementation of a clause some other function may need.
+     *
+     * The value still comes back the ordinary way, through `return`, so the `try` that calls it gets
+     * `7` rather than a scratch value.
+     */
     @Test
-    fun `a function with an emit clause must actually scratch`() {
-        val result = TestSupport.compile(
+    fun `a function with an emit clause need not scratch`() {
+        val loaded = TestSupport.load(
             samplePackage(
                 "class Emitter {",
                 "    static {",
-                "        fun test() {",
-                "            println(\"no scratch\")",
+                "        fun test(): int {",
+                "            return 7",
                 "        } emit [int]",
+                "",
+                "        fun main() {",
+                "            v: int = try test() { x ->",
+                "                nyan x",
+                "            }",
+                "            println(v)",
+                "        }",
                 "    }",
                 "}",
             ),
             name = "Emit.neko",
         )
-        assertTrue(
-            TestSupport.errors(result).any { it.message.contains("can never reach a 'try' handler") },
-            "unexpected messages: ${TestSupport.messages(result)}",
-        )
+        val printed = loaded.capturingOutput {
+            loaded.invoke("com.github.kusa233.neko.sample.Emitter", "main")
+        }
+        assertEquals("7", printed.trim())
     }
 
     @Test

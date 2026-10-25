@@ -2687,7 +2687,13 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         // A lambda's parameter list may wrap across lines.
         newlineInsensitiveDepth++
         val parameters = mutableListOf<LambdaParameter>()
-        if (!at(TokenType.ARROW)) {
+        // Whether this `{` opens a lambda *with* a parameter list, which is decided by one question:
+        // is there an `->` before the matching `}` at this depth? A body written `{ println(1) }` has
+        // no arrow, so the brace is not a parameter list at all — it is a block whose contents are
+        // statements, which is the form `run({ ... })` needs. Reading `println` as a parameter name
+        // and then demanding an arrow is what used to make that form impossible to write.
+        val hasArrow = arrowBeforeMatchingBrace()
+        if (hasArrow && !at(TokenType.ARROW)) {
             while (true) {
                 skipNestedNewlines()
                 if (at(TokenType.ARROW)) break
@@ -2727,13 +2733,18 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         }
         newlineInsensitiveDepth = outerDepth
 
+        // `{ }` and `{ println(1) }` — a lambda with no parameters, written without the arrow it has
+        // nothing to introduce. The brace is then a plain statement block, exactly as it would be
+        // after `if` or `while`.
         if (!arrowFound) {
-            error(
-                "expected '->' after the lambda parameters but found ${current().describe()}",
-                current().span,
+            val statements = parseStatementSequence()
+            val close = expectRightBrace("lambda body")
+            val end = close?.span?.end ?: current().span.end
+            return LambdaExpression(
+                parameters = emptyList(),
+                body = BlockStatement(statements, Span(source, open.span.start, end)),
+                span = Span(source, open.span.start, end),
             )
-            synchronizeToStatement()
-            return null
         }
 
         // The body is an ordinary statement block: newlines terminate its statements.
@@ -2747,6 +2758,47 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             body = body,
             span = Span(source, open.span.start, end),
         )
+    }
+
+    /**
+     * Whether an `->` appears between here and the `}` that closes the brace just consumed.
+     *
+     * This is what tells a lambda's *parameter list* from a lambda's *body*. Both are `{ … }` and the
+     * parser cannot know which it is looking at without looking ahead: reading an identifier as a
+     * parameter name is only correct when an arrow follows it, and demanding an arrow otherwise made
+     * `run({ println(1) })` unparseable — the shortest and most natural way to write a no-argument
+     * lambda.
+     *
+     * Only starts at this brace's own depth count. A nested brace resets the question for its own
+     * contents, so `{ x -> { y -> x + y } }` still sees the outer arrow, while the inner lambda's
+     * arrow is not mistaken for the outer one. A `)` or `]` at the outer depth ends the scan too,
+     * which stops `f({ }, other -> …)` from borrowing the neighbouring lambda's arrow.
+     *
+     * The scan gives up at the end of the token list, so a malformed file reports its real error from
+     * the ordinary parse path rather than looping here.
+     */
+    private fun arrowBeforeMatchingBrace(): Boolean {
+        var depth = 0
+        var offset = 0
+        while (true) {
+            val token = peek(offset)
+            when (token.type) {
+                TokenType.END_OF_FILE -> return false
+                TokenType.LEFT_BRACE, TokenType.LEFT_PAREN, TokenType.LEFT_BRACKET -> depth++
+                TokenType.RIGHT_BRACE -> {
+                    if (depth == 0) return false
+                    depth--
+                }
+                TokenType.RIGHT_PAREN, TokenType.RIGHT_BRACKET -> {
+                    if (depth == 0) return false
+                    depth--
+                }
+                // The arrow that belongs to *this* brace, before any nested one opens.
+                TokenType.ARROW -> if (depth == 0) return true
+                else -> Unit
+            }
+            offset++
+        }
     }
 
     // -------------------------------------------------------------------- types

@@ -1789,7 +1789,20 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      *
      * Only the first was checkable during the walk; the second needs every `try` in the program, which
      * is why this runs at the end with the rest of the linking.
+     *
+     * **This check is switched off, deliberately.** It used to report "declares an 'emit' clause but
+     * can never reach a 'try' handler", and the rule it enforced was the wrong one: whether a function
+     * *can* leave by scratching is a property of its declared signature, and the signature alone is
+     * what a caller matches on. A body that never scratches is not an error — it is a function that
+     * always answers normally, which is a perfectly good implementation of a clause some other
+     * function, or a later version of this one, may need. Reporting it forced an author to invent a
+     * `scratch` they did not want, purely to satisfy the checker.
+     *
+     * The signature is still the whole story on the other side: a `scratch` site has to find a handler,
+     * and that is reported by [linkScratchHandlers] because code generation genuinely cannot proceed
+     * without knowing which method to call.
      */
+    @Suppress("unused")
     private fun reportUselessEmitClauses() {
         val wrapped = handlers.mapNotNull { tryCalleeName(it) }.toSet()
 
@@ -1839,7 +1852,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * later site is the one reported if it disagrees.
      */
     private fun linkScratchHandlers() {
-        reportUselessEmitClauses()
+        // `reportUselessEmitClauses()` is deliberately not called: an `emit` clause is worth what its
+        // signature says, and a body that never scratches simply always returns normally. See that
+        // function's KDoc for why the check was retired.
         for (site in scratchSites.sortedBy { it.expression.span.start }) {
             val expression = site.expression
             val handler = handlers.firstOrNull { it.signatureMatches(site.signature) }
@@ -4087,7 +4102,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
         val classSymbol = classes[callee.name]
         if (classSymbol == null) {
-            for (argument in expression.arguments) analyzeExpression(argument)
+            analyzePlatformConstructionArguments(expression, type)
             expression.constructedType = type
             return type
         }
@@ -4133,6 +4148,62 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         expression.resolvedConstructor = constructor
         expression.constructedType = type
         return type
+    }
+
+    /**
+     * Analyses the arguments of a construction whose class the program does not declare.
+     *
+     * Such a class can only be a platform one — `Thread`, `HashMap` — and its constructors are not in
+     * the symbol table, so they cannot be *checked*. What they can still do is supply an expected
+     * type, and that turns out to matter for one thing: a lambda written straight into the argument
+     * list has no other way to learn what it is. `Thread({ ... })` means `Runnable` and nothing else,
+     * but only the reflected constructor knows that, so without this the lambda is told it has no
+     * target and cannot infer its own shape.
+     *
+     * Overloads of the same arity are the whole difficulty — `Thread` has both `Thread(Runnable)` and
+     * `Thread(String)` — and there is exactly one fact available to break the tie: a lambda can only
+     * fit a functional-interface parameter. So each lambda argument narrows the candidates to those
+     * whose parameter in that position is a functional interface. `Thread({ ... })` collapses to
+     * `Thread(Runnable)` on that test alone, with no guessing about what the author meant.
+     *
+     * When the narrowing leaves anything other than one candidate the arguments are analysed plainly,
+     * which is what every platform call did before. Nothing here reports a mismatch: whether the
+     * arguments fit is left to the JVM verifier, the same division of labour platform calls already
+     * had, since the compiler has no symbol to check against.
+     */
+    private fun analyzePlatformConstructionArguments(expression: CallExpression, type: ClassType) {
+        val loaded = loadQualifiedClass(type.internalName.replace('/', '.'))
+        val byArity = loaded?.constructors
+            ?.filter { it.parameterCount == expression.arguments.size }
+            .orEmpty()
+
+        // Positions holding a lambda: the only arguments whose expected type is both unknown and
+        // recoverable from the signature.
+        val lambdaPositions = expression.arguments
+            .withIndex()
+            .filter { it.value is LambdaExpression }
+            .map { it.index }
+
+        val candidates = if (lambdaPositions.isEmpty()) {
+            byArity
+        } else {
+            byArity.filter { constructor ->
+                lambdaPositions.all { position ->
+                    val parameter = constructor.parameterTypes.getOrNull(position)
+                    parameter != null && singleAbstractMethodOfPlatform(parameter) != null
+                }
+            }
+        }
+
+        if (candidates.size != 1) {
+            for (argument in expression.arguments) analyzeExpression(argument)
+            return
+        }
+
+        val parameters = candidates.single().parameterTypes.map { typeOfReflected(it) }
+        expression.arguments.forEachIndexed { index, argument ->
+            analyzeExpression(argument, parameters.getOrNull(index))
+        }
     }
 
     /**
@@ -4267,7 +4338,21 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // The parameter types it infers come from the function type underneath.
         val expectedFunction = expectedType?.unwrapNullable() as? FunctionType
 
-        if (expectedFunction == null && expression.parameters.any { it.declaredType == null }) {
+        // A lambda also satisfies a *single-method interface* — `Runnable`, `Comparator`, or one the
+        // program declares — which is what makes `run({ ... })` work against a Java-style parameter.
+        // The interface's one abstract method supplies exactly what a function type would: the
+        // parameters and the result the body has to produce. See [singleAbstractMethodOf].
+        val samTarget = if (expectedFunction == null) {
+            (expectedType?.unwrapNullable() as? ClassType)?.let { singleAbstractMethodOf(it) }
+        } else {
+            null
+        }
+
+        // What the body is checked against, whichever kind of target it was given.
+        val expectedParameters: List<NekoType>? = expectedFunction?.parameters ?: samTarget?.parameterTypes
+        val expectedReturn: NekoType? = expectedFunction?.returnType ?: samTarget?.returnType
+
+        if (expectedParameters == null && expression.parameters.any { it.declaredType == null }) {
             diagnostics.error(
                 "cannot infer the parameter types of this lambda: the surrounding context does not " +
                     "expect a function type, so annotate each parameter, as in " +
@@ -4275,30 +4360,35 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 expression.span,
             )
         }
-        if (expectedFunction != null && expectedFunction.arity != expression.parameters.size) {
+        if (expectedParameters != null && expectedParameters.size != expression.parameters.size) {
             diagnostics.error(
                 "this lambda declares ${expression.parameters.size} parameter" +
                     "${if (expression.parameters.size == 1) "" else "s"} but a function type with " +
-                    "${expectedFunction.arity} parameter" +
-                    "${if (expectedFunction.arity == 1) "" else "s"} is expected here",
+                    "${expectedParameters.size} parameter" +
+                    "${if (expectedParameters.size == 1) "" else "s"} is expected here",
                 expression.span,
             )
         }
 
         val parameterTypes = expression.parameters.mapIndexed { index, parameter ->
             parameter.declaredType?.let { resolveType(it) }
-                ?: expectedFunction?.parameters?.getOrNull(index)
+                ?: expectedParameters?.getOrNull(index)
                 ?: ErrorType
         }
         expression.resolvedParameterTypes = parameterTypes
+        expression.samInterface = samTarget
 
         val state = LambdaState(identity = Any())
         // The expected function type is already known here, so its result type is what each `yield`
         // is checked against from the start — which is the only way a bare `yield null` can have a
         // type to be absent from. Without this the first `yield` would fix the result type from its
         // own value alone, and a literal whose type only its context can supply would have none.
-        state.expectedReturnType = expectedFunction?.returnType
-        state.returnTypeIsDeclared = expectedFunction != null
+        //
+        // A single-method interface supplies the same fact, so a body written against `Runnable`
+        // gets `void` and one written against a supplier gets that method's result.
+        state.expectedReturnType = expectedReturn
+        state.returnTypeIsDeclared = expectedFunction != null || samTarget != null
+
         expression.identity = state.identity
         val outerLambda = currentLambda
         val outerFunction = currentFunction
@@ -4367,7 +4457,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         heldPurrLocks.addAll(enclosingPurrLocks)
 
         val returnType = state.expectedReturnType ?: when {
-            expectedFunction != null -> expectedFunction.returnType
+            expectedReturn != null -> expectedReturn
             else -> {
                 diagnostics.error(
                     "this lambda never yields a value, so its result type cannot be determined; " +
@@ -4379,7 +4469,85 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         }
 
         expression.resolvedReturnType = returnType
+
+        // The *value's* type follows the target it was checked against. A single-method interface
+        // makes the lambda an instance of that interface, not of a function type — which is what lets
+        // it be passed to a parameter declared `Runnable` and what the code generator reads to decide
+        // which class to build.
+        samTarget?.let { return ClassType(it.jvmName, it.jvmName.substringAfterLast('/')) }
         return FunctionType(parameterTypes, returnType)
+    }
+
+    /**
+     * The one abstract method of [type], when [type] is a *functional interface*; otherwise `null`.
+     *
+     * "Functional interface" here means exactly what it means to Java: an interface that declares
+     * exactly one abstract method, so a single lambda can be everything an implementer would have to
+     * write. `Runnable` and `Comparator` qualify; an interface with two abstract methods does not,
+     * because there would be no way to say which one the body belonged to.
+     *
+     * Two sources have to be consulted, and they are not symmetrical:
+     *
+     *  * **A Neko interface** has a symbol, so its methods were resolved like any other declaration
+     *    and `allFunctions()` walks inherited ones too. A method with a body is a default, so it is
+     *    already provided and does not count.
+     *  * **A JDK interface** has no symbol — the program never compiles the JDK — so the answer is
+     *    read off the loaded class by reflection. Only `abstract` methods count, which is what keeps
+     *    `Comparator`'s many `default` and `static` helpers from making it look non-functional.
+     *
+     * A type that is neither (a class, or an interface with two methods) answers `null`, and the
+     * lambda is then checked as it always was, against a function type or not at all.
+     */
+    private fun singleAbstractMethodOf(type: ClassType): SamTarget? {
+        val symbol = classes[type.simpleName]
+        if (symbol != null) {
+            if (!symbol.isInterface) return null
+            val abstracts = symbol.allFunctions().values
+                .flatten()
+                .filter { it.isAbstract }
+            // Overloads of one name are two abstract methods, so this counts them rather than names.
+            if (abstracts.size != 1) return null
+            val only = abstracts.single()
+            return SamTarget(
+                jvmName = symbol.jvmInternalName,
+                methodName = only.name,
+                parameterTypes = only.parameterTypes,
+                returnType = only.returnType,
+            )
+        }
+
+        // A platform interface, read from the JDK. `java.lang.Runnable` is named `Runnable` here, and
+        // a qualified name such as `java.util.Comparator` arrived already resolved as a ClassType with
+        // the full internal name, so the load is attempted on the internal name as written.
+        val loaded = loadQualifiedClass(type.internalName.replace('/', '.')) ?: return null
+        val only = singleAbstractMethodOfPlatform(loaded) ?: return null
+        return SamTarget(
+            jvmName = type.internalName,
+            methodName = only.name,
+            parameterTypes = only.parameterTypes.map { typeOfReflected(it) },
+            returnType = typeOfReflected(only.returnType),
+        )
+    }
+
+    /**
+     * The one abstract method of a loaded interface, or `null` when [loaded] is not functional.
+     *
+     * Split out from [singleAbstractMethodOf] because the answer is needed in a second place: choosing
+     * between platform constructors of the same arity, where the only fact that can break the tie is
+     * that a lambda argument can fit a functional-interface parameter and cannot fit a `String`.
+     *
+     * Method bodies with a body in an interface are `default` and are not abstract, so they are
+     * excluded by the modifier test itself. Bridge and synthetic methods are generated for erasure and
+     * are not what an author writes; counting them would make every generic interface look like it
+     * had two methods.
+     */
+    private fun singleAbstractMethodOfPlatform(loaded: Class<*>): java.lang.reflect.Method? {
+        if (!loaded.isInterface) return null
+        val abstracts = loaded.methods.filter { method ->
+            java.lang.reflect.Modifier.isAbstract(method.modifiers) &&
+                !method.isSynthetic && !method.isBridge
+        }
+        return abstracts.singleOrNull()
     }
 
     /**

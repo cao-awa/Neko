@@ -4080,7 +4080,14 @@ class BytecodeGenerator(
      * constructor, so the resulting value is an instance of the function type's interface.
      */
     private fun emitLambda(expression: LambdaExpression, scope: MethodScope) {
-        val functionType = expression.type as? FunctionType ?: run {
+        // A lambda written against a *single-method interface* implements that interface directly:
+        // the class extends nothing and implements `Runnable` (or whatever was named), and the one
+        // abstract method becomes a real method with that name. A lambda written against a function
+        // type keeps its old shape — a generated interface with an `invoke` — because there is no
+        // user-named type to implement.
+        val sam = expression.samInterface
+        val functionType = expression.type as? FunctionType
+        if (sam == null && functionType == null) {
             diagnostics.error(
                 "internal error: a lambda reached code generation without a resolved function type",
                 expression.span,
@@ -4089,7 +4096,6 @@ class BytecodeGenerator(
             return
         }
 
-        val interfaceName = functionInterfaceName(functionType)
         val lambdaClassName = "$currentOwner\$Lambda\$${lambdaCounter++}"
         val identity = expression.identity ?: Any()
 
@@ -4106,7 +4112,18 @@ class BytecodeGenerator(
         }
 
         val enclosingOwner = currentOwner
-        emitLambdaClass(lambdaClassName, interfaceName, functionType, expression, captures, identity)
+        if (sam != null) {
+            emitSamLambdaClass(lambdaClassName, sam, expression, captures, identity)
+        } else {
+            emitLambdaClass(
+                lambdaClassName,
+                functionInterfaceName(functionType!!),
+                functionType,
+                expression,
+                captures,
+                identity,
+            )
+        }
         currentOwner = enclosingOwner
 
         val mv = scope.mv
@@ -4133,6 +4150,86 @@ class BytecodeGenerator(
     }
 
     /** Emits the class that implements a lambda literal. */
+    /**
+     * Emits a lambda written against a single-method interface as a class implementing it.
+     *
+     * The difference from [emitLambdaClass] is what the generated method is called and what it
+     * declares. There, the method is always `invoke` on a synthetic interface; here it is the
+     * interface's own abstract method — `run` for `Runnable`, `compare` for `Comparator` — with that
+     * method's signature. Getting either wrong produces a class the JVM rejects as abstract, so both
+     * come from [SamTarget] rather than from a guess.
+     *
+     * The method must be `public`: an interface's methods are public, and the JVM refuses a class
+     * whose implementation is narrower.
+     */
+    private fun emitSamLambdaClass(
+        lambdaClassName: String,
+        sam: SamTarget,
+        expression: LambdaExpression,
+        captures: List<Pair<LocalSymbol, String>>,
+        identity: Any,
+    ) {
+        currentOwner = lambdaClassName
+
+        val writer = NekoClassWriter(ClassWriter.COMPUTE_FRAMES or ClassWriter.COMPUTE_MAXS)
+        writer.visit(
+            V1_8,
+            ACC_FINAL or ACC_SUPER,
+            lambdaClassName,
+            null,
+            "java/lang/Object",
+            arrayOf(sam.jvmName),
+        )
+        writer.visitSource(currentFile.sourceName(), null)
+
+        for ((symbol, fieldName) in captures) {
+            writer.visitField(
+                ACC_PRIVATE or ACC_FINAL,
+                fieldName,
+                descriptorOf(symbol.type),
+                null,
+                null,
+            ).visitEnd()
+        }
+
+        emitLambdaConstructor(writer, lambdaClassName, captures)
+
+        val mv = writer.visitMethod(
+            ACC_PUBLIC,
+            sam.methodName,
+            descriptorOf(sam.parameterTypes, sam.returnType),
+            null,
+            // No `Exceptions` attribute, matching the synthetic-interface path: a `yield` inside the
+            // body still throws, and the JVM does not verify checked exceptions, so listing one would
+            // only make the class noisier than the source it came from.
+            null,
+        )
+        mv.visitCode()
+
+        val scope = MethodScope(
+            owner = lambdaClassName,
+            mv = mv,
+            lambdaIdentity = identity,
+            firstSlot = 1,
+            captures = captures.associate { it.first to it.second },
+        )
+
+        for (parameter in expression.parameterSymbols.orEmpty()) {
+            scope.allocate(parameter)
+        }
+
+        for (statement in expression.body.statements) {
+            emitStatement(statement, scope)
+        }
+        emitDefaultReturn(sam.returnType, mv)
+
+        mv.visitMaxs(0, 0)
+        mv.visitEnd()
+        writer.visitEnd()
+
+        output[lambdaClassName] = writer.toByteArray()
+    }
+
     private fun emitLambdaClass(
         lambdaClassName: String,
         interfaceName: String,
