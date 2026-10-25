@@ -1095,6 +1095,8 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
                 if (at(TokenType.COMMA)) {
                     advance()
                     skipNestedNewlines()
+                    // A trailing comma, for a clause wrapped one type per line.
+                    if (at(TokenType.RIGHT_BRACKET)) break
                     continue
                 }
                 break
@@ -1107,34 +1109,53 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         return EmitClause(types, close?.span?.end ?: keyword.span.end)
     }
 
-    /** `(a: int, b: string)`; the opening parenthesis is consumed by the caller. */
+    /**
+     * `(a: int, b: string)`; the opening parenthesis is consumed by the caller.
+     *
+     * A parameter list may be broken across lines, and a trailing comma is allowed before the `)`.
+     * The parentheses already say where the list ends, so a newline inside them is formatting rather
+     * than a statement separator — the same reasoning that lets a call's arguments wrap. Without
+     * this, a declaration long enough to need wrapping could not be written at all, and since an
+     * editor adds the trailing comma when it wraps a list, that had to be accepted too.
+     */
     private fun parseParameterList(): List<Parameter> {
         val parameters = mutableListOf<Parameter>()
-        if (at(TokenType.RIGHT_PAREN)) return parameters
-
-        while (true) {
+        // Newlines inside the parentheses are not separators; the depth is restored on every way out.
+        newlineInsensitiveDepth++
+        try {
             skipNestedNewlines()
-            val nameToken = expect(
-                TokenType.IDENTIFIER,
-                "expected a parameter name but found ${current().describe()}",
-            ) ?: break
+            if (at(TokenType.RIGHT_PAREN)) return parameters
 
-            if (!expectColon("parameter '${nameToken.text}'")) break
-            val type = parseType() ?: break
+            while (true) {
+                skipNestedNewlines()
+                // A trailing comma: the list has been written one parameter per line and the last
+                // line's comma closes nothing.
+                if (at(TokenType.RIGHT_PAREN)) break
 
-            parameters += Parameter(
-                name = nameToken.text,
-                nameSpan = nameToken.span,
-                declaredType = type,
-                span = Span(source, nameToken.span.start, type.span.end),
-            )
+                val nameToken = expect(
+                    TokenType.IDENTIFIER,
+                    "expected a parameter name but found ${current().describe()}",
+                ) ?: break
 
-            skipNestedNewlines()
-            if (at(TokenType.COMMA)) {
-                advance()
-                continue
+                if (!expectColon("parameter '${nameToken.text}'")) break
+                val type = parseType() ?: break
+
+                parameters += Parameter(
+                    name = nameToken.text,
+                    nameSpan = nameToken.span,
+                    declaredType = type,
+                    span = Span(source, nameToken.span.start, type.span.end),
+                )
+
+                skipNestedNewlines()
+                if (at(TokenType.COMMA)) {
+                    advance()
+                    continue
+                }
+                break
             }
-            break
+        } finally {
+            newlineInsensitiveDepth--
         }
         return parameters
     }
@@ -2559,6 +2580,9 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
                 if (at(TokenType.COMMA)) {
                     advance()
                     skipNestedNewlines()
+                    // A trailing comma is what an editor leaves behind when it wraps the list one
+                    // argument per line, so it closes the list rather than asking for another.
+                    if (at(TokenType.RIGHT_PAREN)) break
                     continue
                 }
                 break

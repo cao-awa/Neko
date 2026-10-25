@@ -541,6 +541,30 @@ Visibility is written on the member (`private val`, `public fun`), not on the bl
 nest, and cannot hold a `constructor`: a constructor builds an instance, so it is never static.
 Members declared outside the block are instance members.
 
+A parameter list may be broken across lines, and a trailing comma before the `)` is accepted — the
+parentheses already say where the list ends, so neither is a statement separator. A constructor's
+parameter list and a call's argument list wrap the same way:
+
+```neko
+class Neko() {
+  static {
+    fun add(
+      a: int,
+      b: int,
+    ): int {
+      return a + b
+    }
+
+    fun main() {
+      println(add(
+        1,
+        2,
+      ))
+    }
+  }
+}
+```
+
 ### Lambda
 
 A lambda is `{ parameters -> body }`, and it can be written wherever a function type or a

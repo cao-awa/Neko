@@ -615,4 +615,124 @@ class ParserTest {
             "got: ${diagnostics.errorMessages()}",
         )
     }
+
+    // ------------------------------------------------- wrapping a list across lines
+
+    /**
+     * A parameter list may be broken across lines.
+     *
+     * The parentheses already say where the list ends, so a newline inside them is formatting rather
+     * than the statement separator it is everywhere else. This used to be refused with "expected a
+     * parameter name but found end of line", which made a declaration long enough to need wrapping
+     * impossible to write.
+     */
+    @Test
+    fun `accepts a parameter list spread over several lines`() {
+        val declaration = function(
+            """
+            class Sample {
+                static {
+                    fun add(
+                        a: int,
+                        b: int
+                    ): int {
+                        return a + b
+                    }
+                }
+            }
+            """.trimIndent() + "\n",
+            "add",
+        )
+        assertEquals(listOf("a", "b"), declaration.parameters.map { it.name })
+    }
+
+    /**
+     * A trailing comma closes the list.
+     *
+     * This is what an editor leaves behind when it wraps a list one item per line, so refusing it
+     * would mean the wrapped form the test above accepts could not be produced by wrapping at all.
+     */
+    @Test
+    fun `accepts a trailing comma in a parameter list`() {
+        val declaration = function(
+            """
+            class Sample {
+                static {
+                    fun add(
+                        a: int,
+                        b: int,
+                    ): int {
+                        return a + b
+                    }
+                }
+            }
+            """.trimIndent() + "\n",
+            "add",
+        )
+        assertEquals(listOf("a", "b"), declaration.parameters.map { it.name })
+    }
+
+    /** A constructor's parameter list wraps the same way, since it is the same parse. */
+    @Test
+    fun `accepts a constructor parameter list spread over several lines`() {
+        val declaration = classOf(
+            """
+            class Point {
+                constructor(
+                    x: int,
+                    y: int,
+                ) {
+                    this.x = x
+                    this.y = y
+                }
+
+                val x: int
+                val y: int
+            }
+            """.trimIndent() + "\n",
+        )
+        assertEquals(listOf("x", "y"), declaration.constructors.single().parameters.map { it.name })
+    }
+
+    /** Call arguments already wrapped; the trailing comma they leave behind is now accepted too. */
+    @Test
+    fun `accepts a trailing comma in an argument list`() {
+        val declaration = function(
+            """
+            class Sample {
+                static {
+                    fun call() {
+                        println(
+                            1,
+                            2,
+                        )
+                    }
+                }
+            }
+            """.trimIndent() + "\n",
+            "call",
+        )
+        assertTrue(declaration.body != null, "the body should have parsed")
+    }
+
+    /** An `emit` clause wraps like any other bracketed list, trailing comma included. */
+    @Test
+    fun `accepts an emit clause spread over several lines`() {
+        val declaration = function(
+            """
+            class Sample {
+                static {
+                    fun source(): int {
+                        return 1
+                    } emit [
+                        int,
+                        int,
+                    ]
+                }
+            }
+            """.trimIndent() + "\n",
+            "source",
+        )
+        assertEquals(2, declaration.emitTypes.size)
+    }
 }
