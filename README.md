@@ -36,7 +36,7 @@ Tasks are module-qualified now that there is more than one module.
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # Tests.
-./gradlew :neko:test                     # the compiler: 505 tests
+./gradlew :neko:test                     # the compiler: 513 tests
 ./gradlew :plugin:idea:test              # the plugin: 51 tests, in a real IDE instance
 
 # The compiler as one self-contained jar.
@@ -1017,6 +1017,43 @@ The three keywords are not interchangeable, and the difference is the whole desi
 A `scratch` is matched to a handler by its `emit` signature alone, so **each signature may have only
 one handler in the program** —two would be indistinguishable from a site's point of view, and that is
 reported rather than resolved by declaration order.
+
+#### Leaving the value out
+
+The `v` in `nyan v` and `yield v` is optional, and **which form is right depends on where it is
+written**: a handler answers the `scratch` sites that reach it, so whether a value travels out is
+decided by those sites, not by the handler's own preference.
+
+```neko
+class Neko() {
+  fun risky(): int {
+    return 1 / 0
+  }
+
+  fun guard() {
+    // Nothing here reads an answer, so the handler below is `void`.
+    try risky() scratch 5
+    println("after")
+  } emit [int]
+
+  fun invoker() {
+    try guard() { x ->
+      // A bare `nyan`: answers nothing, which is right — no site wants anything.
+      nyan
+    }
+  }
+}
+```
+
+* **A bare `nyan`** is the `return` of a `void` handler. It is accepted exactly when no reaching
+  `scratch` site wants a value, and refused with "this 'nyan' leaves no value, but the 'scratch' sites
+  reaching this handler take `int`" when one does.
+* **A bare `yield`** abandons the call without producing anything. It is accepted in a `try`
+  statement, which is worth nothing, and refused where the construct is worth a value — the other path
+  would produce one and this path would not.
+
+Writing the value anyway is still allowed where nothing reads it (`nyan 0` in a `void` handler is a
+plain `return` of `0`), so the relaxation never invalidates a program that already compiles.
 
 #### Catching a thrown exception with `try ... scratch`
 

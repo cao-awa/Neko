@@ -510,10 +510,23 @@ class ReturnStatement(
     override val span: Span,
 ) : Statement
 
-/** `yield x + y` — the value produced by a lambda body. */
+/**
+ * `yield x + y` — produces the value of the construct this `yield` answers.
+ *
+ * [value] is what the `yield` carries, and it is **optional**. A bare `yield` carries nothing, which
+ * is how a handler abandons a call whose `try` wanted no value:
+ *
+ * ```neko
+ * try call(...) { a -> yield }    // leave through the try, answering nothing
+ * ```
+ *
+ * Writing a value where nothing reads it is a mistake rather than a convenience, and so is omitting
+ * one where something is waiting, so the analyzer requires the two to agree: a bare `yield` only in a
+ * `try` that is worth nothing, and a valued one only in a `try` that is worth something.
+ */
 class YieldStatement(
     val keywordSpan: Span,
-    val value: Expression,
+    val value: Expression?,
     override val span: Span,
 ) : Statement
 
@@ -798,12 +811,16 @@ class ScratchExpression(
  * `nyan value` — leaves the enclosing `try` handler, answering [value].
  *
  * A handler is generated as a method whose return type the reaching `scratch` sites fix, so a `nyan`
- * is a `return` from that method. A handler that writes no `nyan` had better `yield` on every path:
- * `yield` throws, so it never falls off the end.
+ * is a `return` from that method. [value] is **optional**: a bare `nyan` answers nothing, which is
+ * exactly right for a handler whose `scratch` sites all discard the answer — the method is `void` and
+ * a bare `nyan` is its plain `return`.
+ *
+ * A handler that writes no `nyan` at all had better `yield` on every path: `yield` throws, so it never
+ * falls off the end.
  */
 class NyanStatement(
     val keywordSpan: Span,
-    val value: Expression,
+    val value: Expression?,
     override val span: Span,
 ) : Statement
 

@@ -1599,13 +1599,22 @@ class BytecodeGenerator(
      * instead — see [emitYield].
      */
     private fun emitNyan(statement: NyanStatement, scope: MethodScope) {
-        emitExpression(statement.value, scope)
+        val value = statement.value
         val returnType = scope.returnType
-        emitStoreValue(statement.value.type, returnType, scope.mv)
+        if (value == null) {
+            // A bare `nyan` answers nothing, so the handler is `void` there and this is its plain
+            // `return`. Analysis refuses a bare `nyan` in a handler whose sites want a value, so the
+            // method really is `void` whenever this arm runs.
+            emitPurrReleaseOnExit(scope)
+            scope.mv.visitInsn(RETURN)
+            return
+        }
+        emitExpression(value, scope)
+        emitStoreValue(value.type, returnType, scope.mv)
         // A `nyan` leaves the handler, and the handler runs inside the `try`'s protected region, so
         // any `purr` block entered inside it has to be released before the method returns.
         emitPurrReleaseOnExit(scope)
-        scope.mv.visitInsn(returnOpcode(if (returnType === VoidType || returnType === ErrorType) statement.value.type else returnType))
+        scope.mv.visitInsn(returnOpcode(if (returnType === VoidType || returnType === ErrorType) value.type else returnType))
     }
 
     /**
@@ -1621,11 +1630,43 @@ class BytecodeGenerator(
      * return.
      */
     private fun emitYield(statement: YieldStatement, scope: MethodScope) {
-        emitExpression(statement.value, scope)
+        val value = statement.value
+        // A bare `yield` carries nothing. In a lambda it still has to `return` — answering whatever
+        // the lambda answers — so a `void` lambda is the only place it fits, and analysis has checked
+        // that. In the throwing arm it carries `null` as the exception's payload, which no `try` will
+        // read because only a value-wanting `try` accepts a valued `yield` in the first place.
+        if (value == null) {
+            val nya = scope.nyaResult
+            if (nya != null) {
+                scope.mv.visitInsn(ACONST_NULL)
+                scope.mv.visitVarInsn(ASTORE, nya.slot)
+                scope.mv.visitJumpInsn(GOTO, nya.end)
+                return
+            }
+            if (scope.lambdaIdentity != null && !scope.extractorResult) {
+                emitPurrReleaseOnExit(scope)
+                scope.mv.visitInsn(RETURN)
+                return
+            }
+            val mv = scope.mv
+            val exceptionClass = emitYieldExceptionClass()
+            val payloadSlot = scope.allocateTemp(ObjectType)
+            mv.visitInsn(ACONST_NULL)
+            mv.visitVarInsn(ASTORE, payloadSlot)
+            mv.visitTypeInsn(NEW, exceptionClass)
+            mv.visitInsn(DUP)
+            mv.visitVarInsn(ALOAD, payloadSlot)
+            mv.visitMethodInsn(INVOKESPECIAL, exceptionClass, "<init>", "(Ljava/lang/Object;)V", false)
+            emitPurrReleaseOnExit(scope)
+            mv.visitInsn(ATHROW)
+            return
+        }
+
+        emitExpression(value, scope)
 
         val nya = scope.nyaResult
         if (nya != null) {
-            emitStoreValue(statement.value.type, ObjectType, scope.mv)
+            emitStoreValue(value.type, ObjectType, scope.mv)
             scope.mv.visitVarInsn(ASTORE, nya.slot)
             scope.mv.visitJumpInsn(GOTO, nya.end)
             return
@@ -1634,11 +1675,11 @@ class BytecodeGenerator(
         // A `yield` in a lambda is that lambda's return, whatever it is worth; a `yield` in a `try`
         // handler leaves through the `try` instead, which is the throwing arm below.
         if (scope.lambdaIdentity != null && !scope.extractorResult) {
-            emitStoreValue(statement.value.type, scope.returnType, scope.mv)
+            emitStoreValue(value.type, scope.returnType, scope.mv)
             val target = scope.returnType
             emitPurrReleaseOnExit(scope)
             scope.mv.visitInsn(
-                returnOpcode(if (target === VoidType || target === ErrorType) statement.value.type else target),
+                returnOpcode(if (target === VoidType || target === ErrorType) value.type else target),
             )
             return
         }
@@ -2855,7 +2896,12 @@ class BytecodeGenerator(
             firstSlot = 0,
             static = true,
             returnType = returnType,
-            extractorResult = construct.yieldedType != null,
+            // Whether a `yield` here leaves through the `try` rather than returning from this method.
+            // It used to be decided by `yieldedType != null`, which is now wrong: a bare `yield` in a
+            // statement-position `try` carries no value, so `yieldedType` stays null while the `yield`
+            // must still throw. What matters is that this method *is* a `try` handler, not whether
+            // anything ends up being carried out of it.
+            extractorResult = true,
         )
 
         // The parameters arrive typed — no `Object[]` to unpack — so each is simply reserved in
@@ -4465,7 +4511,7 @@ class BytecodeGenerator(
 
             is ExpressionStatement -> collectLocalReferences(node.expression, into)
             is ReturnStatement -> node.value?.let { collectLocalReferences(it, into) }
-            is YieldStatement -> collectLocalReferences(node.value, into)
+            is YieldStatement -> node.value?.let { collectLocalReferences(it, into) }
             // A `nya`'s blocks are emitted inline, in whatever method the construct is written in, so
             // whatever they read from an enclosing scope has to travel as far as the construct does 鈥?            // which is the same reason a nested block's reads are collected.
             is NyaExpression -> {

@@ -1425,11 +1425,18 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
     }
 
     /** `yield expression` */
+    /**
+     * `yield` on its own, or `yield value`.
+     *
+     * The value is optional because a `yield` may answer nothing: a handler that abandons a call whose
+     * `try` is worth nothing has nothing to carry. Whether the form is right for the place it is
+     * written depends on what the surrounding construct wants, which is the analyzer's call.
+     */
     private fun parseYieldStatement(): YieldStatement? {
         val keyword = advance()
         if (atStatementEnd()) {
-            error("'yield' requires a value to produce", keyword.span)
-            return null
+            // A bare `yield` answers nothing at all.
+            return YieldStatement(keyword.span, value = null, span = keyword.span)
         }
         val value = parseExpression() ?: run {
             synchronizeToStatement()
@@ -1988,16 +1995,18 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
     }
 
     /** `nyan value` — leaves the enclosing `try` handler, answering the value. */
+    /**
+     * `nyan` on its own, or `nyan value`.
+     *
+     * The value is optional: a `nyan` answers whatever the `scratch` sites reaching this handler asked
+     * for, and when they ask for nothing — every one of them discarding the answer — a bare `nyan` is
+     * the plain `return` of a `void` method. The analyzer checks that the two agree, so a bare `nyan`
+     * where a value is wanted is reported there rather than guessed at here.
+     */
     private fun parseNyanStatement(): NyanStatement? {
         val keyword = advance()
         if (atStatementEnd()) {
-            error(
-                "'nyan' must be followed by the value the enclosing 'try' handler answers; " +
-                    "write 'yield' to leave through the 'try' that declared it instead",
-                current().span,
-            )
-            synchronizeToStatement()
-            return null
+            return NyanStatement(keyword.span, value = null, span = keyword.span)
         }
 
         val value = parseExpression() ?: run {

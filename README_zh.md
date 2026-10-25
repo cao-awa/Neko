@@ -35,7 +35,7 @@ Neko 是一门用来做编译器实验的玩具 JVM 语言：它有类、接口�
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # 测试。
-./gradlew :neko:test                     # 编译器：505 个测试
+./gradlew :neko:test                     # 编译器：513 个测试
 ./gradlew :plugin:idea:test              # 插件：51 个测试，跑在真实 IDE 实例里
 
 # 把编译器打成单个自包含 jar。
@@ -930,6 +930,41 @@ class Neko() {
 
 `scratch` 仅凭它的 `emit` 签名匹配 handler，所以**每个签名在整个程序里只能有一个 handler**——
 两个从调用点的角度看是无法区分的，这一点会被报出来，而不是按声明顺序解决。
+
+#### 省略值
+
+`nyan v` 和 `yield v` 里的 `v` 可以省略，而**哪种形式正确取决于写在哪里**：handler 应答的是到达它
+的那些 `scratch` 点，所以值能不能带出去由那些点决定，而不是由 handler 自己的偏好决定。
+
+```neko
+class Neko() {
+  fun risky(): int {
+    return 1 / 0
+  }
+
+  fun guard() {
+    // 这里没有任何东西读取答案，所以下面那个 handler 是 `void` 的。
+    try risky() scratch 5
+    println("after")
+  } emit [int]
+
+  fun invoker() {
+    try guard() { x ->
+      // 裸 `nyan`：什么都不应答，这是对的——没有调用点需要任何值。
+      nyan
+    }
+  }
+}
+```
+
+* **裸 `nyan`** 是 `void` handler 的 `return`。只有在没有任何到达的 `scratch` 点需要值时才被接受；
+  如果有，就会报 “this 'nyan' leaves no value, but the 'scratch' sites reaching this handler take
+  `int`”。
+* **裸 `yield`** 放弃这次调用，什么也不产生。它在语句形式的 `try` 里被接受（那种 `try` worth
+  nothing），在结构本身有值的地方被拒绝——另一条路径会产生一个值，而这条路径不会。
+
+在没人读取的地方仍然可以照旧写值（`void` handler 里的 `nyan 0` 就是返回 `0` 的普通 `return`），
+所以这次放宽不会让任何已经能编译的程序失效。
 
 #### 用 `try ... scratch` 捕获抛出的异常
 

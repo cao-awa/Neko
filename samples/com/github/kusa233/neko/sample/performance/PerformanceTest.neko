@@ -4,10 +4,10 @@ class PerformanceTest {
     static {
         fun main() {
             start: long = System.currentTimeMillis()
-            for (i: int = 0; i < 100; i++) {
-                Thread.sleep(1L)
+            for (i: int = 0; i < 10000000; i++) {
+                v: int = i * i
             }
-            println(System.currentTimeMillis() - start)
+            println("Test used time " + (System.currentTimeMillis() - start) + "ms")
         }
     }
 }

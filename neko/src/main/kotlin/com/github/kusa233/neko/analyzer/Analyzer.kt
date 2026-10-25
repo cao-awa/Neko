@@ -1743,10 +1743,18 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * a `nyan` is the `return` from it. Its type must match what the `scratch` sites reaching that
      * handler take, which [linkScratchHandlers] settles once all of them have been seen.
      */
+    /**
+     * `nyan` or `nyan value` — leaves the handler, optionally answering a value.
+     *
+     * A bare `nyan` answers nothing, which is what a handler should write when every `scratch` site
+     * reaching it discards the answer: the generated method is then `void` and the `nyan` is a plain
+     * `return`. A valued one answers the type the sites asked for.
+     */
     private fun analyzeNyan(statement: NyanStatement) {
+        val value = statement.value
         val handler = currentExtractor
         if (handler == null) {
-            analyzeExpression(statement.value)
+            value?.let { analyzeExpression(it) }
             diagnostics.error(
                 "'nyan' can only be used directly inside the 'try' handler it leaves; write " +
                     "'return' to leave the enclosing function, or 'yield' to answer the 'try' itself",
@@ -1758,11 +1766,15 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // The sites that fix this handler's return type have not been linked yet — they may not even
         // have been analyzed — so the answer is only checked for well-formedness here and compared in
         // `linkScratchHandlers`.
-        pendingNyanAnswers += handler to analyzeExpression(statement.value)
+        //
+        // A bare `nyan` is recorded as `null` rather than `VoidType`, because the two are different
+        // mistakes: `null` means the author asked for nothing, while `VoidType` is a valued `nyan` of
+        // a `void` expression, which is separately refused.
+        pendingNyanAnswers += handler to value?.let { analyzeExpression(it) }
     }
 
     /** Every `nyan`, with what it answered, held until its handler's return type is known. */
-    private val pendingNyanAnswers = mutableListOf<Pair<ExtractorTry, NekoType>>()
+    private val pendingNyanAnswers = mutableListOf<Pair<ExtractorTry, NekoType?>>()
 
     /**
      * Reports a function whose `emit` clause does no work.
@@ -1865,10 +1877,17 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         }
 
         // Now that each handler's return type is fixed, the `nyan`s written before it was known can
-        // be compared against it.
+        // be compared against it. A bare `nyan` answers nothing, so it only fits a handler nothing
+        // reads — anything else would be a `void` return from a method declared to answer a value.
         for ((handler, answer) in pendingNyanAnswers) {
             val wanted = handler.handler.returnType ?: continue
-            if (!isAssignable(answer, wanted)) {
+            if (answer == null) {
+                diagnostics.error(
+                    "this 'nyan' leaves no value, but the 'scratch' sites reaching this handler take " +
+                        wanted.displayName,
+                    handler.extractorBody.span,
+                )
+            } else if (!isAssignable(answer, wanted)) {
                 diagnostics.error(
                     "this 'nyan' answers ${answer.displayName} but the 'scratch' sites reaching this " +
                         "handler take ${wanted.displayName}",
@@ -1881,8 +1900,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // answering that value — otherwise the `nyan` would be a `return` of an `int` from a `void`
         // method, which the verifier rejects. The type comes from the `nyan` itself, and comes second
         // in precedence: a site that *does* ask decides, and a disagreement was already reported above.
+        // A bare `nyan` fixes nothing: it answers nothing, so the handler stays `void`.
         for ((handler, answer) in pendingNyanAnswers) {
-            if (handler.handler.returnType == null) handler.handler.returnType = answer
+            if (handler.handler.returnType == null && answer != null) handler.handler.returnType = answer
         }
     }
 
@@ -2528,21 +2548,47 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         }
 
         if (extractor != null && !extractor.acceptsYield) {
-            // `try f(...) { a -> yield 1 }` in statement position is worth nothing, so a `yield`
-            // there would be a value nobody could ever read.
-            diagnostics.error(
-                "a 'try' statement is worth nothing, so its extractor cannot 'yield'; write " +
-                    "'result: T = try ...' to keep the value, or use 'return' to leave the " +
-                    "enclosing function",
-                statement.keywordSpan,
-            )
+            // `try f(...) { a -> yield 1 }` in statement position is worth nothing, so a `yield` with
+            // a value there would be a value nobody could ever read. A *bare* `yield` is a different
+            // matter: it carries nothing, so it is exactly how a handler abandons a call whose `try`
+            // wanted no answer.
+            if (statement.value != null) {
+                diagnostics.error(
+                    "a 'try' statement is worth nothing, so its extractor cannot 'yield' a value; " +
+                        "write a bare 'yield' to leave it, or 'result: T = try ...' to keep the value",
+                    statement.keywordSpan,
+                )
+            }
+        }
+
+        // A bare `yield` carries nothing, so there is no expression to analyze and no result type to
+        // fix. It is accepted precisely where the construct it leaves is worth nothing, which is
+        // checked below.
+        val value = statement.value
+        if (value == null) {
+            // `v: int = try f() { a -> yield }` — the construct is worth a value, so a `yield` that
+            // produces none leaves one path of it without an answer. A bare `yield` in a `try`
+            // statement, or in a function with an `emit` clause, is fine: those are worth nothing,
+            // and this is exactly where the `yield` says so.
+            if (nya != null ||
+                (extractor != null && extractor.acceptsYield) ||
+                (lambda != null && lambda.expectedReturnType != null)
+            ) {
+                diagnostics.error(
+                    "'yield' must be followed by the value the enclosing ${constructName(nya, extractor, lambda)} " +
+                        "produces, since that construct is worth one; leave it out only where nothing " +
+                        "reads it",
+                    statement.keywordSpan,
+                )
+            }
+            return
         }
 
         // A `try` extractor takes precedence over a lambda, and a `nya` value form takes precedence
         // over both: a `yield` inside one belongs to the innermost construct that is waiting for a
         // value, which is the one whose block the statement is written in.
         val expected = nya?.expected ?: extractor?.yieldedType ?: lambda?.expectedReturnType
-        val valueType = analyzeExpression(statement.value, expected)
+        val valueType = analyzeExpression(value, expected)
 
         when {
             nya != null -> {
@@ -2554,7 +2600,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                     diagnostics.error(
                         "this 'yield' produces ${valueType.displayName} but the other block of the " +
                             "same 'nya' produces ${alreadyYielded.displayName}",
-                        statement.value.span,
+                        value.span,
                     )
                 }
             }
@@ -2567,7 +2613,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                     diagnostics.error(
                         "this 'yield' produces ${valueType.displayName} but an earlier 'yield' in " +
                             "the same 'try' extractor produces ${alreadyYielded.displayName}",
-                        statement.value.span,
+                        value.span,
                     )
                 }
             }
@@ -2587,11 +2633,23 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                             "this 'yield' produces ${valueType.displayName} but an earlier 'yield' " +
                                 "in the same lambda produces ${expected.displayName}"
                         },
-                        statement.value.span,
+                        value.span,
                     )
                 }
             }
         }
+    }
+
+    /** Names the construct a `yield` answers, for a diagnostic about a value it left out. */
+    private fun constructName(
+        nya: NyaValue?,
+        extractor: ExtractorTry?,
+        lambda: LambdaState?,
+    ): String = when {
+        nya != null -> "'nya'"
+        extractor != null -> "'try'"
+        lambda != null -> "lambda"
+        else -> "construct"
     }
 
     private fun analyzeIf(statement: IfStatement) {
