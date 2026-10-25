@@ -36,7 +36,7 @@ Tasks are module-qualified now that there is more than one module.
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # Tests.
-./gradlew :neko:test                     # the compiler: 491 tests
+./gradlew :neko:test                     # the compiler: 505 tests
 ./gradlew :plugin:idea:test              # the plugin: 51 tests, in a real IDE instance
 
 # The compiler as one self-contained jar.
@@ -1017,6 +1017,101 @@ The three keywords are not interchangeable, and the difference is the whole desi
 A `scratch` is matched to a handler by its `emit` signature alone, so **each signature may have only
 one handler in the program** —two would be indistinguishable from a site's point of view, and that is
 reported rather than resolved by declaration order.
+
+#### Catching a thrown exception with `try ... scratch`
+
+The `try` spellings above all **declare** a handler. The other question you can ask is what should
+happen when the call **fails**, and that is written by naming an existing handler after the call
+instead of writing a block:
+
+```neko
+class Neko() {
+  fun risky(d: int): int {
+    return 100 / d
+  }
+
+  fun guarded(): int {
+    // `risky(0)` throws, so the handler answers; the call's own return value is not used.
+    v: int = try risky(0) scratch 1, 2
+    return v
+  } emit [int, int]
+
+  fun invoker() {
+    // A thrown exception enters the handler, which answers `1 + 2`.
+    answer: int = try guarded() { a, b -> nyan a + b }
+    println(answer)   // 3
+  }
+}
+```
+
+A `try` whose call returns normally keeps the call's value instead:
+
+```neko
+class Neko() {
+  fun risky(d: int): int {
+    return 100 / d
+  }
+
+  fun guarded(): int {
+    // `risky(2)` returns 50, so the construct is worth the call's value — `50`.
+    v: int = try risky(2) scratch 9
+    return v
+  } emit [int]
+
+  fun invoker() {
+    answer: int = try guarded() { a -> nyan a * 2 }
+    println(answer)   // 50, not 18 — nothing was thrown
+  }
+}
+```
+
+The two spellings are alternatives, not layers. `try call(...) { a, b -> ... }` says **what to do when
+this call scratches**; `try call(...) scratch v1, v2` says **what to do when this call throws**. So:
+
+| written | catches | the construct is worth |
+| --- | --- | --- |
+| `try call(...) { a -> ... }` | the `yield` thrown by the handler it declares | the call's return value |
+| `try call(...) scratch v1, v2` | the `java.lang.Exception` the call threw | the call's return value when it returned, the handler's `nyan` answer when it threw |
+
+Four rules make the second form well defined:
+
+* **The `scratch` is what names the destination.** It is an ordinary `scratch`, so the enclosing
+  function must declare an `emit` clause and the values must match it — that clause is exactly what
+  says which handler out there receives the failure. A `try ... scratch` in a function with no `emit`
+  clause is refused for the same reason a bare `scratch` is.
+* **The exception object is not readable.** The handler takes the values written after `scratch` and
+  nothing else, so `scratch 1, 2` sends exactly the two values the author wrote. The exception is
+  only the trigger.
+* **Both paths must agree in type.** The call's return value and the handler's `nyan` answer are two
+  answers to one question, so they have to be the same type. That also means a `void` call cannot be
+  used as a value — there would be nothing on the returning path — while the statement form
+  `try call() scratch 1` is fine with one.
+* **Only `Exception` is caught, not `Error`.** A handler is ordinary program logic; letting it
+  swallow `OutOfMemoryError` or `StackOverflowError` would turn a fatal failure into a wrong answer,
+  so those still propagate.
+
+A `yield` on its way out is **not** a failure and passes straight through — the `catch` rethrows it
+untouched, so wrapping a call in this form never diverts an effect travelling to another `try`:
+
+```neko
+class Neko() {
+  fun inner(): int {
+    return scratch 21
+  } emit [int]
+
+  fun outer(): int {
+    // The `yield` `inner` throws passes through this form and reaches `invoker`'s handler, so this
+    // is answered by `nyan a + 1` and not by the `scratch 99` written here.
+    w: int = try inner() scratch 99
+    return w
+  } emit [int]
+
+  fun invoker() {
+    answer: int = try outer() { a -> nyan a + 1 }
+    println(answer)   // 22
+  }
+}
+```
 
 ### Checking what the program believes
 

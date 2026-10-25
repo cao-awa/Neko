@@ -35,7 +35,7 @@ Neko 是一门用来做编译器实验的玩具 JVM 语言：它有类、接口�
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # 测试。
-./gradlew :neko:test                     # 编译器：491 个测试
+./gradlew :neko:test                     # 编译器：505 个测试
 ./gradlew :plugin:idea:test              # 插件：51 个测试，跑在真实 IDE 实例里
 
 # 把编译器打成单个自包含 jar。
@@ -930,6 +930,96 @@ class Neko() {
 
 `scratch` 仅凭它的 `emit` 签名匹配 handler，所以**每个签名在整个程序里只能有一个 handler**——
 两个从调用点的角度看是无法区分的，这一点会被报出来，而不是按声明顺序解决。
+
+#### 用 `try ... scratch` 捕获抛出的异常
+
+上面的 `try` 写法都是**声明**一个 handler。另一个可以问的问题是调用**失败**时该怎么办，写法的
+方式是在调用后面写一个已有 handler 的名字，而不是写一个块：
+
+```neko
+class Neko() {
+  fun risky(d: int): int {
+    return 100 / d
+  }
+
+  fun guarded(): int {
+    // `risky(0)` 抛异常，所以由 handler 应答；调用自己的返回值不会被用到。
+    v: int = try risky(0) scratch 1, 2
+    return v
+  } emit [int, int]
+
+  fun invoker() {
+    // 抛出异常，于是进入 handler，它应答 `1 + 2`。
+    answer: int = try guarded() { a, b -> nyan a + b }
+    println(answer)   // 3
+  }
+}
+```
+
+如果调用正常返回，这个结构保留调用自己的值：
+
+```neko
+class Neko() {
+  fun risky(d: int): int {
+    return 100 / d
+  }
+
+  fun guarded(): int {
+    // `risky(2)` 返回 50，所以这个结构的值就是调用自己的值——`50`。
+    v: int = try risky(2) scratch 9
+    return v
+  } emit [int]
+
+  fun invoker() {
+    answer: int = try guarded() { a -> nyan a * 2 }
+    println(answer)   // 50，不是 18——什么都没抛出
+  }
+}
+```
+
+这两种写法是二选一，不是叠加。`try call(...) { a, b -> ... }` 说的是**这次调用 scratch 时做什么**；
+`try call(...) scratch v1, v2` 说的是**这次调用抛异常时做什么**。所以：
+
+| 写法 | 捕获 | 这个结构的值 |
+| --- | --- | --- |
+| `try call(...) { a -> ... }` | 它声明的 handler 所抛出的 `yield` | 调用的返回值 |
+| `try call(...) scratch v1, v2` | 调用抛出的 `java.lang.Exception` | 正常返回时是调用的返回值，抛出时是 handler `nyan` 的答案 |
+
+四条规则让第二种形式有明确的含义：
+
+* **`scratch` 才是命名目的地的东西。** 它是一个普通的 `scratch`，所以所在函数必须声明 `emit`
+  子句，且取值必须匹配——那个子句正是"外面哪个 handler 接收这次失败"的说明。在没有 `emit` 子句的
+  函数里写 `try ... scratch` 会被拒绝，理由和裸 `scratch` 一样。
+* **异常对象不可读。** handler 只接收写在 `scratch` 后面的值，别的什么都不接收，所以
+  `scratch 1, 2` 送出的就是作者写的那两个值。异常只是触发器。
+* **两条路径的类型必须一致。** 调用的返回值和 handler `nyan` 的答案是同一个问题的两个答案，所以
+  它们必须是同一个类型。这也意味着 `void` 调用不能当作值使用——返回值那条路径上没有东西——而语句
+  形式 `try call() scratch 1` 则完全可以用 `void` 调用。
+* **只捕获 `Exception`，不捕获 `Error`。** handler 是普通的程序逻辑；让它吞掉 `OutOfMemoryError`
+  或 `StackOverflowError` 会把致命失败变成一个错误答案，所以这些仍然向上传播。
+
+正在离开的 `yield` **不是**失败，会原样穿过——`catch` 会不加处理地重新抛出它，所以用这个形式包住
+一个调用，永远不会把发往另一个 `try` 的 effect 改道：
+
+```neko
+class Neko() {
+  fun inner(): int {
+    return scratch 21
+  } emit [int]
+
+  fun outer(): int {
+    // `inner` 抛出的 `yield` 穿过这个形式到达 `invoker` 的 handler，所以结果由 `nyan a + 1` 应答，
+    // 而不是这里写的 `scratch 99`。
+    w: int = try inner() scratch 99
+    return w
+  } emit [int]
+
+  fun invoker() {
+    answer: int = try outer() { a -> nyan a + 1 }
+    println(answer)   // 22
+  }
+}
+```
 
 ### 检验程序的假设
 

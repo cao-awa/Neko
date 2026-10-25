@@ -461,6 +461,10 @@ class BytecodeGenerator(
             is AssignmentStatement -> collectPurrLocks(statement.value, used)
             is IndexAssignmentStatement -> collectPurrLocks(statement.value, used)
             is NyanStatement -> collectPurrLocks(statement.value, used)
+            is TryScratchStatement -> {
+                collectPurrLocks(statement.call, used)
+                collectPurrLocks(statement.scratch, used)
+            }
         }
     }
 
@@ -1421,6 +1425,7 @@ class BytecodeGenerator(
             is WhenStatement -> emitWhen(statement, scope)
             is NyanStatement -> emitNyan(statement, scope)
             is TryStatement -> emitTry(statement, scope)
+            is TryScratchStatement -> emitTryScratch(statement, scope, resultSlot = null)
             is PurrStatement -> emitPurr(statement, scope)
             is IndexAssignmentStatement -> emitIndexAssignment(statement, scope)
         }
@@ -2390,6 +2395,9 @@ class BytecodeGenerator(
         // exception out, which is exactly why the attribute is not wanted here. The handler body is a
         // method of its own, so what it does is not this method's business either.
         is TryStatement -> false
+        // This form catches `Exception` and rethrows a `yield` untouched, so a `yield` out of the call
+        // still leaves this method — but the `scratch` itself cannot produce one.
+        is TryScratchStatement -> call.reachesYield()
         else -> false
     }
 
@@ -2418,6 +2426,7 @@ class BytecodeGenerator(
         is IndexExpression -> array.reachesYield() || index.reachesYield()
         is MemberAccessExpression -> receiver.reachesYield()
         is ScratchExpression -> values.any { it.reachesYield() }
+        is TryScratchExpression -> call.reachesYield() || scratch.reachesYield()
         else -> false
     }
 
@@ -2572,6 +2581,129 @@ class BytecodeGenerator(
             mv.visitVarInsn(ALOAD, 0)
             mv.visitFieldInsn(GETFIELD, scope.owner, lockField, descriptor)
         }
+    }
+
+    /**
+     * `r: int = try f() scratch 1, 2` — catch a Java exception and answer it with a handler's result.
+     *
+     * The slot holds a boxed value from either path: `f()`'s return value when it returned, and what
+     * the handler `nyan`ed when it threw. Boxing makes one local serve both, whatever their JVM types.
+     */
+    private fun emitTryScratchExpression(expression: TryScratchExpression, scope: MethodScope) {
+        val mv = scope.mv
+        val resultSlot = scope.allocateTemp(ObjectType)
+        emitTryScratch(expression, scope, resultSlot)
+
+        mv.visitVarInsn(ALOAD, resultSlot)
+        val type = expression.type
+        if (type == VoidType || type === ErrorType) {
+            // Analysis rejected this; a null of the erased type keeps the consumer verifiable.
+            mv.visitInsn(POP)
+            mv.visitInsn(ACONST_NULL)
+        } else {
+            emitUnbox(type, mv)
+        }
+    }
+
+    /**
+     * The `try`/`catch` both `try call() scratch ...` forms share.
+     *
+     * This is the mirror image of [emitExtractorTry]: there the `catch` exists to receive a `yield`
+     * from a handler *this* `try` declared, while here it exists to receive a **Java exception** the
+     * call threw, and the handler it then enters was declared by some other `try` entirely. So the
+     * two directions of the same mechanism meet in one place:
+     *
+     *  * a `yield` escaping the call is **rethrown untouched**. It is not a failure — it is the effect
+     *    mechanism travelling to whichever `try` declared the handler it belongs to — and catching it
+     *    here would silently turn another construct's answer into this one's failure. `EmitYieldException`
+     *    is an `Exception`, so without this test the catch-all below would swallow it.
+     *  * everything else is the failure this construct is for, so the `scratch` runs and its handler's
+     *    `nyan` answer becomes the construct's value. That answer arrives here rather than at the
+     *    `try` that declared the handler, because *this* site is the one that entered it.
+     *
+     * [resultSlot] collects the value — the call's return value on the normal path, the handler's
+     * answer on the failure path — or is `null` when the construct is a statement and discards both.
+     */
+    private fun emitTryScratch(construct: TryScratch, scope: MethodScope, resultSlot: Int?) {
+        val mv = scope.mv
+        val exceptionClass = emitYieldExceptionClass()
+
+        val start = Label()
+        val end = Label()
+        val caught = Label()
+        val after = Label()
+
+        // `java.lang.Exception` rather than `Throwable`: a failure the program can handle is an
+        // `Exception`, while an `Error` such as `OutOfMemoryError` is not something a handler should
+        // be allowed to swallow and carry on from.
+        //
+        // The slot holding the caught object is allocated *before* the protected range opens, exactly
+        // as the `yield`-catching form does: a slot first introduced inside the `try` range has no
+        // stack-map entry at the catch label, and ASM then fails to merge the frames.
+        val thrownSlot = scope.allocateTemp(ThrowableType)
+
+        mv.visitTryCatchBlock(start, end, caught, "java/lang/Exception")
+
+        mv.visitLabel(start)
+        emitExpression(construct.call, scope)
+        if (resultSlot == null) {
+            popIfValue(construct.call.type, mv)
+        } else {
+            if (construct.call.type != VoidType && construct.call.type !== ErrorType) {
+                emitBox(construct.call.type, mv)
+            } else {
+                // Analysis reported a `void` call used as a value; a null keeps the method verifiable.
+                mv.visitInsn(ACONST_NULL)
+            }
+            mv.visitVarInsn(ASTORE, resultSlot)
+        }
+        mv.visitLabel(end)
+        mv.visitJumpInsn(GOTO, after)
+
+        mv.visitLabel(caught)
+        mv.visitVarInsn(ASTORE, thrownSlot)
+        markLine(mv, construct.scratch)
+
+        // A `yield` on its way out is not this construct's failure — rethrow it so it reaches the
+        // `try` that declared the handler it belongs to. `EmitYieldException` is a checked
+        // `Exception`, so without this the catch-all below would swallow another construct's answer
+        // and turn it into this one's failure.
+        //
+        // The test is written as two separate `if`s rather than an `INSTANCEOF`/`IFEQ` pair over one
+        // `ALOAD`, because every branch here has to leave the operand stack empty: the handler body
+        // that follows may be a `RETURN`, and a leftover value on the stack would make the frame
+        // merge fail when ASM computes the stack map.
+        mv.visitVarInsn(ALOAD, thrownSlot)
+        mv.visitTypeInsn(INSTANCEOF, exceptionClass)
+        val notYield = Label()
+        mv.visitJumpInsn(IFEQ, notYield)
+        mv.visitVarInsn(ALOAD, thrownSlot)
+        mv.visitTypeInsn(CHECKCAST, exceptionClass)
+        mv.visitInsn(ATHROW)
+        mv.visitLabel(notYield)
+
+        // The exception object itself is deliberately not passed on: the construct's contract is that
+        // the `scratch` values are what the handler receives, so `try f() scratch 1, 2` sends exactly
+        // the two values the author wrote.
+        //
+        // What `emitScratch` leaves on the stack is the *handler's* return type, not
+        // `scratch.type`: a `ScratchExpression` written as a statement has no expected type of its
+        // own, while the handler it reaches may well answer something. Reading the type off the
+        // scratch here would `POP` nothing while an `int` sits on the stack — which is precisely the
+        // stack-shape disagreement that makes ASM's frame merge fail.
+        emitScratch(construct.scratch, scope)
+        val answered = construct.scratch.handler?.handler?.returnType ?: VoidType
+        if (resultSlot == null) {
+            popIfValue(answered, mv)
+        } else {
+            if (answered != VoidType && answered !== ErrorType) {
+                emitBox(answered, mv)
+            } else {
+                mv.visitInsn(ACONST_NULL)
+            }
+            mv.visitVarInsn(ASTORE, resultSlot)
+        }
+        mv.visitLabel(after)
     }
 
     /**
@@ -2929,6 +3061,7 @@ class BytecodeGenerator(
             is IndexExpression -> emitIndex(expression, scope)
             is NyaExpression -> emitNyaExpression(expression, scope)
             is TryExpression -> emitTryExpression(expression, scope)
+            is TryScratchExpression -> emitTryScratchExpression(expression, scope)
             is ScratchExpression -> emitScratch(expression, scope)
         }
     }
@@ -4424,6 +4557,18 @@ class BytecodeGenerator(
             is TryExpression -> {
                 collectLocalReferences(node.call, into)
                 collectLocalReferences(node.extractorBody, into)
+            }
+
+            // Both halves are emitted inline in this method, so whatever they read from an enclosing
+            // scope travels exactly as far as the construct does.
+            is TryScratchExpression -> {
+                collectLocalReferences(node.call, into)
+                collectLocalReferences(node.scratch, into)
+            }
+
+            is TryScratchStatement -> {
+                collectLocalReferences(node.call, into)
+                collectLocalReferences(node.scratch, into)
             }
 
             // A `purr` block is emitted inline, in this very method, so whatever it reads from an

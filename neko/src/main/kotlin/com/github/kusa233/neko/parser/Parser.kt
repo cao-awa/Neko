@@ -2080,10 +2080,26 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             return null
         }
 
-        // The extractor form. Parsing is restarted from just after the keyword so that a malformed
-        // call is reported against the call itself rather than against the newline that follows it.
+        // Parsing is restarted from just after the keyword so that a malformed call is reported
+        // against the call itself rather than against the newline that follows it.
         index = mark
-        return parseExtractorTry(keyword)
+        return when (val form = parseTryForm(keyword)) {
+            null -> null
+            is TryForm.Handler -> TryStatement(
+                keywordSpan = keyword.span,
+                call = form.parts.call,
+                extractorParameters = form.parts.parameters,
+                extractorBody = form.parts.body,
+                arrowSpan = form.parts.arrowSpan,
+                span = form.parts.span,
+            )
+            is TryForm.Scratch -> TryScratchStatement(
+                keywordSpan = keyword.span,
+                call = form.call,
+                scratch = form.scratch,
+                span = form.span,
+            )
+        }
     }
 
     /**
@@ -2105,22 +2121,80 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
     }
 
     /**
+     * What follows `try call(...)`: a handler block, or a `scratch` naming one declared elsewhere.
+     *
+     * The two are alternatives rather than variants of one shape, because they answer different
+     * questions — "run this when the call scratches" versus "send the call's *failure* to that
+     * handler" — so the parser decides between them on the token after the call and each position
+     * builds its own node from the result.
+     */
+    private sealed class TryForm {
+        /** `try call(...) { a, b -> ... }` — declares a handler. */
+        class Handler(val parts: ExtractorTryParts) : TryForm()
+
+        /** `try call(...) scratch v1, v2` — catches a Java exception and enters an existing handler. */
+        class Scratch(val call: CallExpression, val scratch: ScratchExpression, val span: Span) : TryForm()
+    }
+
+    /**
+     * Parses `try call(...)` and whatever tail followed it.
+     *
+     * The call is parsed once for both forms so that a malformed callee is reported against the call
+     * itself, in the same words, wherever the construct was written.
+     */
+    private fun parseTryForm(keyword: Token): TryForm? {
+        val call = parseExpression() as? CallExpression ?: run {
+            error(
+                "'try' must be followed by a call: either 'try call(...) { values -> ... }' to declare " +
+                    "a handler, or 'try call(...) scratch values' to send a thrown exception to one",
+                current().span,
+            )
+            synchronizeToStatement()
+            return null
+        }
+
+        skipNewlines()
+        // `scratch` names the handler to enter when the call throws, so it replaces the block rather
+        // than following it. No ambiguity with a `scratch` statement written on the next line: a
+        // parenthesised `try call(...)` with no block was never valid, so nothing that parses today
+        // changes meaning here.
+        if (at(TokenType.SCRATCH)) {
+            val scratch = parseScratchExpression() ?: run {
+                synchronizeToStatement()
+                return null
+            }
+            return TryForm.Scratch(call, scratch, Span(source, keyword.span.start, scratch.span.end))
+        }
+
+        val parts = parseExtractorTryBody(keyword, call) ?: return null
+        return TryForm.Handler(parts)
+    }
+
+    /**
      * `try call(args) { a, b -> ... }` in expression position, as in
      * `result: int = try emitTest(true) { a, b -> yield 1 }`.
      *
      * The shape is exactly the statement's; only what the construct is worth differs, which the
      * analyzer decides from the `yield` the extractor body may write.
      */
-    private fun parseExtractorTryExpression(keyword: Token): TryExpression? {
-        val parts = parseExtractorTryParts(keyword) ?: return null
-        return TryExpression(
-            keywordSpan = keyword.span,
-            call = parts.call,
-            extractorParameters = parts.parameters,
-            extractorBody = parts.body,
-            arrowSpan = parts.arrowSpan,
-            span = parts.span,
-        )
+    private fun parseExtractorTryExpression(keyword: Token): Expression? {
+        return when (val form = parseTryForm(keyword)) {
+            null -> null
+            is TryForm.Handler -> TryExpression(
+                keywordSpan = keyword.span,
+                call = form.parts.call,
+                extractorParameters = form.parts.parameters,
+                extractorBody = form.parts.body,
+                arrowSpan = form.parts.arrowSpan,
+                span = form.parts.span,
+            )
+            is TryForm.Scratch -> TryScratchExpression(
+                keywordSpan = keyword.span,
+                call = form.call,
+                scratch = form.scratch,
+                span = form.span,
+            )
+        }
     }
 
     /** The pieces both forms of `try call(...) { a -> ... }` are built from. */
@@ -2135,8 +2209,8 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
     /**
      * Parses `call(args) { a, b -> ... }` after the `try` keyword has been consumed.
      *
-     * Both `try` forms share it so that a malformed extractor is reported once, in the same words,
-     * wherever the construct was written.
+     * Kept for the expression position, which has no `scratch` form of its own to choose between —
+     * it parses the call and then requires the block.
      */
     private fun parseExtractorTryParts(keyword: Token): ExtractorTryParts? {
         val call = parseExpression() as? CallExpression ?: run {
@@ -2149,6 +2223,16 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         }
 
         skipNewlines()
+        return parseExtractorTryBody(keyword, call)
+    }
+
+    /**
+     * Parses the `{ a, b -> ... }` half, given the call that precedes it.
+     *
+     * Split out from [parseExtractorTryParts] so the statement position can choose between this and
+     * the `scratch` form after reading the call once.
+     */
+    private fun parseExtractorTryBody(keyword: Token, call: CallExpression): ExtractorTryParts? {
         if (!expectLeftBrace("'try' extractor")) {
             synchronizeToStatement()
             return null

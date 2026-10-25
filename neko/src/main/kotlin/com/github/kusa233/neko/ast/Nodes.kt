@@ -986,6 +986,64 @@ class TryExpression(
     override val handler = HandlerInfo()
 }
 
+/**
+ * `try call() scratch v1, v2` — runs [call], and if it throws a Java exception, sends it to the
+ * handler that [scratch] reaches.
+ *
+ * This is the other half of `try`'s design. `try call() { a, b -> ... }` *declares* a handler and
+ * catches the `yield` a handler might throw; this form catches a **Java exception** thrown by the
+ * call, and answers it by entering a handler that already exists elsewhere — the one whose `emit`
+ * clause matches the `scratch`'s values. So the two spellings answer different questions:
+ *
+ *  * the brace form says "what should happen when this call scratches";
+ *  * this form says "what should happen when this call *fails*".
+ *
+ * [scratch] is not evaluated on the normal path. It names which handler to enter, and its values are
+ * evaluated only when an exception is actually caught — so `try f() scratch log(), 1` does not call
+ * `log()` unless `f` threw.
+ *
+ * The `nyan` inside the handler reached this way answers back to the `try`, because the `try` is what
+ * called `scratch`: the value a handler `nyan`s comes back to the site that entered it, and that site
+ * is here. That is what makes `v: int = try f() scratch 1, 2` work — `v` is `f()`'s return value
+ * when it returns, and the handler's `nyan` answer when it threw.
+ */
+class TryScratchExpression(
+    override val keywordSpan: Span,
+    override val call: CallExpression,
+    override val scratch: ScratchExpression,
+    override val span: Span,
+) : Expression(), TryScratch
+
+/** `try call() scratch v1, v2` in statement position: the answer is discarded. */
+class TryScratchStatement(
+    override val keywordSpan: Span,
+    override val call: CallExpression,
+    override val scratch: ScratchExpression,
+    override val span: Span,
+) : Statement, TryScratch
+
+/**
+ * The part both `try call() scratch v1, v2` forms share.
+ *
+ * They differ only in what the construct is worth — the expression form is worth the call's return
+ * value, or the handler's `nyan` answer when the call threw, while the statement form discards both —
+ * so everything the two passes have to agree on lives here.
+ */
+interface TryScratch : Node {
+    val keywordSpan: Span
+
+    /** The call whose thrown Java exception this construct catches. */
+    val call: CallExpression
+
+    /**
+     * The `scratch` naming the handler to enter on the exception path.
+     *
+     * Analyzed as an ordinary `scratch`, which is what requires the enclosing function to declare an
+     * `emit` clause and links it to a handler. Its values are emitted only on the failure path.
+     */
+    val scratch: ScratchExpression
+}
+
 /** A bare identifier, such as `field1`, `str` or `println`. */
 class NameExpression(
     val name: String,

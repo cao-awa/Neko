@@ -1206,6 +1206,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             is WhenStatement -> analyzeWhen(statement)
             is NyanStatement -> analyzeNyan(statement)
             is TryStatement -> analyzeTry(statement)
+            is TryScratchStatement -> analyzeTryScratch(statement, wantedType = null)
             is PurrStatement -> analyzePurr(statement)
             is IndexAssignmentStatement -> analyzeIndexAssignment(statement)
         }
@@ -1582,6 +1583,68 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      */
     private fun analyzeTry(statement: TryStatement) {
         analyzeExtractorTry(statement)
+    }
+
+    /**
+     * `try call() scratch v1, v2` — catch a Java exception out of [TryScratch.call] and answer it by
+     * entering the handler the `scratch` names.
+     *
+     * Three things have to hold, and each one is a real constraint rather than a formality:
+     *
+     *  * **The `scratch` must be legal where it is written.** It is analysed as an ordinary
+     *    `scratch`, so the enclosing function has to declare an `emit` clause and the values must
+     *    match it — that clause is what says which handler out there receives this failure. Without
+     *    it the construct would have no way to name a destination.
+     *  * **The call has to be able to return a value** for the expression form, since the value of the
+     *    construct is that return value on the path where nothing was thrown. `t()` returning `void`
+     *    is fine for the statement form, which discards everything.
+     *  * **The handler's answer and the call's return value must agree**, because they are two
+     *    answers to the same question — exactly the rule a `yield`-carrying `try` already follows.
+     *
+     * The `scratch` is analysed with [wantedType] as the expected type, so the handler's return type
+     * is fixed by *this* construct in the same way a written-out `scratch` site fixes it.
+     */
+    private fun analyzeTryScratch(construct: TryScratch, wantedType: NekoType?): NekoType {
+        checkStandardLibrary(construct.keywordSpan)
+
+        // The call is resolved through the ordinary path: unlike the handler-declaring form, this
+        // construct makes no demand that the callee declare an `emit` clause. It catches a Java
+        // exception, which any call can throw.
+        val callType = analyzeExpression(construct.call)
+
+        // The `scratch` is analysed where it stands, which is what enforces the `emit` requirement and
+        // records the site so the handler's return type is decided with everything else.
+        val answered = analyzeScratch(construct.scratch, wantedType)
+
+        val wanted = wantedType?.takeIf { it !== ErrorType }
+        if (wanted == null) {
+            // A statement, or a value nobody asked for: the handler's answer is simply dropped.
+            return callType
+        }
+
+        if (callType === ErrorType) return wanted
+
+        if (callType === VoidType) {
+            diagnostics.error(
+                "this 'try' is used as a value, but '${construct.call.callee}' returns " +
+                    "${callType.displayName}, so the path where nothing is thrown produces nothing; " +
+                    "drop the assignment to keep the failure handling on its own",
+                construct.call.span,
+            )
+            return wanted
+        }
+
+        // The handler answers `answered`, which the scratch site asked to be `wanted`. Both paths of
+        // this construct have to be the same type, for the same reason a `yield` must agree with the
+        // call's return type in the other form.
+        if (!isAssignable(callType, wanted)) {
+            diagnostics.error(
+                "this 'try' is worth ${wanted.displayName} when the handler answers, but " +
+                    "'${construct.call.callee}' returns ${callType.displayName} when nothing is thrown",
+                construct.scratch.keywordSpan,
+            )
+        }
+        return wanted
     }
 
     /**
@@ -2923,6 +2986,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         is IndexExpression -> analyzeIndexRead(expression)
         is NyaExpression -> analyzeNyaExpression(expression, expectedType)
         is TryExpression -> analyzeTryExpression(expression)
+        is TryScratchExpression -> analyzeTryScratch(expression, expectedType)
         is ScratchExpression -> analyzeScratch(expression, expectedType)
     }
 
@@ -5610,7 +5674,7 @@ private fun Statement.alwaysReturns(): Boolean = when (this) {
     // tell; reporting "maybe falls through" is the safe answer.
     // `scratch` is not terminating: the handler it calls answers a value, and the site continues.
     is YieldStatement, is NyanStatement, is VariableDeclarationStatement, is AssignmentStatement,
-    is ExpressionStatement, is TryStatement, is IndexAssignmentStatement,
+    is ExpressionStatement, is TryStatement, is TryScratchStatement, is IndexAssignmentStatement,
     is IncrementStatement,
     -> false
 }
@@ -5632,7 +5696,7 @@ private fun Statement.containsReturn(): Boolean = when (this) {
     is ForEachStatement -> body.containsReturn()
     is PurrStatement -> body.containsReturn()
     is YieldStatement, is NyanStatement, is VariableDeclarationStatement, is AssignmentStatement,
-    is ExpressionStatement, is TryStatement, is IndexAssignmentStatement,
+    is ExpressionStatement, is TryStatement, is TryScratchStatement, is IndexAssignmentStatement,
     is IncrementStatement,
     -> false
 }
@@ -5694,6 +5758,9 @@ private fun Statement.reachesHandler(): Boolean = when (this) {
     // there answers *this* `try` — which is the one case that makes the enclosing function's clause
     // reachable from inside the block.
     is TryStatement -> extractorBody.statements.any { it.reachesHandler() }
+    // `try f() scratch ...` reaches a handler through the `scratch` it carries, which is the whole
+    // point of the form: the failure is answered by one declared elsewhere.
+    is TryScratchStatement -> scratch.reachesHandler() || call.reachesHandler()
     is PurrStatement -> body.statements.any { it.reachesHandler() }
     is ExpressionStatement -> expression.reachesHandler()
     is VariableDeclarationStatement -> initializer?.reachesHandler() == true
@@ -5718,6 +5785,7 @@ private fun Expression.reachesHandler(): Boolean = when (this) {
     is CallExpression -> callee.reachesHandler() || arguments.any { it.reachesHandler() }
     is IndexExpression -> array.reachesHandler() || index.reachesHandler()
     is MemberAccessExpression -> receiver.reachesHandler()
+    is TryScratchExpression -> scratch.reachesHandler() || call.reachesHandler()
     else -> false
 }
 
@@ -5745,7 +5813,7 @@ private fun Expression.reachesHandler(): Boolean = when (this) {
  * built rather than a body being run, so its own `nya`s are not this expression's problem.
  */
 private fun canThrowAssertion(expression: Expression): Boolean = when (expression) {
-    is CallExpression, is NyaExpression, is TryExpression -> true
+    is CallExpression, is NyaExpression, is TryExpression, is TryScratchExpression -> true
 
     // `scratch` calls the handler method. Plainly written it can only reach a handler that was found
     // — an unmatched site is an error — so the only assertion it can raise is one inside the values
