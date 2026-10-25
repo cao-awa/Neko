@@ -35,7 +35,7 @@ Neko 是一门用来做编译器实验的玩具 JVM 语言：它有类、接口�
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # 测试。
-./gradlew :neko:test                     # 编译器：547 个测试
+./gradlew :neko:test                     # 编译器：552 个测试
 ./gradlew :plugin:idea:test              # 插件：56 个测试，跑在真实 IDE 实例里
 
 # 把编译器打成单个自包含 jar。
@@ -394,6 +394,22 @@ out: Object? = java.lang.System.out
 
 类型里可以，变量的声明类型里可以，作为调用或字段读取的接收者也可以。它是 import 无法表达的两种
 情况的出口：文件根本不想导入的那个包里的类，以及两个包都声明的同一个简单名。
+
+#### 两个包可以有同名的短类名
+
+一个类的名字是它的 `locate` 包加上短类名，所以 `demo.a.Helper` 和 `demo.b.Helper` 是两个不同的类，
+可以在同一个程序里同时存在。裸写 `Helper` 指的是哪一个，按已有规则决定：
+
+* **本文件自己包里的**那个直接胜出；
+* 否则是**导入**包里的那个；
+* 如果**两个导入的包**都声明了它，这个名字就是**歧义**，会报出来而不是替你猜：
+
+```
+Main.neko:6:21: error: 'Helper' is ambiguous: it is declared in both 'demo.a' and 'demo.b', and this
+file imports both; write 'demo.a.Helper' or 'demo.b.Helper' to say which one is meant
+```
+
+每个类都会落到自己的包目录下——`demo/a/Helper.class` 和 `demo/b/Helper.class`——所以磁盘上也不会冲突。
 
 `a.b.C` 和 `value.member` 是同一套语法，所以编译器先解析再判断：只有当确实存在一个叫这个名字的类
 时，点链才是限定类名。其余情况——`p.x`、`Code.OK`、`list.size`——仍然是成员访问。链的根决定了这一点：

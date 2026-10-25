@@ -91,8 +91,9 @@ class BytecodeGenerator(
     /** Generates all class files: one per Neko class, in the order the files were given. */
     fun generate(): Map<String, ByteArray> {
         for (declaration in program.classes) {
-            val symbol = classes[declaration.name] ?: continue
-            if (declaration.symbol !== symbol) continue
+            // The declaration carries its own symbol, which is the only way to be sure which of two
+            // same-named classes in different packages this is.
+            val symbol = declaration.symbol ?: continue
             generateClass(declaration, symbol)
         }
 
@@ -118,7 +119,8 @@ class BytecodeGenerator(
      * crash here.
      */
     private fun standardLibraryClass(simpleName: String): String =
-        classes[simpleName]?.jvmInternalName ?: (currentClass?.packagePrefix ?: "") + simpleName
+        classes.values.firstOrNull { it.name == simpleName }?.jvmInternalName
+            ?: (currentClass?.packagePrefix ?: "") + simpleName
 
     /**
      * The JVM name of `EmitYieldException`, the checked exception a `yield` throws.

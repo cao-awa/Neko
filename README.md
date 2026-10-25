@@ -36,7 +36,7 @@ Tasks are module-qualified now that there is more than one module.
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # Tests.
-./gradlew :neko:test                     # the compiler: 547 tests
+./gradlew :neko:test                     # the compiler: 552 tests
 ./gradlew :plugin:idea:test              # the plugin: 56 tests, in a real IDE instance
 
 # The compiler as one self-contained jar.
@@ -403,6 +403,25 @@ mechanism a platform class already used, now covering the program's own classes.
 
 A **qualified** name needs no import, because spelling the package out *is* saying where the name comes
 from; `other.pkg.Helper.shared` works in the file above with no clause.
+
+#### Two packages may declare the same short name
+
+A class' name is its `locate` package plus its short name, so `demo.a.Helper` and `demo.b.Helper` are
+two different classes and both may exist in one program. Which one a bare `Helper` means is decided the
+way the rest of the rule already works:
+
+* the class in **this file's own package** wins outright;
+* otherwise the one from an **imported** package;
+* if two *imported* packages both declare it, the name is **ambiguous** and is reported rather than
+  guessed:
+
+```
+Main.neko:6:21: error: 'Helper' is ambiguous: it is declared in both 'demo.a' and 'demo.b', and this
+file imports both; write 'demo.a.Helper' or 'demo.b.Helper' to say which one is meant
+```
+
+Each class is emitted into its own package directory — `demo/a/Helper.class` and `demo/b/Helper.class`
+— so the two never collide on disk either.
 
 The two spellings are the same syntax and are told apart by what the name *is*, which only the
 platform can answer:

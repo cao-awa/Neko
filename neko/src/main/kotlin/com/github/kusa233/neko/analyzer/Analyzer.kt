@@ -31,7 +31,25 @@ import com.github.kusa233.neko.types.*
 class Analyzer(private val program: NekoProgram, private val diagnostics: DiagnosticBag) {
 
     private val scopes = ArrayDeque<Scope>()
+    /**
+     * Every class the program declares, keyed by its **fully qualified** JVM name.
+     *
+     * The key used to be the simple name, which made a class name global: `demo.a.Helper` and
+     * `demo.b.Helper` were the same entry, and the second declaration was refused as a duplicate of
+     * the first. Nothing about the language ever said a simple name was unique across packages, so the
+     * key is what `locate` plus the name actually denotes.
+     */
     private val classes = LinkedHashMap<String, ClassSymbol>()
+
+    /**
+     * The declarations grouped by simple name, for the unqualified lookups.
+     *
+     * A file writes `Helper`, not `demo.a.Helper`, so resolution still has to start from a simple
+     * name — and now it may find several candidates. Which of them the name denotes is decided by
+     * [classBySimpleName], which applies the same package-and-import rule that decides whether a name
+     * may be written at all.
+     */
+    private val classesBySimpleName = LinkedHashMap<String, MutableList<ClassSymbol>>()
 
     /**
      * The packages each class may reach by simple name, from the `import` clauses of its file.
@@ -337,7 +355,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 continue
             }
 
-            val previous = classes[declaration.name]
+            val packagePrefix = program.packagePrefixOf(declaration)
+            val internalName = packagePrefix + declaration.name
+            val previous = classes[internalName]
             if (previous != null) {
                 diagnostics.error(
                     "${if (declaration.isInterface) "interface" else "class"} " +
@@ -352,18 +372,19 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 )
                 continue
             }
-            val packagePrefix = program.packagePrefixOf(declaration)
             val symbol = ClassSymbol(
                 name = declaration.name,
                 span = declaration.nameSpan,
-                jvmInternalName = packagePrefix + declaration.name,
+                jvmInternalName = internalName,
                 packagePrefix = packagePrefix,
                 isInterface = declaration.isInterface,
                 isMeow = declaration.isMeow,
                 isMiao = declaration.isMiao,
                 typeParameters = declaration.typeParameters,
             )
-            classes[declaration.name] = symbol
+            classes[internalName] = symbol
+            classesBySimpleName.getOrPut(declaration.name) { mutableListOf() } += symbol
+            declaration.symbol = symbol
             // Resolution reads the declaring file's clauses rather than a per-file flag, because a
             // class' own `import` clauses are what decide where *its* bodies may look for a name.
             val file = program.fileOf(declaration)
@@ -376,7 +397,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
     private fun resolveSignatures() {
         for (declaration in program.classes) {
-            val classSymbol = classes[declaration.name] ?: continue
+            val classSymbol = declaration.symbol ?: continue
             declaration.symbol = classSymbol
             currentClass = classSymbol
             resolveSupertypes(declaration, classSymbol)
@@ -385,7 +406,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // Local variable scopes for type parameters need the supertypes resolved first, so a
         // supertype's own type parameters are known before a member mentions one.
         for (declaration in program.classes) {
-            val classSymbol = classes[declaration.name] ?: continue
+            val classSymbol = declaration.symbol ?: continue
             currentClass = classSymbol
             declareFields(declaration, classSymbol)
             if (declaration.isMiao) declareEnumEntries(declaration, classSymbol)
@@ -437,7 +458,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             superclass.resolvedType = type
             if (type is ClassType) {
                 classSymbol.superclass = type
-                val parent = classes[type.simpleName]
+                val parent = classes[type.internalName]
                 classSymbol.superclassSymbol = parent
                 if (parent != null && parent.isInterface) {
                     diagnostics.error(
@@ -456,7 +477,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             implemented.resolvedType = type
             if (type is ClassType) {
                 classSymbol.interfaces += type
-                classes[type.simpleName]?.let { classSymbol.interfaceSymbols += it }
+                classes[type.internalName]?.let { classSymbol.interfaceSymbols += it }
             }
         }
 
@@ -478,7 +499,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      */
     private fun checkSuperclassesAreConstructible() {
         for (declaration in program.classes) {
-            val classSymbol = classes[declaration.name] ?: continue
+            val classSymbol = declaration.symbol ?: continue
             val superclass = declaration.superclass ?: continue
             val parent = classSymbol.superclassSymbol ?: continue
             if (parent.constructors.isEmpty()) continue
@@ -732,7 +753,10 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * left for the code generator, which knows no better.
      */
     private fun scratchHandlerTypeFor(arity: Int, span: Span): NekoType? {
-        val symbol = classes["ScratchHandler$arity"]
+        // Looked up by name but *not* through the import rule: the library is the compiler's own
+        // machinery, so `scratch` reaches it from any package with no import written. That is the same
+        // exemption `scratch`, `nyan` and `yield` have always had.
+        val symbol = classesBySimpleName["ScratchHandler$arity"]?.firstOrNull()
         if (symbol != null) return ClassType(symbol.jvmInternalName, symbol.name)
 
         if (arity > maxEmitValues) {
@@ -971,7 +995,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
     private fun checkBodies() {
         for (declaration in program.classes) {
-            val classSymbol = classes[declaration.name] ?: continue
+            val classSymbol = declaration.symbol ?: continue
             currentClass = classSymbol
             checkInterfacesImplemented(declaration, classSymbol)
             for (field in declaration.fields) checkFieldInitializer(field)
@@ -1398,7 +1422,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         if (standardLibraryChecked) return
         standardLibraryChecked = true
 
-        if (classes.containsKey(EMIT_YIELD_EXCEPTION_SIMPLE_NAME)) return
+        if (classesBySimpleName.containsKey(EMIT_YIELD_EXCEPTION_SIMPLE_NAME)) return
 
         diagnostics.error(
             "'scratch' and 'nyan' need ${EMIT_YIELD_EXCEPTION_SIMPLE_NAME}, which the compiler " +
@@ -2224,7 +2248,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // spelling `analyzeMemberAccess` accepts for reading one. It is matched before the receiver
         // is analysed, because a class name is not a value and has no type of its own.
         val className = (target.receiver as? NameExpression)?.name
-        val namedClass = className?.let { classNamed(it) }
+        val namedClass = className?.let { classNamed(it, target.memberSpan) }
         if (namedClass != null) {
             target.receiverIsClass = true
             target.receiver.resolvedType = ClassType(namedClass.jvmInternalName, namedClass.name)
@@ -2708,7 +2732,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         if (type.internalName == ITERABLE_INTERFACE) return type
         if (!seen.add(type.internalName)) return null
 
-        val symbol = classes[type.simpleName] ?: return null
+        val symbol = classes[type.internalName] ?: return null
         // A class's own type is the one carrying the type arguments; `Iterable` reached through the
         // superclass chain keeps whichever arguments were written along the way.
         for (interfaceType in symbol.interfaces) {
@@ -2881,7 +2905,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         if (supertype === ThrowableType) {
             if (sub === ThrowableType) return true
             val thrown = (sub as? ClassType) ?: return false
-            val thrownSymbol = classes[thrown.simpleName] ?: return false
+            val thrownSymbol = classes[thrown.internalName] ?: return false
             // Either the program walked all the way to `Throwable` itself, or it stopped at a JDK
             // class that is itself a `Throwable` — `EmitYieldException: Exception()` names
             // `java/lang/Exception`, which the program does not compile, so the chain above it has to
@@ -2893,7 +2917,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
         val subClass = sub as? ClassType ?: return false
         val superClass = supertype as? ClassType ?: return false
-        val subSymbol = classes[subClass.simpleName] ?: return false
+        val subSymbol = classes[subClass.internalName] ?: return false
 
         // The supertype may be a platform class the program never declares — `java.util.Iterator` is
         // what `class Cursor: Iterator` names, and there is no `ClassSymbol` for it because the
@@ -2901,7 +2925,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // the declared-supertypes walk in `descendsFrom` answers instead of `isSubtypeOf`. Without
         // this, implementing a JDK interface would satisfy the `for ... in` check and then fail the
         // assignability check on the very `iterator()` method that makes it work.
-        val superSymbol = classes[superClass.simpleName]
+        val superSymbol = classes[superClass.internalName]
         return if (superSymbol != null) {
             subSymbol.isSubtypeOf(superSymbol)
         } else {
@@ -3752,7 +3776,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private fun analyzeMemberCall(expression: CallExpression, callee: MemberAccessExpression): NekoType {
         // `Sample.f(1)` calls a static function by class name, which needs no object.
         val className = (callee.receiver as? NameExpression)?.name
-        val namedClass = className?.let { classNamed(it) }
+        val namedClass = className?.let { classNamed(it, callee.memberSpan) }
         if (namedClass != null) {
             if (callee.isSafeCall) reportSafeCallOnClassName(callee.memberSpan, className)
             callee.receiverIsClass = true
@@ -3792,7 +3816,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 if (callee.isSafeCall) reportSafeCallOnClassName(callee.memberSpan, dotted)
                 callee.receiverIsClass = true
                 callee.receiver.resolvedType = receiverClass
-                val symbol = classes[receiverClass.simpleName]
+                val symbol = classes[receiverClass.internalName]
                 return if (symbol != null) {
                     resolveMemberCall(expression, callee, symbol, receiverClass.simpleName, viaClass = true)
                 } else {
@@ -3994,7 +4018,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             return ErrorType
         }
 
-        val classSymbol = classes[callee.name]
+        val classSymbol = classBySimpleName(callee.name)
         if (classSymbol == null) {
             analyzePlatformConstructionArguments(expression, type)
             expression.constructedType = type
@@ -4398,7 +4422,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * lambda is then checked as it always was, against a function type or not at all.
      */
     private fun singleAbstractMethodOf(type: ClassType): SamTarget? {
-        val symbol = classes[type.simpleName]
+        // By internal name: a `ClassType` already carries the package, and two packages may each
+        // declare an interface with this simple name.
+        val symbol = classes[type.internalName]
         if (symbol != null) {
             if (!symbol.isInterface) return null
             val abstracts = symbol.allFunctions().values
@@ -4471,7 +4497,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // syntax and no qualified type syntax, falling through left no way at all to reach a JDK
         // static member. Resolving the name as a class first is what makes the ordinary spelling work.
         val className = (expression.receiver as? NameExpression)?.name
-        val namedClass = className?.let { classNamed(it) }
+        val namedClass = className?.let { classNamed(it, expression.memberSpan) }
         if (namedClass != null) {
             if (expression.isSafeCall) reportSafeCallOnClassName(expression.memberSpan, className)
             expression.receiverIsClass = true
@@ -4503,7 +4529,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 if (expression.isSafeCall) reportSafeCallOnClassName(expression.memberSpan, dotted)
                 expression.receiverIsClass = true
                 expression.receiver.resolvedType = receiverClass
-                val symbol = classes[receiverClass.simpleName]
+                val symbol = classes[receiverClass.internalName]
                 return if (symbol != null) {
                     staticMemberOf(symbol, expression, receiverClass.simpleName)
                 } else {
@@ -4664,7 +4690,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // A chain rooted at a class the program declares is a member access: `Code.OK` reads a static
         // field of `Code`. Reporting it as an unknown type would be wrong twice over — the type is
         // fine, and the name is not a type at all.
-        if (classes[dotted.substringBefore('.')] != null) return false
+        if (classBySimpleName(dotted.substringBefore('.')) != null) return false
         if (dotted.substringAfterLast('.').firstOrNull()?.isUpperCase() == true) return true
         val root = dotted.substringBefore('.')
         return root != dotted && (root == "java" || root == "javax" || PlatformLibrary.hasPackage(root))
@@ -4693,11 +4719,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // chains are the same shape. This check is what keeps the rest of this function from
         // inventing a class called `Code/OK` out of a perfectly ordinary static field read.
         val root = dotted.substringBefore('.')
-        if (classes[root] != null) return null
+        if (classBySimpleName(root) != null) return null
 
         // A class the program declares, reachable by its package: `com.example.Helper`. The
         // declaration knows its own internal name, so it is authoritative.
-        classes[simpleName]?.let { symbol ->
+        classes[dotted.replace('.', '/')]?.let { symbol ->
             if (dotted.replace('.', '/') == symbol.jvmInternalName) {
                 return ClassType(symbol.jvmInternalName, simpleName)
             }
@@ -5090,7 +5116,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * does not, which is how the analyzer knows it cannot check members against it.
      */
     private fun classOf(type: NekoType): ClassSymbol? =
-        (type as? ClassType)?.let { classes[it.simpleName] }
+        (type as? ClassType)?.let { classes[it.internalName] }
 
     private fun packagePrefix(): String = currentClass?.packagePrefix ?: ""
 
@@ -5470,7 +5496,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * to a missing class.
      */
     private fun resolveClassType(name: String, span: Span): NekoType {
-        declaredClass(name)?.let { return ClassType(it.jvmInternalName, name) }
+        declaredClass(name, span)?.let { return ClassType(it.jvmInternalName, name) }
 
         // A *qualified* name — `java.util.HashMap` — says where the class lives, so the imports are
         // not consulted at all. This is the escape hatch the rest of this function describes the
@@ -5635,7 +5661,85 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * class", and the answers differ per file, which is why the question is asked at resolution time
      * rather than once at declaration time.
      */
-    private fun declaredClass(simpleName: String): ClassSymbol? = classes[simpleName]?.takeIf { isVisible(it) }
+    private fun declaredClass(simpleName: String, span: Span? = null): ClassSymbol? {
+        val candidates = visibleCandidates(simpleName)
+        if (candidates.size > 1) reportAmbiguousSimpleName(candidates, simpleName, span)
+        return candidates.firstOrNull()
+    }
+
+    /** Guards [declaredClass] against reporting one ambiguity once per expression. */
+    private var lastAmbiguity: ClassSymbol? = null
+
+    /**
+     * Reports that [simpleName] names two classes this file can reach, and says which import decides.
+     *
+     * Only possible when two imported packages each declare the name: a class in the file's own
+     * package is unique, and would have won before this is reached. The message names both
+     * candidates, because choosing one for the reader would be a guess that shows up later as a
+     * confusing error about members.
+     *
+     * Anchored at [span] — the name as written — when the caller has one, so the caret lands on the
+     * ambiguous word rather than on one of the two declarations it might mean.
+     */
+    private fun reportAmbiguousSimpleName(
+        candidates: List<ClassSymbol>,
+        simpleName: String,
+        span: Span?,
+    ) {
+        val first = candidates[0]
+        val second = candidates[1]
+        if (lastAmbiguity === first) return
+        lastAmbiguity = first
+
+        fun where(symbol: ClassSymbol): String =
+            symbol.packagePrefix.removeSuffix("/").replace('/', '.').ifEmpty { "the unnamed package" }
+
+        diagnostics.error(
+            "'$simpleName' is ambiguous: it is declared in both '${where(first)}' and " +
+                "'${where(second)}', and this file imports both; write '${importFor(first)}' or " +
+                "'${importFor(second)}' to say which one is meant",
+            span ?: first.span,
+            notes = listOf(
+                diagnostics.note("one declaration is here", first.span),
+                diagnostics.note("the other is here", second.span),
+            ),
+        )
+    }
+
+    /**
+     * The class a bare [simpleName] denotes here, or `null` when nothing reachable goes by that name.
+     *
+     * Two packages may each declare a `Helper`, so a simple name is a question rather than a lookup,
+     * and the answer is the one this file can actually name:
+     *
+     *  * **The same `locate` package wins outright**, and there can only be one such class — a second
+     *    declaration in one package is the same internal name, which is refused when it is declared.
+     *  * **Otherwise a visible candidate answers**, where visibility is the import rule of
+     *    [isVisible]. Several visible candidates means the name is ambiguous: two imported packages
+     *    both hold a `Helper` and nothing in the file says which. [declaredClass] reports that; the
+     *    lookup itself stays silent so a question asked from a check that is merely probing cannot
+     *    produce a diagnostic.
+     *
+     * A candidate that is not visible at all is *not* an answer. [invisibleClass] is the separate
+     * question the diagnostic asks, so that "you forgot an import" and "nothing goes by that name"
+     * stay distinguishable.
+     */
+    private fun classBySimpleName(simpleName: String): ClassSymbol? = visibleCandidates(simpleName).firstOrNull()
+
+    /**
+     * Every declaration of [simpleName] this file may name, the same-package one first.
+     *
+     * More than one means the name is ambiguous, which is only possible when two *imported* packages
+     * each declare it: the same-package class is unique by construction.
+     */
+    private fun visibleCandidates(simpleName: String): List<ClassSymbol> {
+        val candidates = classesBySimpleName[simpleName] ?: return emptyList()
+        val owner = currentClass
+        if (owner != null) {
+            candidates.firstOrNull { it.packagePrefix == owner.packagePrefix }?.let { return listOf(it) }
+        }
+        return candidates.filter { isVisible(it) }
+    }
 
     /**
      * Whether the current file may name [symbol] — the same package, or an import that reaches it.
@@ -5675,7 +5779,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * import" and "you misspelled it".
      */
     private fun invisibleClass(simpleName: String): ClassSymbol? =
-        classes[simpleName]?.takeIf { !isVisible(it) }
+        classesBySimpleName[simpleName]?.firstOrNull { !isVisible(it) }
 
     /**
      * The `import` clause that would make [symbol] reachable, e.g. `other.pkg.Helper`.
@@ -5703,7 +5807,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * package rule could be walked around by reaching for a member instead of the class itself.
      * Funnelling them through one function is what keeps the two paths saying the same thing.
      */
-    private fun classNamed(name: String): ClassSymbol? = declaredClass(name)
+    private fun classNamed(name: String, span: Span? = null): ClassSymbol? = declaredClass(name, span)
 
 
 

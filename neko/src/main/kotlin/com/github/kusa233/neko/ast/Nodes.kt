@@ -238,9 +238,16 @@ class ClassDeclaration(
      * The order is what `ordinal()` reports, so it is the source order and is never sorted.
      */
     val entries: List<EnumEntry> = emptyList(),
+
     override val span: Span,
 ) : Node {
-    /** Filled in by the analyzer. */
+    /**
+     * Filled in by the analyzer: the symbol this declaration resolves to.
+     *
+     * The symbol table is keyed by fully qualified name, because two packages may each declare a
+     * `Helper`. This field is how a declaration names its own symbol without recomputing the package
+     * prefix — the same reason [FunctionDeclaration.symbol] exists.
+     */
     var symbol: ClassSymbol? = null
 }
 

@@ -91,9 +91,9 @@ class ImportTest {
 
     @Test
     fun `an import adds a package without hiding the program's own declarations`() {
-        // An import can only ever *add* a way to resolve a name. A class the program declares is
-        // already known, so `Helper` keeps resolving to the declaration rather than to a same-named
-        // class in the imported package.
+        // An import can only ever *add* a way to resolve a name. A class in the file's own package is
+        // already known, so `Helper` keeps resolving to it rather than to the same-named class in the
+        // imported package.
         val helper = fileIn(
             "com.github.kusa233.other",
             "",
@@ -125,15 +125,14 @@ class ImportTest {
             "}",
         )
 
-        // Two classes named `Helper` in one program is a redeclaration, whichever packages they are
-        // in: a class is known by its simple name across the whole program.
-        val result = Compiler.compileProgram(listOf(helper, program), outputDirectory = null)
-        val messages = TestSupport.messages(result)
-        assertEquals(
-            listOf("class 'Helper' is already declared"),
-            messages.filter { it.contains("Helper") },
-            "a declared name is program-wide, so the import cannot pick the other Helper",
-        )
+        // Two classes named `Helper` in one program is no longer a redeclaration: they are two
+        // different classes, `com.github.kusa233.other.Helper` and `com.github.kusa233.test.Helper`,
+        // and the bare name picks the one in this file's own package.
+        val loaded = TestSupport.load(listOf(helper, program))
+        val printed = loaded.capturingOutput {
+            loaded.invoke("com.github.kusa233.test.Main", "main")
+        }
+        assertEquals("7\n", printed, "the same-package Helper is the one a bare name means")
     }
 
     @Test

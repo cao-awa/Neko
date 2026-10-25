@@ -222,17 +222,145 @@ class PackageVisibilityTest {
         assertEquals(emptyList(), TestSupport.errors(result).map { it.message })
     }
 
+    /**
+     * Two packages may each declare a class with the same simple name.
+     *
+     * They are different classes, and they were only ever an error because the symbol table was one
+     * map keyed by simple name. `locate` decides where a class lives, and the name of a class is its
+     * package plus its short name — so nothing about the language ever said the short name had to be
+     * unique. Each becomes its own class file under its own package directory.
+     */
     @Test
     fun `a program may declare a class whose name another package also declares`() {
-        // Duplicate simple names across packages stay an error, and the package rule does not change
-        // that: the lookup is still one map by simple name, now with a permission check on top.
         val messages = messagesOf(
             SourceFile.of("A.neko", "locate demo.a\n\nclass Thing() {\n}\n"),
             SourceFile.of("B.neko", "locate demo.b\n\nclass Thing() {\n}\n"),
         )
+        assertEquals(
+            emptyList(),
+            messages,
+            "the two Things are different classes, so neither is a redeclaration",
+        )
+    }
+
+    /** The two same-named classes are emitted into their own package directories. */
+    @Test
+    fun `same-named classes in different packages produce separate class files`() {
+        val result = Compiler.compileProgram(
+            listOf(
+                SourceFile.of("A.neko", "locate demo.a\n\nclass Thing() {\n}\n"),
+                SourceFile.of("B.neko", "locate demo.b\n\nclass Thing() {\n}\n"),
+            ),
+            outputDirectory = null,
+        )
+        assertTrue(
+            !result.hasErrors,
+            "the program must compile first: ${TestSupport.messages(result)}",
+        )
+        assertTrue(
+            "demo/a/Thing" in result.classes.keys,
+            "expected demo/a/Thing, got ${result.classes.keys}",
+        )
+        assertTrue(
+            "demo/b/Thing" in result.classes.keys,
+            "expected demo/b/Thing, got ${result.classes.keys}",
+        )
+    }
+
+    /**
+     * A bare name reaches the class in the file's own package, not the same-named one elsewhere.
+     *
+     * The same-package rule is what makes a duplicate across packages harmless: a file never has to
+     * disambiguate what it declares next to itself.
+     */
+    @Test
+    fun `a bare name means the class in the file's own package`() {
+        val other = SourceFile.of(
+            "B.neko",
+            "locate demo.b\n\nclass Thing() {\n    static {\n        fun tag(): int { return 2 }\n    }\n}\n",
+        )
+        val own = SourceFile.of(
+            "A.neko",
+            "locate demo.a\n\nclass Thing() {\n    static {\n        fun tag(): int { return 1 }\n    }\n}\n",
+        )
+        val use = SourceFile.of(
+            "Use.neko",
+            "locate demo.a\n\nclass Use() {\n    static {\n        fun main() {\n            println(Thing.tag())\n        }\n    }\n}\n",
+        )
+
+        val loaded = TestSupport.load(listOf(own, other, use))
+        val printed = loaded.capturingOutput { loaded.invoke("demo.a.Use", "main") }
+        assertEquals("1\n", printed, "demo.a.Use sees demo.a.Thing, not demo.b.Thing")
+    }
+
+    /** A qualified name picks the class it spells, whichever packages are imported. */
+    @Test
+    fun `a qualified name picks one of two same-named classes`() {
+        val a = SourceFile.of(
+            "A.neko",
+            "locate demo.a\n\nclass Thing() {\n    static {\n        fun tag(): int { return 1 }\n    }\n}\n",
+        )
+        val b = SourceFile.of(
+            "B.neko",
+            "locate demo.b\n\nclass Thing() {\n    static {\n        fun tag(): int { return 2 }\n    }\n}\n",
+        )
+        val use = SourceFile.of(
+            "Use.neko",
+            "locate demo\nimport demo.a\nimport demo.b\n\nclass Use() {\n    static {\n        fun main() {\n" +
+                "            println(demo.a.Thing.tag())\n            println(demo.b.Thing.tag())\n" +
+                "        }\n    }\n}\n",
+        )
+
+        val loaded = TestSupport.load(listOf(a, b, use))
+        val printed = loaded.capturingOutput { loaded.invoke("demo.Use", "main") }
+        assertEquals("1\n2\n", printed, "each qualified name reached its own class")
+    }
+
+    /**
+     * A bare name for which two *imported* packages both answer is ambiguous, and says so.
+     *
+     * The same-package rule cannot break this tie, because neither class is in the file's own
+     * package. Picking one by declaration order would compile, and would be a guess the reader
+     * cannot see; the diagnostic names both packages and the two imports that would decide.
+     */
+    @Test
+    fun `a bare name two imported packages both answer is ambiguous`() {
+        val a = SourceFile.of(
+            "A.neko",
+            "locate demo.a\n\nclass Thing() {\n}\n",
+        )
+        val b = SourceFile.of(
+            "B.neko",
+            "locate demo.b\n\nclass Thing() {\n}\n",
+        )
+        val use = SourceFile.of(
+            "Use.neko",
+            "locate demo\nimport demo.a\nimport demo.b\n\nclass Use() {\n    static {\n        fun main() {\n" +
+                "            t: Thing = Thing()\n        }\n    }\n}\n",
+        )
+
+        val result = Compiler.compileProgram(listOf(a, b, use), outputDirectory = null)
+        val messages = TestSupport.messages(result)
+        assertTrue(
+            messages.any { "'Thing' is ambiguous" in it },
+            "expected the ambiguity to be reported, but got:\n${messages.joinToString("\n")}",
+        )
+        assertTrue(
+            messages.any { "demo.a.Thing" in it && "demo.b.Thing" in it },
+            "the message should name both imports that would decide:\n${messages.joinToString("\n")}",
+        )
+    }
+
+    /** Two classes with one name in *one* package are still one class declared twice. */
+    @Test
+    fun `the same name in the same package is still a redeclaration`() {
+        val messages = messagesOf(
+            SourceFile.of("A.neko", "locate demo.a\n\nclass Thing() {\n}\n"),
+            SourceFile.of("B.neko", "locate demo.a\n\nclass Thing() {\n}\n"),
+        )
         assertTrue(
             messages.any { "already declared" in it },
-            "expected the duplicate-declaration error, but got:\n${messages.joinToString("\n")}",
+            "a second Thing in demo.a is the same class file: ${messages.joinToString("\n")}",
         )
     }
 }
