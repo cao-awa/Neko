@@ -35,7 +35,7 @@ Neko 是一门用来做编译器实验的玩具 JVM 语言：它有类、接口�
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # 测试。
-./gradlew :neko:test                     # 编译器：540 个测试
+./gradlew :neko:test                     # 编译器：547 个测试
 ./gradlew :plugin:idea:test              # 插件：56 个测试，跑在真实 IDE 实例里
 
 # 把编译器打成单个自包含 jar。
@@ -1076,6 +1076,33 @@ class Neko() {
 `try` 可以应答同一个 `emit` 子句的原因：每个 `try` 自己造一个 handler 对象交给它包住的那次调用，
 于是同一个被调函数对每个调用方都是独立的。它也意味着 `scratch` 不要求程序里存在任何 `try`——函数的
 `emit` 子句说明它已经拿到了一个。
+
+#### handler 会捕获它周围的局部变量
+
+`{ ... }` 块会变成某个生成类的方法，所以写在 `try` 所在处的局部变量在块内并不是「直接可见」的，而是
+和 lambda 一样被捕获：
+
+```neko
+class Neko() {
+  fun invoker() {
+    factor: int = 10
+    greeting: string = "hi"
+    // 两个都在块内被读取，因此都作为 handler 对象的字段传进去。
+    v: int = try test() { a, b ->
+      println(greeting)
+      nyan a * b * factor
+    }
+    println(v)
+  }
+}
+```
+
+捕获按值进行，规则与 lambda 完全一致，因此同样有两条限制：handler 不能给被捕获的局部变量赋值（改的是
+副本，原变量不变）；handler 里不能用 `this`，因为块运行在 handler 对象上，而不是外层函数被调用时所在
+的那个对象上。
+
+写在 handler 体内部的 `scratch` 会把这个效应再往外传一层，所以外层函数持有的 handler 也会被捕获。
+这才让 handler 可以转交：内层调用外层 handler，答案再一路传回来。
 
 #### 省略值
 

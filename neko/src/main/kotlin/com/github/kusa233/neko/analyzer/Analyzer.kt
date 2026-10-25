@@ -56,6 +56,25 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     /** Non-null while analysing the body of a lambda literal. */
     private var currentLambda: LambdaState? = null
 
+    /**
+     * The identity of the generated method the body being analysed will be compiled into, if any.
+     *
+     * A lambda and a `try` handler both become a method of their own, in a class of their own, so a
+     * local declared inside one is *its* local and anything else it names has to be captured. Every
+     * `LocalSymbol` gets stamped with this identity when it is created, and the code generator reads
+     * the stamp back to tell the two apart: a symbol carrying the current identity is a slot of this
+     * method, and one that does not is a field of the generated class.
+     *
+     * `null` while analysing an ordinary function body, where every local really is a local.
+     *
+     * This is separate from [currentLambda] rather than folded into it because the two answer
+     * different questions: `currentLambda` is about lambda *semantics* — a `yield` returns from it, a
+     * `this` is refused inside it — while this is only about where a declaration physically lives.
+     * A handler body is a method boundary without being a lambda, and conflating them would make
+     * `yield` mean the wrong thing inside a `try` block.
+     */
+    private var currentBoundaryIdentity: Any? = null
+
     /** Non-null while analysing the body of a declared function. */
     private var currentFunction: FunctionSymbol? = null
 
@@ -1832,20 +1851,25 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     /**
      * Analyzes the extractor body in its own scope, binding the parameters it named to the types the
      * callee's `emit` clause declares.
+     *
+     * The block becomes a method of a generated class, so it is a *method boundary*: its own
+     * parameters and locals live in that method, and anything else it names is captured into a field
+     * of the class and passed in through the constructor. That is what lets a handler read an
+     * enclosing local, which it could not do when the block was a `static` method.
      */
     private fun analyzeTryExtractor(statement: ExtractorTry, expected: List<NekoType>) {
-        // A try handler body is not a lambda: it is analysed in the enclosing function, so `this` and
-        // the enclosing variables are all still in scope here, and a `scratch` inside it behaves as
-        // usual. Note the gap that follows from that: code generation lifts the block out into a
-        // `static` method with no captures, so a handler that reads an enclosing local has no way to
-        // see it. Only the handler's own parameters and static state survive the move.
         val savedFunction = currentFunction
         val savedExtractor = currentExtractor
-        // It is its own home for a `yield`, though: a `yield` written here produces the extractor's
-        // value, not that of a `nya` value form the `try` happens to be written inside.
+        // The identity the body's own declarations are stamped with, so the code generator can tell
+        // them apart from the enclosing locals it has to capture. The `try` node is the identity: it
+        // is stable, unique, and already carried by the construct down to code generation.
+        val savedBoundary = currentBoundaryIdentity
+        // It is its own home for a `yield`: a `yield` written here produces the extractor's value,
+        // not that of a `nya` value form the `try` happens to be written inside.
         val savedNya = currentNya
         pushScope(identifier = statement)
         currentExtractor = statement
+        currentBoundaryIdentity = statement
         currentNya = null
 
         for ((index, parameter) in statement.extractorParameters.withIndex()) {
@@ -1857,9 +1881,8 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 span = parameter.nameSpan,
                 kind = VariableKind.VAL,
                 isParameter = true,
-                // The extractor body is emitted inside the enclosing method, so a reference to one of
-                // these is an ordinary local read, not a capture.
-                enclosingLambda = currentLambda?.identity,
+                // The body is a method of its own, so these are *its* locals rather than captures.
+                enclosingLambda = currentBoundaryIdentity,
             )
             val existing = scopes.last().symbols[parameter.name]
             if (existing != null) {
@@ -1877,6 +1900,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         analyzeBlock(statement.extractorBody)
 
         currentExtractor = savedExtractor
+        currentBoundaryIdentity = savedBoundary
         popScope()
         currentFunction = savedFunction
         currentNya = savedNya
@@ -2073,7 +2097,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 type = declaredType,
                 span = statement.nameSpan,
                 kind = statement.kind,
-                enclosingLambda = currentLambda?.identity,
+                enclosingLambda = currentBoundaryIdentity,
             )
             statement.symbol = symbol
             scopes.last().symbols[statement.name] = symbol
@@ -2130,13 +2154,15 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             )
         }
         // Capture is by value, so writing to a variable from an enclosing scope would silently have
-        // no effect on the enclosing variable. Reject it instead of miscompiling it.
-        if (resolved is LocalSymbol && currentLambda != null &&
-            resolved.enclosingLambda !== currentLambda!!.identity
+        // no effect on the enclosing variable. Reject it instead of miscompiling it. A `try` handler
+        // captures for the same reason a lambda does, so the same rule covers it.
+        if (resolved is LocalSymbol && currentBoundaryIdentity != null &&
+            resolved.enclosingLambda !== currentBoundaryIdentity
         ) {
+            val where = if (currentLambda != null) "a lambda" else "a 'try' handler"
             diagnostics.error(
-                "cannot assign to '${resolved.name}' inside a lambda: it is declared in the " +
-                    "enclosing scope and lambdas capture variables by value",
+                "cannot assign to '${resolved.name}' inside $where: it is declared in the " +
+                    "enclosing scope and the block captures variables by value",
                 target.span,
                 notes = listOf(diagnostics.note("'${resolved.name}' is declared here", resolved.span)),
             )
@@ -2179,7 +2205,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             type = valueType,
             span = target.span,
             kind = VariableKind.VAR,
-            enclosingLambda = currentLambda?.identity,
+            enclosingLambda = currentBoundaryIdentity,
         )
         statement.declaredLocal = symbol
         target.resolution = symbol
@@ -2635,7 +2661,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 // Read-only, so an assignment to it is refused by the same check that refuses one to a
                 // `val`.
                 kind = VariableKind.VAL,
-                enclosingLambda = currentLambda?.identity,
+                enclosingLambda = currentBoundaryIdentity,
             )
             statement.symbol = symbol
             scopes.last().symbols[statement.name] = symbol
@@ -3188,6 +3214,17 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             diagnostics.error(
                 "'this' cannot be used inside a lambda: a lambda body runs on its own object, " +
                     "which is not the one the enclosing function was called on",
+                expression.keywordSpan,
+            )
+            return ErrorType
+        }
+        if (currentExtractor != null) {
+            // The handler is an object of its own too. Allowed, `this` would read the *handler* and
+            // its members, which is not what the author means and would compile to a field access on
+            // the wrong class.
+            diagnostics.error(
+                "'this' cannot be used inside a 'try' handler: the block runs on the handler object, " +
+                    "not on the one the enclosing function was called on",
                 expression.keywordSpan,
             )
             return ErrorType
@@ -4265,6 +4302,10 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         val enclosingPurrLocks = heldPurrLocks.toList()
         heldPurrLocks.clear()
         currentLambda = state
+        // A lambda is its own method, so its locals are stamped with its identity; the code generator
+        // captures everything else it names.
+        val outerBoundary = currentBoundaryIdentity
+        currentBoundaryIdentity = state.identity
         currentNya = null
         // `return` inside a lambda is an error (reported by `analyzeReturn`), so the enclosing
         // function must not stay visible here.
@@ -4307,6 +4348,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         popScope()
         restoreNarrowings(enclosingFacts)
         currentLambda = outerLambda
+        currentBoundaryIdentity = outerBoundary
         currentFunction = outerFunction
         currentNya = outerNya
         implicitThisClass = outerImplicitThis

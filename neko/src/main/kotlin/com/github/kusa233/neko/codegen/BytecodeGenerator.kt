@@ -2346,15 +2346,22 @@ class BytecodeGenerator(
         val mv = scope.mv
         val owner = scope.handlerInterface
         val slot = scope.handlerSlot
+        val field = scope.handlerField
 
-        if (owner == null || slot == null) {
+        if (owner == null || (slot == null && field == null)) {
             // No handler to call: the site is outside any `emit` function, which analysis has already
             // reported. A default of the right shape keeps the rest of the expression verifiable.
             pushDefault(expression.type, mv)
             return
         }
 
-        mv.visitVarInsn(ALOAD, slot)
+        if (slot != null) {
+            mv.visitVarInsn(ALOAD, slot)
+        } else {
+            // The handler was captured by the class this body was compiled into.
+            mv.visitVarInsn(ALOAD, 0)
+            mv.visitFieldInsn(GETFIELD, scope.owner, field!!, descriptorOf(ClassType(owner, owner.substringAfterLast('/'))))
+        }
         for (value in expression.values) {
             emitExpression(value, scope)
             emitBox(value.type, mv)
@@ -2799,15 +2806,70 @@ class BytecodeGenerator(
         val mv = scope.mv
         val exceptionClass = emitYieldExceptionClass()
 
+        // Everything the body reads from an enclosing method travels in as a field, exactly as it does
+        // for a lambda. A symbol stamped with this construct's own identity is a local *of the
+        // handler*, so it needs no capture; anything else must be reachable from here to be captured
+        // at all — a nested handler forwards whatever it needs, because its own scope records it.
+        val referenced = LinkedHashSet<LocalSymbol>()
+        collectLocalReferences(construct.extractorBody, referenced)
+        val captures = mutableListOf<Pair<LocalSymbol, String>>()
+        for (symbol in referenced) {
+            if (symbol.enclosingLambda === construct) continue
+            if (scope.slotOf(symbol) == null && scope.captureOf(symbol) == null) continue
+            captures += symbol to "captured\$${captures.size}"
+        }
+
         // The handler is a *value* now, so this `try` builds one before it calls: a fresh object of a
         // class generated for this `try` alone. That is the whole difference from the old design —
         // the handler travels with the call instead of being found by signature, which is what lets
         // several `try` blocks answer the same `emit` clause.
-        val handlerClass = emitScratchHandlerClass(construct)
+        // A `scratch` written inside this handler's own body scratches the effect further out, so the
+        // handler the enclosing function holds travels in as well — otherwise that site would have no
+        // object to call and would silently produce the type's default.
+        val outerHandlerInterface = scope.handlerInterface
+        val outerHandlerSlot = scope.handlerSlot
+        val outerHandlerField = scope.handlerField
+
+        val handlerClass = emitScratchHandlerClass(construct, captures, outerHandlerInterface)
         val handlerSlot = scope.allocateTemp(ObjectType)
         mv.visitTypeInsn(NEW, handlerClass)
         mv.visitInsn(DUP)
-        mv.visitMethodInsn(INVOKESPECIAL, handlerClass, "<init>", "()V", false)
+        for ((symbol, _) in captures) {
+            val slot = scope.slotOf(symbol)
+            if (slot != null) {
+                mv.visitVarInsn(loadOpcode(symbol.type), slot)
+            } else {
+                mv.visitVarInsn(ALOAD, 0)
+                mv.visitFieldInsn(
+                    GETFIELD,
+                    scope.owner,
+                    scope.captureOf(symbol)!!,
+                    descriptorOf(symbol.type),
+                )
+            }
+        }
+        if (outerHandlerInterface != null) {
+            if (outerHandlerSlot != null) {
+                mv.visitVarInsn(ALOAD, outerHandlerSlot)
+            } else {
+                mv.visitVarInsn(ALOAD, 0)
+                mv.visitFieldInsn(
+                    GETFIELD,
+                    scope.owner,
+                    outerHandlerField ?: "outerHandler",
+                    "L$outerHandlerInterface;",
+                )
+            }
+        }
+        val constructorTypes = captures.map { it.first.type } +
+            listOfNotNull(outerHandlerInterface?.let { ClassType(it, it.substringAfterLast('/')) })
+        mv.visitMethodInsn(
+            INVOKESPECIAL,
+            handlerClass,
+            "<init>",
+            descriptorOf(constructorTypes, VoidType),
+            false,
+        )
         mv.visitVarInsn(ASTORE, handlerSlot)
 
         val start = Label()
@@ -2865,13 +2927,15 @@ class BytecodeGenerator(
      * Emits the class that implements one `try`'s handler, and returns its internal name.
      *
      * The `{ ... }` block becomes `scratching` on a class of its own, which implements the
-     * `ScratchHandlerN` the wrapped call's `emit` clause calls for. That is the shape the old design
-     * gave it too — a method of its own, with the body compiled exactly as written — so a handler
-     * body keeps meaning what it meant. What changed is how a `scratch` reaches it: through the value
-     * the caller passed, not through a `static` name.
+     * `ScratchHandlerN` the wrapped call's `emit` clause calls for — the same shape a lambda takes,
+     * for the same reason: the block is a method of a generated object.
      *
-     * Three details are load-bearing:
+     * Four details are load-bearing:
      *
+     *  * **It captures what it reads.** A handler runs at a moment of its own, from a frame of its
+     *    own, so an enclosing local it names is copied into a field and handed in through the
+     *    constructor. This is what makes reading one legal; before, the block was a `static` method
+     *    and had no way to reach it, which the analyzer did not report.
      *  * **The interface's parameters are `Object`s.** So each one is converted to the type the
      *    clause declared, into a local of its own, before the body runs. That is what lets a body
      *    keep writing `emit1 * emit2` against `int` while the JVM sees `Object`.
@@ -2882,11 +2946,19 @@ class BytecodeGenerator(
      *    rather than returning from this method — the two exits mean different things and both are
      *    needed.
      */
-    private fun emitScratchHandlerClass(construct: ExtractorTry): String {
+    private fun emitScratchHandlerClass(
+        construct: ExtractorTry,
+        captures: List<Pair<LocalSymbol, String>>,
+        outerHandlerInterface: String?,
+    ): String {
         val name = "${currentOwner}\$ScratchHandler\$${scratchHandlerCounter++}"
         val parameters = construct.extractorParameters
         val signature = construct.handler.signature
         val interfaceName = standardLibraryClass("ScratchHandler${signature.size}")
+        // A body that scratches again needs the handler *it* was given, so that one travels in like
+        // any other captured value. It is named apart from the local captures so the two can never
+        // be confused in a diagnostic.
+        val outerHandlerField = outerHandlerInterface?.let { "outerHandler" }
 
         val enclosingOwner = currentOwner
         currentOwner = name
@@ -2902,9 +2974,32 @@ class BytecodeGenerator(
         )
         writer.visitSource(currentFile.sourceName(), null)
 
-        // No captures and no constructor arguments: a handler body reads its own parameters and
-        // static state, exactly as it did when this was a `static` method.
-        emitLambdaConstructor(writer, name, emptyList())
+        for ((symbol, fieldName) in captures) {
+            writer.visitField(
+                ACC_PRIVATE or ACC_FINAL,
+                fieldName,
+                descriptorOf(symbol.type),
+                null,
+                null,
+            ).visitEnd()
+        }
+
+        if (outerHandlerField != null && outerHandlerInterface != null) {
+            writer.visitField(
+                ACC_PRIVATE or ACC_FINAL,
+                outerHandlerField,
+                "L$outerHandlerInterface;",
+                null,
+                null,
+            ).visitEnd()
+        }
+
+        emitHandlerConstructor(
+            writer,
+            name,
+            captures,
+            outerHandlerField?.let { it to outerHandlerInterface!! },
+        )
 
         val mv = writer.visitMethod(
             ACC_PUBLIC,
@@ -2923,10 +3018,15 @@ class BytecodeGenerator(
             lambdaIdentity = construct,
             // `this` occupies slot 0 and the interface's `Object` parameters follow.
             firstSlot = 1,
+            // The captured fields are how an enclosing local is read from here.
+            captures = captures.associate { it.first to it.second },
             static = false,
             // What a `nyan` returns from, and what the trailing return has to agree with.
             returnType = ObjectType,
             extractorResult = true,
+            // A body that scratches again calls the handler *it* was handed, which is a field here.
+            handlerInterface = outerHandlerInterface,
+            handlerField = outerHandlerField,
         )
         // The `Object`s the interface handed over occupy the first slots; the locals the body reads
         // start after them.
@@ -2960,6 +3060,43 @@ class BytecodeGenerator(
         output[name] = writer.toByteArray()
         currentOwner = enclosingOwner
         return name
+    }
+
+    /**
+     * The constructor of a generated handler class: the captured locals, then the outer handler.
+     *
+     * The parameter list has to match what the call site pushes, in the same order, which is why both
+     * are built from the same two lists rather than independently.
+     */
+    private fun emitHandlerConstructor(
+        writer: ClassWriter,
+        name: String,
+        captures: List<Pair<LocalSymbol, String>>,
+        outerHandler: Pair<String, String>?,
+    ) {
+        val parameterTypes = captures.map { it.first.type } +
+            listOfNotNull(outerHandler?.let { ClassType(it.second, it.second.substringAfterLast('/')) })
+        val mv = writer.visitMethod(ACC_PUBLIC, "<init>", descriptorOf(parameterTypes, VoidType), null, null)
+        mv.visitCode()
+        mv.visitVarInsn(ALOAD, 0)
+        mv.visitMethodInsn(INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false)
+
+        var slot = 1
+        for ((symbol, fieldName) in captures) {
+            mv.visitVarInsn(ALOAD, 0)
+            mv.visitVarInsn(loadOpcode(symbol.type), slot)
+            mv.visitFieldInsn(PUTFIELD, name, fieldName, descriptorOf(symbol.type))
+            slot += BuiltinTypes.slotCountOf(symbol.type)
+        }
+        if (outerHandler != null) {
+            mv.visitVarInsn(ALOAD, 0)
+            mv.visitVarInsn(ALOAD, slot)
+            mv.visitFieldInsn(PUTFIELD, name, outerHandler.first, "L${outerHandler.second};")
+        }
+
+        mv.visitInsn(RETURN)
+        mv.visitMaxs(0, 0)
+        mv.visitEnd()
     }
 
     /**
@@ -4789,6 +4926,13 @@ class BytecodeGenerator(
             // enclosing scope travels exactly as far as the `purr` does.
             is PurrStatement -> collectLocalReferences(node.body, into)
 
+            // A `nyan` and a `scratch` live inside a `try` handler, which is a method of its own, so
+            // a value they name has to be captured by that handler. Omitting them here is not a lost
+            // optimisation: the capture list is what the constructor is built from, and a reference
+            // the list misses is compiled as the type's default instead of as a read.
+            is NyanStatement -> node.value?.let { collectLocalReferences(it, into) }
+            is ScratchExpression -> node.values.forEach { collectLocalReferences(it, into) }
+
             else -> Unit
         }
     }
@@ -4847,6 +4991,16 @@ class BytecodeGenerator(
         var handlerSlot: Int? = null,
         /** The internal name of the interface [handlerSlot] holds, e.g. `.../ScratchHandler2`. */
         var handlerInterface: String? = null,
+        /**
+         * The field holding the handler this method's *body* was given, when the body is itself a
+         * `try` handler.
+         *
+         * A `scratch` written inside a handler body scratches the effect further out, so the handler
+         * that body was handed has to be carried in as a field — it arrives through the constructor
+         * rather than occupying a slot of this method's frame, because it is one of the values the
+         * generated class captures.
+         */
+        var handlerField: String? = null,
         /**
          * The `purr` blocks currently open in this method, innermost last.
          *

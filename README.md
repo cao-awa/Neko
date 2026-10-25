@@ -36,7 +36,7 @@ Tasks are module-qualified now that there is more than one module.
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # Tests.
-./gradlew :neko:test                     # the compiler: 540 tests
+./gradlew :neko:test                     # the compiler: 547 tests
 ./gradlew :plugin:idea:test              # the plugin: 56 tests, in a real IDE instance
 
 # The compiler as one self-contained jar.
@@ -1175,6 +1175,35 @@ signature. That is why several `try` blocks may answer the same `emit` clause: e
 handler object and hands it to the call it wraps, so a callee serves every caller independently. It
 also means a `scratch` needs no `try` anywhere in the program — the function's `emit` clause means it
 already holds one.
+
+#### A handler captures the locals around it
+
+The `{ ... }` block becomes a method of a generated class, so a local declared where the `try` is
+written is not simply in scope inside it. It is captured, exactly as a lambda captures:
+
+```neko
+class Neko() {
+  fun invoker() {
+    factor: int = 10
+    greeting: string = "hi"
+    // Both are read inside the block, so both travel in as fields of the handler object.
+    v: int = try test() { a, b ->
+      println(greeting)
+      nyan a * b * factor
+    }
+    println(v)
+  }
+}
+```
+
+Capture is by value and by the same rule as a lambda, which means the same two restrictions apply: a
+handler cannot assign to a captured local (the copy would change and the original would not), and
+`this` is refused inside one, because the block runs on the handler object rather than on the object
+the enclosing function was called on.
+
+A `scratch` written inside a handler body scratches the effect further out, so the handler the
+enclosing function holds is captured too. That is what lets a handler delegate: the inner site calls
+the outer handler, and the answer travels back through both.
 
 #### Leaving the value out
 
