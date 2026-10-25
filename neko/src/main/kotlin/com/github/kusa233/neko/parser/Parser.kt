@@ -92,21 +92,47 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         return PackageDeclaration(name, name.split('.'), nameSpan)
     }
 
-    /** `import com.github.kusa233.neko.stdlib.emit` */
+    /**
+     * `import java.util` or `import java.util.HashMap`
+     *
+     * Both are the same syntax: a dotted name. Which one it is is decided by the analyzer, because
+     * only the platform can say whether the last segment is a class or a package part — `java.util`
+     * is a package, `java.util.HashMap` is a class, and no rule about the shape of the text
+     * distinguishes them. The parser therefore reads the name and records it; see
+     * [ImportDeclaration.isClassImport].
+     *
+     * `.*` is deliberately not accepted. It would be a second spelling of what a bare `import
+     * java.util` already means, and it is reported with the form to write instead.
+     */
     private fun parseImportDeclaration(): ImportDeclaration? {
         val keyword = advance() // `import`
         skipNewlines()
 
         if (!isNameSegment(current())) {
             error(
-                "expected a package name after 'import' but found ${current().describe()}",
+                "expected a package or class name after 'import' but found ${current().describe()}",
                 current().span,
             )
             synchronizeToStatement()
             return null
         }
 
-        val (name, nameSpan) = parseDottedName(keyword, "an imported package name segment")
+        val (name, nameSpan) = parseDottedName(keyword, "an imported name segment")
+
+        // `import java.util.*` — the wildcard. Reported here rather than at analysis because it is a
+        // syntax the language does not have, and the fix is a rewrite of this clause, not a change
+        // somewhere else. The span covers the `.*` so the caret lands on the part to delete.
+        if (at(TokenType.DOT) && peek(1).type == TokenType.STAR) {
+            val dot = advance()
+            val star = advance()
+            error(
+                "Neko has no '.*': 'import $name' already imports everything in '$name', so write " +
+                    "'import $name'",
+                Span(source, dot.span.start, star.span.end),
+            )
+            return ImportDeclaration(name, name.split('.'), nameSpan)
+        }
+
         return ImportDeclaration(name, name.split('.'), nameSpan)
     }
 
@@ -131,6 +157,11 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             endOffset = segment.span.end
             segments += segment.text
             if (at(TokenType.DOT)) {
+                // `.*` is not a segment: the `.` is left for the caller, which reports the wildcard
+                // with the form to write instead. Consuming it here would turn `java.util.*` into two
+                // errors — "expected a segment" and whatever follows — instead of the one that says
+                // what to do.
+                if (peek(1).type == TokenType.STAR) break
                 advance()
                 continue
             }
@@ -2664,7 +2695,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
     }
 
     /**
-     * Parses a type: `int`, `string[]`, `[int, int] -> int`.
+     * Parses a type: `int`, `string[]`, `[int, int] -> int`, `java.util.HashMap`.
      *
      * Returns `null` (after reporting) when no valid type is present.
      */
@@ -2674,11 +2705,29 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             TokenType.LEFT_BRACKET -> parseFunctionTypeFromBrackets() ?: return null
             TokenType.IDENTIFIER -> {
                 advance()
+                // A qualified name: `java.util.HashMap`. The whole dotted name is one identifier as
+                // far as the type system is concerned — it names a class, not a member of one — so the
+                // segments are joined back into a single name rather than being modelled as a path.
+                // A type position has no other meaning for `.`, which is why this cannot shadow a
+                // member access: there is no value here to reach into.
+                val name = StringBuilder(start.text)
+                var last = start
+                while (at(TokenType.DOT) && isNameSegment(peek(1))) {
+                    advance() // `.`
+                    val segment = advance()
+                    name.append('.').append(segment.text)
+                    last = segment
+                }
                 // `<...>` on a type: captured rather than skipped, because `for ... in` needs the
                 // argument to know what an iterable yields. The JVM still erases it.
                 val arguments = parseTypeArguments()
-                val end = arguments.lastOrNull()?.span?.end ?: start.span.end
-                NamedTypeReference(start.text, start.span, arguments, Span(source, start.span.start, end))
+                val end = arguments.lastOrNull()?.span?.end ?: last.span.end
+                NamedTypeReference(
+                    name.toString(),
+                    Span(source, start.span.start, last.span.end),
+                    arguments,
+                    Span(source, start.span.start, end),
+                )
             }
 
             // `([int] -> int)?` — parentheses, so that a `?` can apply to the function type as a

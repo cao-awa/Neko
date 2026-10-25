@@ -49,24 +49,67 @@ class NekoFile(
      * This file's own package comes first, so a local name always wins over an imported one; then
      * the imports in source order. The standard library's package is appended by the analyzer rather
      * than stored here, because it is implicit in every file.
+     *
+     * A single-class import contributes its own *package*, not the class: `import java.util.HashMap`
+     * is a statement about where `HashMap` lives, and the simple name is what the file then writes.
+     * The class it names is pinned by [NekoFile.importedClasses] so that the same clause cannot also
+     * be read as a package called `java.util.HashMap`.
      */
-    fun importPrefixes(): List<String> = imports.map { it.name.replace('.', '/') + "/" }
+    fun importPrefixes(): List<String> = imports.map { it.packageName.replace('.', '/') + "/" }
+
+    /**
+     * The simple names this file's single-class imports pin to one exact class, by simple name.
+     *
+     * `import java.util.HashMap` fixes `HashMap`; without this the clause would be
+     * indistinguishable from `import java.util` and `HashMap` would resolve the same way it would
+     * anyway. What pinning buys is the *restriction*: when a file says which `List` it means, a
+     * second package holding a `List` cannot quietly answer instead.
+     */
+    fun importedClasses(): Map<String, ImportDeclaration> =
+        imports.filter { it.isClassImport }.associateBy { it.simpleName!! }
 }
 
 /**
- * `import com.github.kusa233.neko.stdlib.emit`
+ * `import java.util` — a package — or `import java.util.HashMap` — a single class.
  *
- * Names a package whose classes this file may refer to by simple name. It is not a per-class alias
- * and it never hides a declaration: resolution still prefers this file's own package and the
- * program's own declarations, so an import can only ever *add* a way to resolve a name.
+ * One clause covers both, because the two spellings are the same shape and only the *target* tells
+ * them apart: `java.util.HashMap` names a class, `java.util` names a package. The parser cannot know
+ * which, so it records what was written and [isClassImport] records what the analyzer decided once it
+ * could ask the platform. Nothing here is a per-class alias and nothing hides a declaration:
+ * resolution still prefers the file's own package and the program's own classes, so an import can
+ * only ever *add* a way to resolve a name.
+ *
+ * There is no `.*` form, and its absence is deliberate. A wildcard would be a second way to say what
+ * a bare `import java.util` already means, and the language's rule is that an import names what it
+ * wants. Writing `import java.util.*` is therefore reported with the exact form to write instead.
  */
 class ImportDeclaration(
-    /** Fully-qualified package name, e.g. `com.github.kusa233.neko.stdlib.emit`. */
+    /**
+     * The name exactly as written, e.g. `java.util` or `java.util.HashMap`.
+     *
+     * Kept verbatim because diagnostics quote it back, and because the analyzer needs the original
+     * dotted form to split into package and class before it can decide which one it is.
+     */
     val name: String,
     /** Individual dotted segments, used to point at one segment in diagnostics. */
     val segments: List<String>,
     override val span: Span,
-) : Node
+    /**
+     * Whether the analyzer found [name] to be a class rather than a package.
+     *
+     * Filled in by analysis, not by the parser: whether `java.util.HashMap` names a class is a
+     * question only the platform can answer. Defaults to `false` so a declaration built before
+     * analysis reads as the package import it was when nothing said otherwise.
+     */
+    var isClassImport: Boolean = false,
+) : Node {
+
+    /** The package this clause pulls into view, whichever of the two kinds it turned out to be. */
+    val packageName: String get() = if (isClassImport) name.substringBeforeLast('.') else name
+
+    /** The class this clause pins, or `null` when it imports a whole package. */
+    val simpleName: String? get() = if (isClassImport) name.substringAfterLast('.') else null
+}
 
 /**
  * Every `.neko` file being compiled together, as one program.

@@ -43,6 +43,16 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      */
     private val importPrefixes = LinkedHashMap<ClassSymbol, List<String>>()
 
+    /**
+     * The single-class imports of each file, by the simple name they pin.
+     *
+     * Keyed by class symbol like [importPrefixes], because a class' own `import` clauses are what
+     * decide where *its* bodies may look — the same reason the package imports are stored that way.
+     * Filled in after [checkImports] has decided which clauses name a class, since that decision is
+     * what makes a clause appear here at all.
+     */
+    private val importedClasses = LinkedHashMap<ClassSymbol, Map<String, ImportDeclaration>>()
+
     /** Non-null while analysing the body of a lambda literal. */
     private var currentLambda: LambdaState? = null
 
@@ -223,6 +233,12 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         for (file in program.files) {
             val seen = mutableMapOf<String, ImportDeclaration>()
             for (declaration in file.imports) {
+                // Whether this clause names a class or a package is decided here, once, by asking the
+                // platform — and it is decided *before* the duplicate check below, because `import
+                // java.util` and `import java.util.HashMap` are not duplicates of each other even
+                // though one name is a prefix of the other.
+                classifyImport(declaration)
+
                 val previous = seen.put(declaration.name, declaration)
                 if (previous == null) continue
                 diagnostics.error(
@@ -234,6 +250,45 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 )
             }
         }
+    }
+
+    /**
+     * Decides whether [declaration] imports one class or a whole package, in place.
+     *
+     * `import java.util.HashMap` and `import java.util` are the same syntax and the same shape; the
+     * only difference is what the name *is*. So the question is put to the platform: if the whole
+     * dotted name is a class the JVM can load, it is a class import, and otherwise it is a package.
+     * That is what the requirement "when the target is not a class, import the whole package" means
+     * operationally, and it is also why a package the platform does not describe still works — an
+     * unknown name is simply not a platform class, so it is taken as a package, which is the same
+     * treatment such a package has always had.
+     *
+     * The program's own classes are asked about first. A file may import the package of a class it
+     * compiles itself, and `import com.example.Helper` should then mean `Helper` rather than a package
+     * called `com.example.Helper`; the program's declarations are the only other authority that knows
+     * a class by its full name.
+     */
+    private fun classifyImport(declaration: ImportDeclaration) {
+        val owner = declaration.name
+        // A dotted name whose last segment is not capitalized cannot be a class, and asking the
+        // platform about it would only cost a classload attempt per import on every build.
+        val simpleName = owner.substringAfterLast('.')
+        if (simpleName == owner || simpleName.firstOrNull()?.isUpperCase() != true) return
+
+        // The program's own declarations are asked first, and read from the AST rather than from
+        // `classes`: imports are classified before the class symbols exist, because the symbols'
+        // resolution order is itself built from these clauses. A file may legitimately import the
+        // package of a class it compiles itself, and the declaration says which package that is.
+        val declared = program.classes.firstOrNull { it.name == simpleName }
+        if (declared != null) {
+            val packageName = program.fileOf(declared)
+                ?.packageDeclaration?.name
+                .orEmpty()
+            declaration.isClassImport = packageName == owner.substringBeforeLast('.', "")
+            return
+        }
+
+        declaration.isClassImport = loadQualifiedClass(owner) != null
     }
 
     /** Parameter symbols for [function]; used by the code generator to place locals. */
@@ -302,7 +357,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             classes[declaration.name] = symbol
             // Resolution reads the declaring file's clauses rather than a per-file flag, because a
             // class' own `import` clauses are what decide where *its* bodies may look for a name.
-            importPrefixes[symbol] = program.fileOf(declaration)?.importPrefixes().orEmpty()
+            val file = program.fileOf(declaration)
+            importPrefixes[symbol] = file?.importPrefixes().orEmpty()
+            // Only the clauses `checkImports` recognised as naming a class; the rest are packages and
+            // are already covered by `importPrefixes`.
+            importedClasses[symbol] = file?.importedClasses().orEmpty()
         }
     }
 
@@ -2755,8 +2814,18 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * Initialization is deliberately skipped: the compiler must not execute code from the program
      * being compiled, and a class' identity is all that is being asked about here.
      */
-    private fun loadPlatformClass(simpleName: String): Class<*>? = try {
-        Class.forName("java.lang.$simpleName", false, javaClass.classLoader)
+    private fun loadPlatformClass(simpleName: String): Class<*>? = loadQualifiedClass("java.lang.$simpleName")
+
+    /**
+     * The class the JVM loads by its fully-qualified name, or `null` when there is none.
+     *
+     * `loadPlatformClass` answers only for `java.lang`, which is what an *unqualified* name is allowed
+     * to reach. A dotted name says where it expects the class to live, so it is loaded as written —
+     * that is what makes `import java.util.HashMap` answerable, and it is also what makes a typo in a
+     * class import visible instead of being accepted as a package called `java.util.Hashmap`.
+     */
+    private fun loadQualifiedClass(binaryName: String): Class<*>? = try {
+        Class.forName(binaryName, false, javaClass.classLoader)
     } catch (_: ClassNotFoundException) {
         null
     } catch (_: LinkageError) {
@@ -3554,6 +3623,47 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             return resolveMemberCall(expression, callee, namedClass, className, viaClass = true)
         }
 
+        // A *qualified* receiver — `java.lang.System.currentTimeMillis()`, or a Neko class named by
+        // its package. The receiver parses as nested member accesses rather than a name, so it has to
+        // be tried as a qualified class name before anything else happens to it; otherwise
+        // `java.lang` would be looked up as a value and reported as an unresolved name.
+        //
+        // The whole dotted text — receiver plus member — is tried first, because `java.util.HashMap()`
+        // and `java.lang.System.exit(0)` are *both* calls whose callee chain spells a qualified name
+        // and only the last segment decides which reading applies. Whichever segment is a class, the
+        // call is that class: `…HashMap()` constructs it, `…System.exit` calls its static member.
+        //
+        // Everything here goes through the non-reporting [qualifiedClassOrNull]: a chain like
+        // `list.get(0)` also reaches this point, and it must fall through to the ordinary value path
+        // without a word about "unknown type".
+        val dotted = qualifiedClassNameOf(callee.receiver)
+        if (dotted != null && '.' in dotted) {
+            val whole = "$dotted.${callee.memberName}"
+            val wholeClass = qualifiedClassOrNull(whole)
+            if (wholeClass != null) {
+                // `java.util.HashMap()` — the last segment is the class, so this is a construction.
+                if (callee.isSafeCall) reportSafeCallOnClassName(callee.memberSpan, whole)
+                expression.constructedType = wholeClass
+                for (argument in expression.arguments) analyzeExpression(argument)
+                return wholeClass
+            }
+
+            val receiverClass = qualifiedClassOrNull(dotted)
+            if (receiverClass != null) {
+                // The receiver is not a value, so it is left un-analysed; its type records what it
+                // named, which is what the emitter needs to pick the owner for `invokestatic`.
+                if (callee.isSafeCall) reportSafeCallOnClassName(callee.memberSpan, dotted)
+                callee.receiverIsClass = true
+                callee.receiver.resolvedType = receiverClass
+                val symbol = classes[receiverClass.simpleName]
+                return if (symbol != null) {
+                    resolveMemberCall(expression, callee, symbol, receiverClass.simpleName, viaClass = true)
+                } else {
+                    platformQualifiedCall(expression, callee, receiverClass)
+                }
+            }
+        }
+
         // A JDK class named as the receiver — `System.currentTimeMillis()`, `Math.abs(x)`. The program
         // does not declare it, so there is no symbol to check members against; the reflected class
         // answers instead. Without this branch these calls were refused as an unresolved *name*, which
@@ -3566,6 +3676,34 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             callee.receiverIsClass = true
             callee.receiver.resolvedType = platformType
             return platformStaticCall(expression, callee, platformType)
+        }
+
+        // A qualified chain that *reads* as a class name, but resolved to nothing, has already been
+        // described by `resolveClassType`; falling through would analyse `java` as a value and add a
+        // second, misleading "unresolved reference 'java'". Two shapes have to be caught here:
+        //
+        //  * the member is the class — `java.util.Nope()` — so the whole dotted text is the name;
+        //  * the receiver is the class — `java.util.Nope.f()` — so the chain is the name.
+        //
+        // Whether it really was a class name is decided by the capital letter, which is the same rule
+        // `resolveClassType` applies; a lowercase last segment is not a class and is left to the value
+        // path, where it may well be a legitimate member read.
+        // Order matters. When the receiver already ends in a capitalized segment — `java.lang.Nope.f()`
+        // — the receiver is the class the reader meant to call into, so it is the name reported; `f`
+        // is the member, not a class. Only when the receiver does not read as a class at all —
+        // `java.util.Nope()` — is the whole dotted text the candidate, because there the member *is*
+        // the class. Choosing the wrong one would report a name the reader never wrote.
+        val failedType = dotted?.let { receiver ->
+            if ('.' in receiver && receiver.substringAfterLast('.').firstOrNull()?.isUpperCase() == true) {
+                receiver
+            } else {
+                "$receiver.${callee.memberName}"
+            }
+        }
+        if (failedType != null && '.' in failedType && readsAsQualifiedType(failedType)) {
+            resolveClassType(failedType, callee.receiver.span)
+            for (argument in expression.arguments) analyzeExpression(argument)
+            return ErrorType
         }
 
         val receiverType = analyzeExpression(callee.receiver)
@@ -3725,7 +3863,6 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             expression.constructedType = type
             return type
         }
-
         if (classSymbol.isInterface) {
             for (argument in expression.arguments) analyzeExpression(argument)
             diagnostics.error(
@@ -4061,6 +4198,44 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             return platformStaticFieldOf(platformType, expression)
         }
 
+        // A *qualified* receiver reaching a static field — `java.lang.System.out`. Same ambiguity as
+        // in the call path: the chain is plain names, and only resolution can say whether it ends at
+        // a class. Asked without reporting, so an ordinary `point.x` read falls through untouched.
+        val dotted = qualifiedClassNameOf(expression.receiver)
+        if (dotted != null && '.' in dotted) {
+            val receiverClass = qualifiedClassOrNull(dotted)
+            if (receiverClass != null) {
+                if (expression.isSafeCall) reportSafeCallOnClassName(expression.memberSpan, dotted)
+                expression.receiverIsClass = true
+                expression.receiver.resolvedType = receiverClass
+                val symbol = classes[receiverClass.simpleName]
+                return if (symbol != null) {
+                    staticMemberOf(symbol, expression, receiverClass.simpleName)
+                } else {
+                    platformStaticFieldOf(receiverClass, expression)
+                }
+            }
+        }
+
+        // A qualified chain that reads as a class name but resolved to nothing has already been
+        // described by `resolveClassType`; falling through would analyse `java` as a value and add a
+        // second, misleading "unresolved reference 'java'".
+        //
+        // The receiver is the candidate when it already ends in a capitalized segment — `java.lang.Nope`
+        // in `java.lang.Nope.f` — because there the member is an ordinary member name. Otherwise the
+        // whole dotted text is, since the member is the class itself: `a.b.C` read as a field.
+        val failedType = dotted?.let { receiver ->
+            if ('.' in receiver && receiver.substringAfterLast('.').firstOrNull()?.isUpperCase() == true) {
+                receiver
+            } else {
+                "$receiver.${expression.memberName}"
+            }
+        }
+        if (failedType != null && '.' in failedType && readsAsQualifiedType(failedType)) {
+            resolveClassType(failedType, expression.span)
+            return ErrorType
+        }
+
         val receiverType = analyzeExpression(expression.receiver)
 
         if (receiverType.isError) return ErrorType
@@ -4175,6 +4350,112 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             "$className.…",
         )
     }
+
+    /**
+     * Whether [dotted] was unmistakably written as a *type* rather than as a value being reached into.
+     *
+     * A dotted chain is ambiguous in general — `point.x` and `java.util.HashMap` look the same — but
+     * two shapes cannot be a value, and both are worth recognising so that a mistake in them is
+     * reported once, as the type it was meant to be, instead of decaying into "unresolved reference
+     * 'java'":
+     *
+     *  * it ends in a capitalized segment, which is how a class is spelled;
+     *  * it starts at a package the platform describes. `java` and `javax` are names no variable can
+     *    hold, and a chain beginning with one is a reader writing a qualified class name.
+     *
+     * Used only after resolution has already failed, so it never suppresses a legal program.
+     */
+    private fun readsAsQualifiedType(dotted: String): Boolean {
+        // A chain rooted at a class the program declares is a member access: `Code.OK` reads a static
+        // field of `Code`. Reporting it as an unknown type would be wrong twice over — the type is
+        // fine, and the name is not a type at all.
+        if (classes[dotted.substringBefore('.')] != null) return false
+        if (dotted.substringAfterLast('.').firstOrNull()?.isUpperCase() == true) return true
+        val root = dotted.substringBefore('.')
+        return root != dotted && (root == "java" || root == "javax" || PlatformLibrary.hasPackage(root))
+    }
+
+    /**
+     * The class a **qualified** name might denote, or `null` — asking, never reporting.
+     *
+     * A dotted chain of names is ambiguous by construction: `java.util.HashMap` is a class, while
+     * `list.size` and `point.x` are a value and one of its members, and nothing in the syntax tells
+     * them apart. Resolution is what decides, and it must decide *before* anything is reported,
+     * because the common case — an ordinary member read written with dots — must not be greeted with
+     * "unknown type".
+     *
+     * So this is the question the analyzer may ask freely and repeat: is there a class with exactly
+     * this dotted name, either declared by the program or loadable from the platform? Only when the
+     * answer is yes does the caller commit to reading the chain as a class name, and only then may
+     * `resolveClassType` be called — which is where a *genuinely* bad qualified type is reported.
+     */
+    private fun qualifiedClassOrNull(dotted: String): ClassType? {
+        val simpleName = dotted.substringAfterLast('.')
+        if (simpleName.firstOrNull()?.isUpperCase() != true) return null
+
+        // A chain that *starts* at a class the program declares is a member access, not a qualified
+        // package name: `Code.OK` is the enum constant `OK` of `Code`, and `point.Distance`-style
+        // chains are the same shape. This check is what keeps the rest of this function from
+        // inventing a class called `Code/OK` out of a perfectly ordinary static field read.
+        val root = dotted.substringBefore('.')
+        if (classes[root] != null) return null
+
+        // A class the program declares, reachable by its package: `com.example.Helper`. The
+        // declaration knows its own internal name, so it is authoritative.
+        classes[simpleName]?.let { symbol ->
+            if (dotted.replace('.', '/') == symbol.jvmInternalName) {
+                return ClassType(symbol.jvmInternalName, simpleName)
+            }
+        }
+
+        val internalName = dotted.replace('.', '/')
+        if (loadQualifiedClass(dotted) != null) return ClassType(internalName, simpleName)
+
+        // A class compiled elsewhere, in a package the platform does not describe: it cannot be
+        // checked, so a name that *looks* qualified is taken on the file's word. This is the same
+        // rule an unqualified name outside `java.lang` has always had, and without it a qualified
+        // name would be useless for exactly the case it exists for.
+        if (!PlatformLibrary.hasPackage(dotted.substringBeforeLast('.'))) {
+            return if (loadPlatformClass(simpleName) == null) ClassType(internalName, simpleName) else null
+        }
+
+        // The package is real but holds no such class: `java.util.Hashmap` is a typo, and answering
+        // here would turn it into a reference to a class file that does not exist.
+        return null
+    }
+
+    /**
+     * The dotted class name [receiver] spells, or `null` when it is not a chain of plain names.
+     *
+     * `java.lang.System` parses as `MemberAccess(MemberAccess(Name(java), lang), System)` — which is
+     * exactly what a *member access* is, so nothing in the syntax distinguishes the two readings. The
+     * difference is what the names turn out to be, and that is what this function lets the caller find
+     * out: it reconstructs the dotted text only when every link is a plain name, so a receiver that
+     * reads a real value (`list.size`, `obj.field`) is left alone and analysed as the value it is.
+     *
+     * Returns `null` for anything else, which is the signal to carry on with the ordinary path.
+     */
+    private fun qualifiedClassNameOf(receiver: Expression): String? = when (receiver) {
+        is NameExpression -> receiver.name
+        is MemberAccessExpression -> {
+            val prefix = qualifiedClassNameOf(receiver.receiver)
+            prefix?.let { "$it.${receiver.memberName}" }
+        }
+        else -> null
+    }
+
+    /**
+     * A call to a static method of a class named by its **package** — `java.lang.System.exit(0)`.
+     *
+     * `platformQualifiedCall` is the same work the unqualified path does, but the owner is already
+     * settled: a qualified name says where the class is, so there is no imported package to search
+     * and no `java.lang` default to fall back on.
+     */
+    private fun platformQualifiedCall(
+        expression: CallExpression,
+        callee: MemberAccessExpression,
+        owner: ClassType,
+    ): NekoType = platformStaticCall(expression, callee, owner)
 
     /**
      * `Cls.member` / `Cls.member(...)` where `Cls` is a JDK class the program does not declare.
@@ -4839,6 +5120,45 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private fun resolveClassType(name: String, span: Span): NekoType {
         declaredClass(name)?.let { return ClassType(it.jvmInternalName, name) }
 
+        // A *qualified* name — `java.util.HashMap` — says where the class lives, so the imports are
+        // not consulted at all. This is the escape hatch the rest of this function describes the
+        // absence of: without it a class in a package the file did not import, or one whose simple
+        // name two packages share, could not be named at all.
+        //
+        // The platform is still the authority on whether the class exists, which keeps a typo from
+        // becoming a reference to `java/util/Hashmap`. A qualified name whose package the platform
+        // does not describe is taken on the file's word, exactly as an unqualified name outside
+        // `java.lang` is: a class compiled elsewhere cannot be checked, and refusing it would make
+        // qualified names useless for the case they exist for.
+        if ('.' in name) {
+            val simpleName = name.substringAfterLast('.')
+            if (simpleName.firstOrNull()?.isUpperCase() != true) {
+                diagnostics.error(
+                    "'$name' does not end in a class name: a qualified type is written " +
+                        "'package.ClassName', and the class name starts with a capital letter",
+                    span,
+                    unresolved = true,
+                )
+                return ErrorType
+            }
+            // The same query the expression path asks, so a qualified name means one thing whether it
+            // appears as a type or as a callee. Answering `null` here is a reportable mistake, because
+            // a type position cannot be anything but a type.
+            qualifiedClassOrNull(name)?.let { return it }
+            val packageName = name.substringBeforeLast('.')
+            diagnostics.error(
+                if (PlatformLibrary.hasPackage(packageName)) {
+                    "'$packageName' has no class named '$simpleName'"
+                } else {
+                    "unknown type '$name': the JDK has no class by that name, and no package " +
+                        "'$packageName' to take it from either"
+                },
+                span,
+                unresolved = true,
+            )
+            return ErrorType
+        }
+
         // A class the program does not declare but the JVM provides — `RuntimeException`,
         // `ArithmeticException` — is one a program has to be able to name in order to extend or
         // catch it. Whether it exists is answered by the platform rather than by a list, so every
@@ -4950,6 +5270,16 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      */
     private fun platformClassInImportedPackages(simpleName: String): String? {
         val owner = currentClass ?: return null
+
+        // A single-class import answers first and answers *only*: when a file wrote
+        // `import java.util.HashMap` it has said which `HashMap` it means, so no other imported
+        // package gets to supply one. That restriction is the whole difference between this form and
+        // the package form — without it the clause would be a longer way to write `import java.util`.
+        val pinned = importedClasses[owner]?.get(simpleName)
+        if (pinned != null && pinned.simpleName == simpleName) {
+            return pinned.name.replace('.', '/')
+        }
+
         for (prefix in importPrefixes[owner].orEmpty()) {
             // `importPrefixes` stores JVM form (`java/util/`), which is what a class file needs.
             val packageName = prefix.removeSuffix("/").replace('/', '.')

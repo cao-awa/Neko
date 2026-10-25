@@ -1,0 +1,29 @@
+Accept a whole package or a single class in `import`, and allow qualified names
+
+`import` used to name a package only, which left two things unexpressible: pinning one class when two
+imported packages both hold the name, and naming a class without importing anything. Both are now
+syntax the language has, and both are the *same* syntax — a dotted name — told apart by what the name
+turns out to be.
+
+So `import java.util` imports a package and `import java.util.HashMap` imports one class, decided in
+`classifyImport` by asking the platform whether the whole dotted name is loadable. When it is not a
+class it is a package, which is exactly the requested rule and also why an unknown package keeps
+working: an unloadable name is taken as a package, the same treatment it always had.
+
+There is no `.*`, and the refusal says so rather than being silently accepted. A wildcard would be a
+second spelling of the bare package import, and the parser reports the form to write instead.
+
+Qualified names — `java.util.HashMap`, `java.lang.System.currentTimeMillis()` — then came almost for
+free, in every position the same dotted text appears: a type, a constructor, a static call, a static
+field. The work was making one rule answer all of them, because `a.b.C` and `value.member` are the
+same syntax and only resolution can tell them apart. `qualifiedClassOrNull` is that rule: it asks
+without reporting, so a chain like `p.x` or `Code.OK` falls through to the ordinary value path
+untouched, and only a chain that really names a class is read as one.
+
+The enum case is what would have broken silently: `Code.OK` starts at a class the program declares, so
+`qualifiedClassOrNull` refuses any chain whose root is a declared class. Six enum tests caught that
+before it shipped, which is the argument for having them.
+
+A mistake in a qualified name is reported once, as the type it was meant to be, rather than decaying
+into "unresolved reference 'java'": `readsAsQualifiedType` recognises the two shapes that cannot be a
+value — a capitalized last segment, and a chain rooted at a package the platform describes.
