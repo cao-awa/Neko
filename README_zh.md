@@ -32,7 +32,7 @@ Neko 是一门用来做编译器实验的玩具 JVM 语言：它有类、接口�
 
 # 运行一个已编译的程序。程序名在构建里查表，所以往 neko/build.gradle.kts 的
 # 列表里加一个程序是改配置，而不是新增任务。
-./gradlew :neko:runNeko -Pneko.program=ExceptionSample
+./gradlew :neko:runNeko -Pneko.program=ExceptionMapping
 
 # 测试。
 ./gradlew :neko:test                     # 编译器：552 个测试
@@ -104,12 +104,16 @@ neko.outputDirectory=neko-compile/classes
 
 列出的每个目录都会被递归搜索，所以新增一个源文件就是把它放进某个目录。
 
-`ExceptionSample` 打印：
+示例按主题一个目录，**每个目录就是自己那个包**：`sample/lock/` 下的文件声明
+`locate com.github.kusa233.neko.sample.lock`。这才让输出分开——
+`neko-compile/classes/com/github/kusa233/neko/sample/lock/PurrSample.class` 等等——因为一个类会被写到
+它 `locate` 所指的目录下，和 Java 的 class 文件一样。
 
-```
-123
-456
-1
+`ExceptionMapping` 是 `scratch`/`nyan`/`try` 的参考，它每一行打印什么都由上一行的注释说明——示例自带
+预期输出，直接读示例比这里的表格更可靠：
+
+```bash
+./gradlew :neko:runNeko -Pneko.program=ExceptionMapping
 ```
 
 `NullableSample` 端到端地演练可空特性，它的注释把**不该**编译通过的行标得和该通过的行一样清楚——
@@ -119,17 +123,19 @@ neko.outputDirectory=neko-compile/classes
 ./gradlew :neko:runNeko -Pneko.program=NullableSample
 ```
 
-`NyaSample` 对 [`nya`](#检验程序的假设)做同样的事，`ExceptionSample` 对 `scratch`、`nyan` 和
+`NyaSample` 对 [`nya`](#检验程序的假设)做同样的事，`ExceptionMapping` 对 `scratch`、`nyan` 和
 `try` 也是如此。`EffectRecovery` 是同一套机制的参考——也就是下文 `emit`/`scratch`/`nyan` 一节
 逐步走完的那个。`EnumSample` 展示 [`miao class`](#枚举miao)——常量、常量可以携带的值，以及
 `values()`/`valueOf()`；`PurrSample` 展示[锁](#锁purrpurredpurrclspurredcls)：
 
 ```bash
 ./gradlew :neko:runNeko -Pneko.program=NyaSample
-./gradlew :neko:runNeko -Pneko.program=ExceptionSample
+./gradlew :neko:runNeko -Pneko.program=ExceptionMapping
 ./gradlew :neko:runNeko -Pneko.program=EffectRecovery
 ./gradlew :neko:runNeko -Pneko.program=EnumSample
 ./gradlew :neko:runNeko -Pneko.program=PurrSample
+./gradlew :neko:runNeko -Pneko.program=InstanceSample
+./gradlew :neko:runNeko -Pneko.program=ForSample
 ```
 
 ## 标准库

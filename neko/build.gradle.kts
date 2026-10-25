@@ -197,16 +197,27 @@ fun existingDirectories(directories: List<String>): List<String> = directories
 /** The programs, as the absolute paths of the directories that exist. */
 val nekoSourcePaths: List<String> = existingDirectories(nekoSourceDirectories)
 
-/** The name each runnable program is known by, paired with its fully-qualified class. */
+/**
+ * The name each runnable program is known by, paired with its fully-qualified class.
+ *
+ * The class name is the sample's `locate` package plus the class it puts `main` in, which is why it
+ * tracks the source directories: `lock/PurrSample.neko` declares `locate ...sample.lock`, so the
+ * class is `...sample.lock.PurrSample`. A program whose file name differs from its runnable class —
+ * `ControlFlowSample.neko` holds `ForSample` — is listed under both names so either one works on the
+ * command line.
+ */
 val nekoPrograms: Map<String, String> = mapOf(
-    "Sample" to "com.github.kusa233.neko.sample.Sample",
-    "ExceptionSample" to "com.github.kusa233.neko.sample.ExceptionSample",
-    "NullableSample" to "com.github.kusa233.neko.sample.NullableSample",
-    "NyaSample" to "com.github.kusa233.neko.sample.NyaSample",
-    "EnumSample" to "com.github.kusa233.neko.sample.EnumSample",
-    "PurrSample" to "com.github.kusa233.neko.sample.PurrSample",
-    "ForSample" to "com.github.kusa233.neko.sample.ForSample",
-    "EffectRecovery" to "com.github.kusa233.neko.sample.EffectRecovery",
+    "NyaSample" to "com.github.kusa233.neko.sample.assert.NyaSample",
+    "ControlFlowSample" to "com.github.kusa233.neko.sample.control.ForSample",
+    "ForSample" to "com.github.kusa233.neko.sample.control.ForSample",
+    "EffectRecovery" to "com.github.kusa233.neko.sample.effect.EffectRecovery",
+    "ScratchHandlerExternal" to "com.github.kusa233.neko.sample.effect.ScratchHandlerExternal",
+    "EnumSample" to "com.github.kusa233.neko.sample.enum.EnumSample",
+    "ExceptionMapping" to "com.github.kusa233.neko.sample.exception.ExceptionMapping",
+    "InstanceSample" to "com.github.kusa233.neko.sample.instance.InstanceSample",
+    "PurrSample" to "com.github.kusa233.neko.sample.lock.PurrSample",
+    "NullableSample" to "com.github.kusa233.neko.sample.nullable.NullableSample",
+    "PerformanceTest" to "com.github.kusa233.neko.sample.performance.PerformanceTest",
 )
 
 /**
@@ -239,7 +250,7 @@ tasks.register<JavaExec>("compileNeko") {
 /**
  * Runs one compiled program.
  *
- * Named with `gradlew :neko:runNeko -Pneko.program=ExceptionSample`. Adding a program is therefore a
+ * Named with `gradlew :neko:runNeko -Pneko.program=ExceptionMapping`. Adding a program is therefore a
  * configuration change rather than a new task.
  */
 tasks.register<JavaExec>("runNeko") {

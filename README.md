@@ -33,7 +33,7 @@ Tasks are module-qualified now that there is more than one module.
 
 # Run a compiled program. The name is looked up in the build, so adding a program to the
 # list in neko/build.gradle.kts is a configuration change rather than a new task.
-./gradlew :neko:runNeko -Pneko.program=ExceptionSample
+./gradlew :neko:runNeko -Pneko.program=ExceptionMapping
 
 # Tests.
 ./gradlew :neko:test                     # the compiler: 552 tests
@@ -113,12 +113,17 @@ neko.outputDirectory=neko-compile/classes
 Every directory listed is searched recursively, so adding a source file means adding it to a
 directory.
 
-`ExceptionSample` prints:
+The samples are organised one directory per topic, and **each directory is its own package**: a file
+under `sample/lock/` declares `locate com.github.kusa233.neko.sample.lock`. That is what splits the
+output — `neko-compile/classes/com/github/kusa233/neko/sample/lock/PurrSample.class` and so on —
+because a class is written under the directory its `locate` names, exactly as a Java class file is.
 
-```
-123
-456
-1
+`ExceptionMapping` is the `scratch`/`nyan`/`try` reference, and every line it prints is described by
+the comment above it — the samples carry their own expected output, so read them rather than a table
+here:
+
+```bash
+./gradlew :neko:runNeko -Pneko.program=ExceptionMapping
 ```
 
 `NullableSample` exercises the nullable feature end to end, and its comments mark the lines that must
@@ -129,7 +134,7 @@ output. It is the closest thing to a reference for [nullable types](#nullable-ty
 ./gradlew :neko:runNeko -Pneko.program=NullableSample
 ```
 
-`NyaSample` does the same for [`nya`](#checking-what-the-program-believes), and `ExceptionSample` for
+`NyaSample` does the same for [`nya`](#checking-what-the-program-believes), and `ExceptionMapping` for
 `scratch`, `nyan` and `try`. `EffectRecovery` is the reference for the same mechanism —the one the
 `emit`/`scratch`/`nyan` section below walks through. `EnumSample` shows [`miao class`](#enum-miao) —
 the constants, the values they can carry, and `values()`/`valueOf()` —and `PurrSample` shows
@@ -137,10 +142,12 @@ the constants, the values they can carry, and `values()`/`valueOf()` —and `Pur
 
 ```bash
 ./gradlew :neko:runNeko -Pneko.program=NyaSample
-./gradlew :neko:runNeko -Pneko.program=ExceptionSample
+./gradlew :neko:runNeko -Pneko.program=ExceptionMapping
 ./gradlew :neko:runNeko -Pneko.program=EffectRecovery
 ./gradlew :neko:runNeko -Pneko.program=EnumSample
 ./gradlew :neko:runNeko -Pneko.program=PurrSample
+./gradlew :neko:runNeko -Pneko.program=InstanceSample
+./gradlew :neko:runNeko -Pneko.program=ForSample
 ```
 
 ## Standard library
