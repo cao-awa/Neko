@@ -174,11 +174,41 @@ when it exists:
   needs a receiver.
 - **Classes** — the program's own, and the Java platform's. The platform's are read from the running
   JDK rather than listed, and only the ones this file can actually name are offered: `java.lang`,
-  and the file's imported package.
+  and the file's imported packages.
 - **Types, in a type position** — after a `:`, and inside an `emit [ ... ]` clause. A type position
   gets its own list, since a variable is not a type.
 - **The built-ins**, each shown with the Java type it is, so `Integer` and `int` are visibly the same
   type rather than two.
+
+### Automatic imports
+
+A class the file cannot name yet is offered too — with the `import` clause that would make it
+nameable, written for you when you accept it. Type `Hash`, pick `HashMap` from the popup, and the
+file gains `import java.util` as well as the name.
+
+This depends on three things agreeing, which is why it is built the way it is:
+
+- **The index is the compiler's.** `PlatformLibrary` reads the package and class list out of the
+  running JDK's `java.base` module, so a name is offered exactly when the analyzer would resolve it.
+  No table is kept, because a JDK gains and loses classes between releases.
+- **The fix is the compiler's.** The analyzer reports an unresolvable platform class as an error
+  carrying `suggestedImport`, and the IDE turns that field into an Alt+Enter action. Re-deriving the
+  clause in the plugin would be a second implementation free to disagree with the one that decides
+  whether the file compiles.
+- **The placement is the file's.** A Neko header is ordered — `locate`, then every `import`, then the
+  classes — so `NekoImports` works out where the clause goes from the file's own text rather than
+  from a line number, and refuses to write a clause the file already has (a second identical import
+  is an error).
+
+Classes needing an import are offered **only once a prefix has been typed**. `java.base` holds 3373
+classes; listing them all on an empty prefix both overflows the popup and buries the handful of names
+the reader was reaching for. `java.lang` and already-imported packages need no clause, so they are
+offered regardless.
+
+Note what the language itself requires: **the import is compulsory**. `HashMap` without
+`import java.util` is an error, not a warning — the compiler cannot know a class from a package it was
+never told to look in, and resolving it silently would make the name's package invisible in the source.
+The IDE writes the clause; it does not stand in for one.
 
 ### How highlighting works
 
@@ -201,6 +231,44 @@ free to disagree with the compiler's, and the structure the IDE reports on comes
 anyway, through the annotator.
 
 ## Syntax
+
+### Package and import
+
+A file begins with an optional `locate`, then its `import` clauses, then the classes:
+
+```neko
+locate com.github.kusa233.sample
+
+import java.util
+
+class Neko() {
+}
+```
+
+`locate` gives the file's package; a class declared in it becomes
+`com/github/kusa233/sample/Neko`. A file without one is in the unnamed package.
+
+`import` names a **package**, not a class — there is no per-class alias. What an import decides is
+where a name the program does *not* declare is looked for, and the lookup order is:
+
+1. the program's own declarations, by simple name, whichever package they are in — the unit of
+   compilation is the whole program, so this always answers first and an import can only ever *add* a
+   way to resolve a name;
+2. `java.lang`, so `Exception` and `String` need no clause;
+3. the imported packages, in source order.
+
+For a package the JDK describes, the class has to really be in it: `import java.util` does not make
+`BufferedReader` resolve, because `java.util` has no such class. This is what stops a typo from
+becoming a reference to a class that does not exist, and it is also what lets the compiler tell you
+which clause to write:
+
+```
+Main.neko:8:20: error: unknown type 'HashMap': 'HashMap' is java.util.HashMap, which this file does
+not import — write 'import java.util' to reach it
+```
+
+A package the JDK does not describe — one compiled elsewhere — cannot be checked at all, so it is
+taken on the file's word. That is the case an import exists for in the first place.
 
 ### Class
 

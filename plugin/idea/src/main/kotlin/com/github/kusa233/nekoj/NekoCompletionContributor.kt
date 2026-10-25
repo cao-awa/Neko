@@ -73,8 +73,13 @@ private class NekoCompletionProvider : CompletionProvider<CompletionParameters>(
         // A type is a different vocabulary from a value, so a type position gets its own list: a
         // local variable or a method call is not something that can be written there.
         val ast = file.parsedFile(model)
+        // What the reader has typed so far, which is what decides whether the classes needing an
+        // import are worth offering. The platform filters the list by it anyway; asking here too means
+        // the 3373 classes of `java.base` are narrowed *before* they are added, rather than after.
+        val prefix = result.prefixMatcher.prefix
+
         if (isTypePosition(file.text, parameters.offset)) {
-            addTypeNames(model, ast, result)
+            addTypeNames(model, ast, prefix, result)
             return
         }
 
@@ -98,8 +103,8 @@ private class NekoCompletionProvider : CompletionProvider<CompletionParameters>(
         for (symbol in model.classes.values) {
             result.addElement(classLookup(symbol))
         }
-        for ((name, packageName) in platformClasses(ast)) {
-            result.addElement(platformClassLookup(name, packageName))
+        for (location in platformClasses(ast, prefix)) {
+            result.addElement(platformClassLookup(location))
         }
     }
 
@@ -114,6 +119,7 @@ private class NekoCompletionProvider : CompletionProvider<CompletionParameters>(
     private fun addTypeNames(
         model: NekoProgramModel,
         ast: NekoFile?,
+        prefix: String,
         result: CompletionResultSet,
     ) {
         for ((name, type) in BuiltinTypes.byName) {
@@ -122,8 +128,8 @@ private class NekoCompletionProvider : CompletionProvider<CompletionParameters>(
         for (symbol in model.classes.values) {
             result.addElement(classLookup(symbol))
         }
-        for ((name, packageName) in platformClasses(ast)) {
-            result.addElement(platformClassLookup(name, packageName))
+        for (location in platformClasses(ast, prefix)) {
+            result.addElement(platformClassLookup(location))
         }
     }
 
@@ -226,29 +232,85 @@ private fun builtinTypeLookup(name: String, type: NekoType): LookupElementBuilde
 }
 
 /**
- * The names of the platform's classes that this file may write, without qualification.
+ * The platform's classes this file may write, each with the package it comes from.
  *
- * Two sets, because Neko resolves an unqualified capitalized name in two places: `java.lang` first,
- * and then the file's first imported package. Offering anything else would propose a name that
- * resolves to the wrong class or to none — the completion list has to describe this file, not the
- * JDK in general.
+ * Three sets, because Neko resolves an unqualified capitalized name in three places: the program's own
+ * declarations (added elsewhere), `java.lang` — which needs no import — and then the file's imported
+ * packages.
+ *
+ * A fourth set is offered on a condition: the classes of packages the file does *not* import. Those
+ * need a clause written, so accepting one edits the file's header — which is exactly the automatic
+ * import a reader wants. They are added only once [prefix] is non-empty, and that restriction is
+ * load-bearing rather than cosmetic: `java.base` holds 3373 classes, and listing all of them on an
+ * empty prefix both overflows the popup and buries the handful of names the reader was actually
+ * reaching for. Filtering them by prefix first means the list stays short and every row is a name the
+ * reader is demonstrably part-way through typing.
+ *
+ * An imported package contributes only if the platform actually has it. A package the JDK does not
+ * describe cannot be checked, so offering its classes would be inventing names.
  *
  * [ast] is `null` when the file has no parse — while it is being written, say — and then only
  * `java.lang` is offered, since that lookup does not depend on the file.
  */
-private fun platformClasses(ast: NekoFile?): List<Pair<String, String>> {
-    val imported = ast?.imports?.firstOrNull()?.name
-    val fromImport = if (imported == null) {
-        emptyList()
-    } else {
-        PlatformLibrary.classesIn(imported).map { it to imported }
+private fun platformClasses(ast: NekoFile?, prefix: String): List<PlatformClassCandidate> {
+    val imported = ast?.imports?.map { it.name }.orEmpty().toSet()
+
+    val candidates = LinkedHashMap<String, PlatformClassCandidate>()
+    for (name in PlatformLibrary.javaLangClasses) {
+        candidates[name] = PlatformClassCandidate(name, "java.lang", needsImport = false)
     }
-    return PlatformLibrary.javaLangClasses.map { it to "java.lang" } + fromImport
+    for (packageName in imported) {
+        for (name in PlatformLibrary.classesIn(packageName)) {
+            candidates[name] = PlatformClassCandidate(name, packageName, needsImport = false)
+        }
+    }
+
+    if (prefix.isEmpty()) return candidates.values.toList()
+
+    // Everything else the indexed module holds, offered with the clause it would need. A name already
+    // reachable keeps its existing entry: it must not be re-offered as needing an import it does not
+    // need, and a name in two packages is left at the one the file can already write.
+    for (location in PlatformLibrary.classes) {
+        if (!location.simpleName.startsWith(prefix, ignoreCase = true)) continue
+        candidates.getOrPut(location.simpleName) {
+            PlatformClassCandidate(location.simpleName, location.packageName, needsImport = true)
+        }
+    }
+    return candidates.values.toList()
 }
 
-/** A class the Java platform provides, shown with the package it belongs to. */
-private fun platformClassLookup(name: String, packageName: String): LookupElementBuilder =
-    LookupElementBuilder.create(name).withTypeText(packageName, true)
+/** A platform class the completion list can offer, and whether writing it needs an `import`. */
+private class PlatformClassCandidate(
+    val simpleName: String,
+    val packageName: String,
+    /**
+     * `true` when the file cannot name this class yet, so accepting the completion has to write the
+     * clause. `java.lang` and already-imported packages are `false`.
+     */
+    val needsImport: Boolean,
+)
+
+/**
+ * A class the Java platform provides, shown with the package it belongs to.
+ *
+ * The package is in the tail text rather than the type text because it is the thing the reader is
+ * choosing between: two rows reading `HashMap` are only distinguishable by where they come from. A
+ * class that has to be imported says so, which is what tells the reader that accepting it will edit
+ * the file's header as well as the line they are on.
+ */
+private fun platformClassLookup(candidate: PlatformClassCandidate): LookupElementBuilder {
+    var builder = LookupElementBuilder.create(candidate.simpleName)
+        .withTypeText("class", true)
+        .withTailText("  ${candidate.packageName}", true)
+
+    if (candidate.needsImport) {
+        builder = builder.withInsertHandler { context, _ ->
+            val file = context.file
+            if (file != null) NekoImports.addImport(file, candidate.packageName)
+        }
+    }
+    return builder
+}
 
 /** The parse of this file, or `null` when it was never parsed. */
 private fun NekoPsiFile.parsedFile(model: NekoProgramModel): NekoFile? =

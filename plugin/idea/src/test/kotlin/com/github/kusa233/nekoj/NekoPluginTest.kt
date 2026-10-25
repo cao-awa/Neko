@@ -768,6 +768,200 @@ class NekoPluginTest : BasePlatformTestCase() {
         assertContainsElements(completeAtCaret(), "ArrayList")
     }
 
+    // ------------------------------------------------------------------------- automatic imports
+
+    fun testCompletionOffersAClassThatNeedsAnImportOnceTheReaderStartsTypingIt() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main() {
+                        value: Hash<caret>
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // `HashMap` is in `java.util`, which this file does not import, so the name would not compile
+        // as it stands. It is offered anyway because accepting it writes the clause -- and only once
+        // a prefix has been typed, which is what keeps the popup from being flooded by all 3373
+        // classes of `java.base`.
+        assertContainsElements(completeAtCaret(), "HashMap")
+    }
+
+    fun testAnEmptyPrefixDoesNotOfferEveryPlatformClass() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main() {
+                        value: <caret>
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // The counterpart to the test above: with nothing typed, only `java.lang` (which needs no
+        // import) is offered. Offering the whole platform module here would overflow the popup.
+        val names = completeAtCaret()
+        assertFalse("HashMap needs an import, so it must wait for a prefix", "HashMap" in names)
+        assertTrue("java.lang classes need no import, so they are offered", "Exception" in names)
+    }
+
+    fun testAcceptingAClassThatNeedsAnImportWritesTheClause() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main() {
+                        value: Hash<caret>
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        val elements = myFixture.completeBasic().orEmpty()
+        val hashMap = elements.first { it.lookupString == "HashMap" }
+        myFixture.lookup.currentItem = hashMap
+        myFixture.finishLookup('\t')
+
+        // The whole point of the feature: one keystroke both inserts the name and makes it resolvable.
+        val text = myFixture.editor.document.text
+        assertTrue(
+            "expected an import to be written, but the file is:\n$text",
+            text.contains("import java.util"),
+        )
+        assertTrue("expected the name itself to be inserted, but the file is:\n$text", text.contains("HashHashMap") || text.contains("HashMap"))
+    }
+
+    fun testAnImportIsNotWrittenTwice() {
+        val file = myFixture.configureByText(
+            "Sample.neko",
+            """
+            locate com.github.kusa233.test
+
+            import java.util
+
+            class Sample {
+                static {
+                    fun main() {
+                        value: HashMap<caret>
+                    }
+                }
+            }
+            """.trimIndent(),
+        ) as NekoPsiFile
+
+        // A second identical clause is an error in the language ("already imported"), so asking for
+        // one the file already has must be a no-op rather than a compiling file turned into a broken
+        // one.
+        assertFalse("no change should be needed", NekoImports.addImport(file, "java.util"))
+        assertEquals(
+            "the file should still have exactly one import of java.util",
+            1L,
+            Regex("import java\\.util(\\s|$)").findAll(myFixture.editor.document.text).count().toLong(),
+        )
+    }
+
+    fun testAnImportFollowsAnExistingImport() {
+        val file = myFixture.configureByText(
+            "Sample.neko",
+            """
+            locate com.github.kusa233.test
+
+            import java.io
+
+            class Sample {
+            }
+            """.trimIndent(),
+        ) as NekoPsiFile
+
+        assertTrue(NekoImports.addImport(file, "java.util"))
+
+        // New clauses join the group rather than being scattered: `import` lines are read as one
+        // header, and a clause below the first class would not compile at all. Asserting "directly
+        // after the last existing import" pins the group's contiguity without also pinning the blank
+        // lines that separate the header from the declarations.
+        val lines = myFixture.editor.document.text.lines()
+        val ioLine = lines.indexOfFirst { it.trim() == "import java.io" }
+        assertEquals(
+            "the new import should follow the existing one",
+            "import java.util",
+            lines.getOrNull(ioLine + 1)?.trim(),
+        )
+    }
+
+    fun testAnImportFollowsTheLocateClauseWhenTheFileHasNoImport() {
+        val file = myFixture.configureByText(
+            "Sample.neko",
+            """
+            locate com.github.kusa233.test
+
+            class Sample {
+            }
+            """.trimIndent(),
+        ) as NekoPsiFile
+
+        assertTrue(NekoImports.addImport(file, "java.util"))
+
+        // A blank line is kept between `locate` and the import: Neko files in this repository always
+        // separate the two, and `locate a.b` directly above `import c.d` reads as a single clause.
+        val text = myFixture.editor.document.text
+        assertTrue(
+            "expected a blank line between locate and import, but the file is:\n$text",
+            text.contains("locate com.github.kusa233.test\n\nimport java.util\n"),
+        )
+    }
+
+    fun testAnImportGoesToTheTopOfAFileWithNoHeader() {
+        val file = myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+            }
+            """.trimIndent(),
+        ) as NekoPsiFile
+
+        assertTrue(NekoImports.addImport(file, "java.util"))
+
+        // Nothing precedes the import, so it is the first line -- and a blank line after it keeps the
+        // header from running into the first declaration.
+        val text = myFixture.editor.document.text
+        assertTrue(
+            "expected the import at the top, but the file is:\n$text",
+            text.startsWith("import java.util\n"),
+        )
+    }
+
+    fun testAnUnimportedPlatformClassIsReportedWithAnImportFix() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun make(other: HashMap): int {
+                        return 1
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // The analyzer's diagnostic carries the clause, and the annotator turns it into an action, so
+        // the reader never has to remember which package a class lives in.
+        val fixes = myFixture.getAllQuickFixes().map { it.text }
+        assertTrue(
+            "expected an import quick fix, but the editor offered: $fixes",
+            fixes.any { it.contains("java.util") },
+        )
+    }
+
     // -------------------------------------------------------------------------------- helpers
 
     /** Every token the highlighting lexer produces for [text], as type/text pairs. */

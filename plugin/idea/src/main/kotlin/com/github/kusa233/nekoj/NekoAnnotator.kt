@@ -6,6 +6,8 @@ import com.github.kusa233.neko.source.Span
 import com.intellij.lang.annotation.AnnotationHolder
 import com.intellij.lang.annotation.Annotator
 import com.intellij.lang.annotation.HighlightSeverity
+import com.intellij.openapi.editor.Editor
+import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Key
 import com.intellij.openapi.util.TextRange
 import com.intellij.psi.PsiElement
@@ -74,7 +76,17 @@ class NekoAnnotator : Annotator {
 
         // Notes carry the extra detail the compiler attached — a hint at the declaration, say — and
         // each becomes its own annotation when it has a location, so the reader can jump to it.
-        holder.newAnnotation(severity, diagnostic.message).range(range).create()
+        val annotation = holder.newAnnotation(severity, diagnostic.message).range(range)
+
+        // A diagnostic that names the `import` to write becomes an Alt+Enter action. The clause comes
+        // from the compiler rather than being re-derived here: only the analyzer knows which packages
+        // the file already has and which the platform really provides, and a second implementation
+        // would be free to disagree with it.
+        val suggestedImport = diagnostic.suggestedImport
+        if (suggestedImport != null) {
+            annotation.withFix(NekoImportFix(suggestedImport))
+        }
+        annotation.create()
 
         for (note in diagnostic.notes) {
             val noteSpan = note.span
@@ -97,6 +109,32 @@ class NekoAnnotator : Annotator {
 private fun Span.belongsTo(path: Path?): Boolean {
     if (path == null) return false
     return file.path == path
+}
+
+/**
+ * The Alt+Enter action that writes the `import` a diagnostic asked for.
+ *
+ * It is offered only where the compiler filled in [Diagnostic.suggestedImport], which is exactly where
+ * one clause is correct: a `java.lang` class needs none, and a name two packages both declare has no
+ * single right answer. This action therefore never has to decide anything — it applies the compiler's
+ * answer, and reuses [NekoImports] for the placement rules.
+ */
+private class NekoImportFix(private val packageName: String) :
+    com.intellij.codeInsight.intention.IntentionAction {
+
+    override fun getText(): String = "Import '$packageName'"
+
+    override fun getFamilyName(): String = "Import Neko package"
+
+    override fun startInWriteAction(): Boolean = false
+
+    override fun isAvailable(project: Project, editor: Editor?, file: PsiFile?): Boolean =
+        file is NekoPsiFile && file.text.isNotEmpty()
+
+    override fun invoke(project: Project, editor: Editor?, file: PsiFile?) {
+        val target = file ?: return
+        NekoImports.addImport(target, packageName)
+    }
 }
 
 /**

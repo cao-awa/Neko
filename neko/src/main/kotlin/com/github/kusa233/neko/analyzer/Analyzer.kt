@@ -2,6 +2,7 @@ package com.github.kusa233.neko.analyzer
 
 import com.github.kusa233.neko.ast.*
 import com.github.kusa233.neko.diagnostics.DiagnosticBag
+import com.github.kusa233.neko.platform.PlatformLibrary
 import com.github.kusa233.neko.source.Span
 import com.github.kusa233.neko.symbols.*
 import com.github.kusa233.neko.types.*
@@ -4629,6 +4630,19 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // boxed class it happens to share a name with.
         if (isPlatformClass(name)) return ClassType("java/lang/$name", name)
 
+        // A platform class outside `java.lang` — `HashMap`, `BufferedReader` — needs the package it
+        // lives in, and an `import` is the only way to name it: the language has no qualified type
+        // syntax, so `java.util.HashMap` cannot be written. Every imported package is therefore
+        // searched, and the first that the platform agrees has this class wins.
+        //
+        // Agreeing is what makes this safe. A package the JDK does not have cannot be checked at all,
+        // so it is kept as a candidate on the file's word — which is the rule that existed before
+        // this lookup, and it is what lets a program name a class compiled elsewhere whose package
+        // the compiler never sees. A *platform* package is checkable, though, so the class has to be
+        // in it; otherwise `import java.util` would silently turn every typo into
+        // `java/util/Strng`.
+        platformClassInImportedPackages(name)?.let { return ClassType(it, name) }
+
         if (!name.first().isUpperCase()) {
             diagnostics.error(
                 "unknown type '$name': Neko has the eight primitives 'byte', 'short', 'char', " +
@@ -4645,7 +4659,53 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
         // No declaration to read an internal name from, so the package has to be picked: the first
         // import if the file wrote one, and otherwise the file's own package.
+        //
+        // Before falling back, though, one case is worth a diagnostic rather than a class file that
+        // will not load: the name is a real `java.base` class, and its package is one no `import`
+        // names. That happens to everyone who writes `HashMap` and forgets the import, and without
+        // this the compiler would answer `java/util/HashMap` only if the file happened to import
+        // `java.util` already — otherwise the name silently becomes part of the file's own package
+        // and the failure arrives at run time as `NoClassDefFoundError`.
+        suggestedImportFor(name)?.let { packageName ->
+            diagnostics.error(
+                "unknown type '$name': '$name' is $packageName.$name, which this file does not " +
+                    "import — write 'import $packageName' to reach it",
+                span,
+                suggestedImport = packageName,
+            )
+            return ErrorType
+        }
+
         return ClassType(importedPrefix() + name, name)
+    }
+
+    /**
+     * The package a real `java.base` class named [simpleName] has to be imported from, when the file
+     * does not already import one that provides it, or `null` when no import would help.
+     *
+     * Three conditions all have to hold, and each is a way this can be the wrong advice:
+     *
+     *  * the platform must know the name at all — otherwise it is an ordinary name from a package
+     *    compiled elsewhere, and the file's own word is all there is to go on;
+     *  * it must not be in `java.lang`, where it would already have resolved and this code would not
+     *    be running;
+     *  * exactly one package must declare it. A name two packages both hold (`Timer` would be one)
+     *    has no single correct import, and naming one of them would be a guess presented as advice.
+     *
+     * The imported packages are excluded because reaching this point already means none of them
+     * answered — either the class is not in them, or the package is one the platform does not
+     * describe and so could not be checked.
+     */
+    private fun suggestedImportFor(simpleName: String): String? {
+        val candidates = PlatformLibrary.packagesOf(simpleName)
+        if (candidates.size != 1) return null
+        val only = candidates.single()
+        if (only == "java.lang") return null
+        // A package the file already imports has already been searched by
+        // `platformClassInImportedPackages`, so reaching here means it does not provide the class.
+        // Reporting "write the import you already wrote" would be nonsense.
+        if (importPrefixes[currentClass]?.contains(only.replace('.', '/') + "/") == true) return null
+        return only
     }
 
     /**
@@ -4659,12 +4719,31 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private fun declaredClass(simpleName: String): ClassSymbol? = classes[simpleName]
 
     /**
+     * `java/[package]/[simpleName]` for a platform class the file's imports make reachable, or `null`.
+     *
+     * Only a package the platform actually describes can be answered this way: the class has to be in
+     * it, which is what stops `import java.util` from making every typo resolve. A package the JDK
+     * does not have cannot be checked, so it is left to [importedPrefix]'s fallback, where the file's
+     * word is taken as given.
+     */
+    private fun platformClassInImportedPackages(simpleName: String): String? {
+        val owner = currentClass ?: return null
+        for (prefix in importPrefixes[owner].orEmpty()) {
+            // `importPrefixes` stores JVM form (`java/util/`), which is what a class file needs.
+            val packageName = prefix.removeSuffix("/").replace('/', '.')
+            if (!PlatformLibrary.hasPackage(packageName)) continue
+            if (simpleName in PlatformLibrary.classesIn(packageName)) return prefix + simpleName
+        }
+        return null
+    }
+
+    /**
      * The package prefix an undeclared class name belongs to: the current file's first `import`, or
      * its own `locate` package when it wrote none.
      *
-     * Taking the first import rather than searching them is what makes resolution a plain reading of
-     * the file: the packages of an undeclared class cannot be inspected, so there is nothing to
-     * search, and a name found in none of them is the same failure wherever it was looked for.
+     * This is the fallback for a name no imported *platform* package provided, so it is what keeps a
+     * program able to name a class compiled elsewhere: such a package cannot be inspected, and the
+     * file's first import is the package it said its names come from.
      */
     private fun importedPrefix(): String {
         val owner = currentClass ?: return packagePrefix()

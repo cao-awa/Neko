@@ -27,9 +27,18 @@ class DiagnosticBag {
      *
      * When a pass has no better anchor it passes `null`; the renderer then omits the source snippet
      * rather than pointing at a misleading location.
+     *
+     * [suggestedImport] is the machine-readable form of "write this `import`": the message says it in
+     * words for a human, and the field says it in a form an editor can insert. It is filled in only
+     * where exactly one clause is correct.
      */
-    fun error(message: String, span: Span? = null, notes: List<Diagnostic> = emptyList()) {
-        report(Diagnostic(Severity.ERROR, message, span, notes))
+    fun error(
+        message: String,
+        span: Span? = null,
+        notes: List<Diagnostic> = emptyList(),
+        suggestedImport: String? = null,
+    ) {
+        report(Diagnostic(Severity.ERROR, message, span, notes, suggestedImport))
     }
 
     fun warning(message: String, span: Span? = null, notes: List<Diagnostic> = emptyList()) {

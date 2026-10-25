@@ -21,6 +21,19 @@ class Diagnostic(
     val message: String,
     val span: Span? = null,
     val notes: List<Diagnostic> = emptyList(),
+    /**
+     * The `import` clause that would fix this diagnostic, without the keyword, or `null`.
+     *
+     * This is machine-readable advice rather than prose: the message already says the same thing in
+     * words, but an editor cannot act on a sentence. Keeping it as a field is what lets the IDE offer
+     * a quick fix that inserts exactly the clause the compiler would have wanted, instead of
+     * re-deriving the answer — and, more importantly, instead of deriving a *different* one. Only the
+     * analyzer knows which packages the file already imports and which the platform actually has.
+     *
+     * It stays `null` whenever no single import is correct: a name two packages both declare has no
+     * right answer to offer.
+     */
+    val suggestedImport: String? = null,
 ) {
     /** Convenience factory for the secondary locations attached to a primary diagnostic. */
     fun note(message: String, span: Span?): Diagnostic = Diagnostic(Severity.NOTE, message, span)

@@ -1,8 +1,11 @@
 package com.github.kusa233.neko
 
+import com.github.kusa233.neko.platform.PlatformLibrary
 import com.github.kusa233.neko.source.SourceFile
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /**
  * Tests for `import`, and for the standard library needing none.
@@ -222,6 +225,132 @@ class ImportTest {
             TestSupport.locationOf(source, "com.github.kusa233.other", occurrence = 2),
             "${error.span?.line}:${error.span?.column}",
             "the error belongs on the second import",
+        )
+    }
+
+    /**
+     * A `Main` that names a platform class the program does not declare, with the given clause.
+     *
+     * Separate from [namingUndeclaredLevel] because the two cases are answered by different rules:
+     * `Level` is a name from a package the compiler cannot see, while `HashMap` is one the platform
+     * describes, so the compiler can tell whether the import actually provides it.
+     */
+    private fun namingHashMap(importLine: String): String = buildString {
+        append("locate com.github.kusa233.test\n")
+        if (importLine.isNotEmpty()) {
+            append('\n')
+            append(importLine)
+            append('\n')
+        }
+        append('\n')
+        append("class Main() {\n")
+        append("    static {\n")
+        append("        fun make(other: HashMap): int {\n")
+        append("            return 1\n")
+        append("        }\n")
+        append("    }\n")
+        append("}\n")
+    }
+
+    @Test
+    fun `a java base class resolves through an import of its package`() {
+        // `HashMap` is in `java.util`, not `java.lang`, so an unqualified `HashMap` cannot be looked
+        // up by the implicit `java.lang` rule. The import is what makes the name resolve — and the
+        // descriptor proves it resolved to the right package rather than to the file's own.
+        val result = TestSupport.compile(namingHashMap("import java.util"), name = "Main.neko")
+        assertEquals(
+            emptyList(),
+            TestSupport.errorLocations(result),
+            "a java.base class should resolve when its package is imported",
+        )
+        assertEquals(
+            "(Ljava/util/HashMap;)I",
+            methodDescriptors(result.classes.getValue("com/github/kusa233/test/Main"))["make"],
+            "the import must decide the class' real package",
+        )
+    }
+
+    @Test
+    fun `a java base class without its import is reported with the import to write`() {
+        // The failure this catches is the common one: `HashMap` written without the import used to
+        // compile into the file's own package and fail at run time as `NoClassDefFoundError`. It is
+        // now refused, and the diagnostic names the clause rather than only the mistake — which is
+        // also what the IDE's quick fix reads.
+        val source = namingHashMap("")
+        val error = TestSupport.errors(TestSupport.compile(source, name = "Main.neko")).single()
+
+        assertEquals(
+            "unknown type 'HashMap': 'HashMap' is java.util.HashMap, which this file does not " +
+                "import — write 'import java.util' to reach it",
+            error.message,
+        )
+        assertEquals("java.util", error.suggestedImport, "the fix must be machine-readable too")
+        assertEquals(
+            TestSupport.locationOf(source, "HashMap"),
+            "${error.span?.line}:${error.span?.column}",
+            "the error belongs on the name that could not be resolved",
+        )
+    }
+
+    @Test
+    fun `importing a package that does not hold the class is still an error`() {
+        // The check is that the class is really in the imported package, not merely that some import
+        // exists: `java.util` has no `BufferedReader`, so this must not resolve to
+        // `java/util/BufferedReader` just because an import was written.
+        val source = namingHashMap("import java.util").replace("HashMap", "BufferedReader")
+        val error = TestSupport.errors(TestSupport.compile(source, name = "Main.neko")).single()
+
+        assertTrue(
+            error.message.contains("is java.io.BufferedReader"),
+            "the message should name the package the class really lives in: ${error.message}",
+        )
+        assertEquals("java.io", error.suggestedImport)
+    }
+
+    @Test
+    fun `a java lang class needs no import and suggests none`() {
+        // `java.lang` is the implicit first lookup, so `Exception` resolves with no clause at all and
+        // must never be reported as needing an import.
+        val program = TestSupport.file(
+            "class Main() {",
+            "    static {",
+            "        fun check(failure: Exception) {",
+            "        }",
+            "    }",
+            "}",
+        )
+        assertEquals(
+            emptyList(),
+            TestSupport.errorLocations(TestSupport.compile(program)),
+            "a java.lang class should resolve without an import",
+        )
+    }
+
+    @Test
+    fun `the platform index knows every package it holds a class in`() {
+        // The index is what the analyzer and the IDE both read, so its shape is worth pinning: a
+        // name-to-package reverse lookup, and no package offered that holds nothing.
+        assertTrue(
+            PlatformLibrary.hasPackage("java.util"),
+            "java.util should be indexed",
+        )
+        assertEquals(
+            listOf("java.util"),
+            PlatformLibrary.packagesOf("HashMap"),
+            "HashMap lives in exactly one package",
+        )
+        assertEquals(
+            "java.io",
+            PlatformLibrary.importPackageFor("BufferedReader"),
+            "the reverse lookup is what an automatic import is built from",
+        )
+        assertNull(
+            PlatformLibrary.importPackageFor("Exception"),
+            "a java.lang class needs no import, so there is nothing to insert",
+        )
+        assertNull(
+            PlatformLibrary.importPackageFor("Level"),
+            "a name the platform does not have cannot suggest a package",
         )
     }
 
