@@ -1,4 +1,4 @@
-locate com.github.kusa233.neko.sample
+locate com.github.kusa233.neko.sample.assert
 
 /**
  * `nya <condition>` — writes down what the program believes, and says what a wrong belief means.

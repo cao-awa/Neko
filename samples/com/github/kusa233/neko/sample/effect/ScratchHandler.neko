@@ -1,0 +1,17 @@
+locate com.github.kusa233.neko.sample.effect
+
+/**
+ * The reference for `try ... { ... }`, `scratch` and `nyan`.
+ *
+ * `nyanTest` declares the handler; `b` reaches it from two calls down. The `try` compiles its
+ * `{ ... }` block into a method on this class, and every `scratch` with a matching emit signature
+ * calls that method instead of raising anything. `nyan` returns a value from it; `yield` throws an
+ * `EmitYieldException` that the `try` catches and stores into its target.
+ */
+class ScratchHandler {
+    static {
+        fun scratching() {
+            scratch 1, 2
+        } emit [int, int]
+    }
+}

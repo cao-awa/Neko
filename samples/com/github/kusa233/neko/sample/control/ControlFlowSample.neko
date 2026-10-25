@@ -1,4 +1,4 @@
-locate com.github.kusa233.neko.sample
+locate com.github.kusa233.neko.sample.control
 
 import java.util
 

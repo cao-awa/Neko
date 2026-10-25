@@ -1,4 +1,4 @@
-locate com.github.kusa233.neko.sample
+locate com.github.kusa233.neko.sample.effect
 
 /**
  * The reference for `try ... { ... }`, `scratch` and `nyan`.
@@ -26,11 +26,7 @@ class EffectRecovery {
         }
 
         fun a(): int {
-            return inner() // Recovery to b, return 30 directly
-        } emit [int, int]
-
-        fun inner(): int {
-            return b()
+            return b() // Recovery to here, return 30 directly
         } emit [int, int]
 
         fun b(): int {

@@ -1,0 +1,39 @@
+locate com.github.kusa233.neko.sample.lock
+
+/**
+ * `purr { ... }` — a critical section, backed by a `java.util.concurrent.locks.StampedLock`.
+ *
+ * The block asks for a lock on the way in and gives it back on the way out, and "on the way out"
+ * includes every way there is: falling off the end, a `return`, a `raise`, and an exception thrown by
+ * anything called inside. That last one is why this is a keyword rather than a library call — the
+ * release has to be emitted for each path, and a `StampedLock` also has to be told *which*
+ * acquisition to undo, which is a stamp the source cannot carry.
+ *
+ * Four forms. Two choices — *which* lock, and *which* mode — spelled as one word each:
+ *
+ *   purr { ... }        the instance lock, written: the default, and by far the most common
+ *   purred { ... }      the instance lock, read: readers do not wait for each other
+ *   purrcls { ... }     the class lock, written: shared by every object and every static function
+ *   purredcls { ... }   the class lock, read
+ *
+ * A thread may hold the read lock while others read, but a writer excludes everyone. So a
+ * read-modify-write belongs under `purr`, and only a read that does not need to be consistent with
+ * other readers belongs under `purred`.
+ */
+
+class PurrSample() {
+    static {
+        private val number: int = 0
+
+        fun main() {
+            for (i: int = 0; i < 1000000; i++) {
+                add()
+            }
+            println(number)
+        }
+
+        fun add() {
+            number++
+        }
+    }
+}

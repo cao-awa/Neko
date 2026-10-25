@@ -1,0 +1,21 @@
+locate com.github.kusa233.neko.sample.exception
+
+class ExceptionMapping {
+    static {
+        fun main() {
+            try emitter() { success ->
+                yield
+            }
+        }
+
+        fun emitter() {
+            v: int = try err() scratch false
+            println("Continues")
+            println(v)
+        } emit [bool]
+
+        fun err(): int {
+            return 1 / 0
+        }
+    }
+}

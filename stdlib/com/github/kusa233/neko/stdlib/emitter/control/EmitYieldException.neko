@@ -1,4 +1,4 @@
-locate com.github.kusa233.neko.stdlib.emitter
+locate com.github.kusa233.neko.stdlib.emitter.control
 
 /**
  * The carrier a `yield` throws.
@@ -28,5 +28,9 @@ class EmitYieldException: Exception() {
 
     constructor(data: Object) {
         this.data = data
+    }
+
+    public fun fillInStackTrace(): Throwable {
+        return this;
     }
 }

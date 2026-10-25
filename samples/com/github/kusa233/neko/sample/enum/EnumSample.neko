@@ -1,4 +1,4 @@
-locate com.github.kusa233.neko.sample
+locate com.github.kusa233.neko.sample.enum
 
 /**
  * `miao class` — a fixed set of named values, each an object the compiler creates.
