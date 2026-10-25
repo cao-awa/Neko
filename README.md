@@ -3,7 +3,7 @@
 Neko is a toy JVM language for experimenting with compilers: it has classes, interfaces,
 `emit`/`scratch`/`nyan` error control, and it compiles straight to Java bytecode.
 
-[中文](README.zh.md)
+[中文](README_zh.md)
 
 ## Project layout
 
@@ -414,10 +414,15 @@ Main.neko:6:29: error: 'java.util' has no class named 'Hashmap'
 A package it does not describe is taken on the file's word, because a class compiled elsewhere cannot
 be checked and refusing it would make qualified names useless for the case they exist for.
 
-Members of a JDK class are resolved reflectively and dispatched against the reflected owner and
+A JDK class' **static** members are resolved reflectively and dispatched against the reflected owner and
 descriptor; a call that matches no overload is refused and told what the class does declare. The class
 name is matched before its receiver is treated as a value, because there is no value there —and since
 Neko has no static-import syntax, `Cls.member` is the only spelling available for a static member.
+
+Only statics, though: an *instance* of a JDK class has no members here. `System.currentTimeMillis()` and
+`System.out` work, while `m.size()` on a `HashMap` is refused —the JDK was never compiled by the
+program, so there is no symbol to check a member against, and the message says exactly that rather than
+guessing. A value the platform hands over is usable as a value: pass it on, store it, print it.
 
 ### Class
 
@@ -668,6 +673,14 @@ is the same value and the same declaration; the analyzer simply knows more for a
 ordinary spelling works there and no `?` is needed.
 
 ```neko
+class Holder {
+    val value: int
+
+    constructor(value: int) {
+        this.value = value
+    }
+}
+
 h: Holder? = Holder(4)
 
 if (h != null) {
@@ -950,13 +963,37 @@ class Neko() {
 ```
 
 **`yield` leaves through the `try` instead.** It throws `EmitYieldException` carrying its value, the
-`try` catches it, and that value becomes what the `try` is worth —so it works from any depth, and a
-`try` that is used as a value can be answered even by a call that never scratches:
+`try` catches it, and that value becomes what the `try` is worth —so it reaches the `try` from any
+depth, however many frames down the `scratch` was:
 
 ```neko
 class Neko() {
   fun invoker() {
-    // `test` never scratches, but the handler yields, so the `try` is worth 7.
+    // The `scratch` is two frames below the `try`, and the answer the handler yields is still what
+    // the `try` is worth.
+    result: int = try outer() { emit1, emit2 ->
+      yield 7
+    }
+    println(result)   // 7
+  }
+
+  fun outer(): int {
+    return inner()
+  } emit [int, int]
+
+  fun inner(): int {
+    return scratch 1, 2
+  } emit [int, int]
+}
+```
+
+A `yield` is what the handler does **when it runs**, so it needs a handler that runs: a `try` whose
+call never scratches is worth what that call returned, and the handler's `yield` is never reached.
+
+```neko
+class Neko() {
+  fun invoker() {
+    // `test` returns 0 and never scratches, so the handler never runs: this is 0, not 7.
     result: int = try test() { emit1, emit2 ->
       yield 7
     }
