@@ -3,6 +3,8 @@
 Neko is a toy JVM language for experimenting with compilers: it has classes, interfaces,
 `emit`/`scratch`/`nyan` error control, and it compiles straight to Java bytecode.
 
+[ä¸­æ–‡](README.zh.md)
+
 ## Project layout
 
 The build is a Gradle multi-module project. The compiler and the IDE plugin are separate modules so
@@ -12,12 +14,12 @@ that using one does not drag in the other: the plugin depends on the compiler, n
 |-----------------|----------------|--------------------------------------------------------------|
 | `neko/`         | `:neko`        | The compiler: lexer, parser, AST, analyzer, bytecode emitter  |
 | `plugin/idea/`  | `:plugin:idea` | NekoJ, the IntelliJ IDEA plugin, built on `:neko`             |
-| `stdlib/`       | â€?             | The Neko standard library, compiled by the compiler itself     |
-| `samples/`      | â€?             | Example programs                                              |
-| `neko-compile/` | â€?             | Compiler output; not checked in                               |
+| `stdlib/`       | â€”            | The Neko standard library, compiled by the compiler itself     |
+| `samples/`      | â€”            | Example programs                                              |
+| `neko-compile/` | â€”            | Compiler output; not checked in                               |
 
 `stdlib/` and `samples/` are source, not modules: both are compiled by Neko itself, so a new file
-there needs no build change. `stdlib/` is *not* a source directory the build passes to the compiler â€?
+there needs no build change. `stdlib/` is *not* a source directory the build passes to the compiler â€”
 the compiler prepends it to every compile from the copy packaged into its own jar. Listing it twice
 would declare every library class twice.
 
@@ -34,9 +36,71 @@ Tasks are module-qualified now that there is more than one module.
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # Tests.
-./gradlew :neko:test                     # the compiler: 464 tests
+./gradlew :neko:test                     # the compiler: 476 tests
 ./gradlew :plugin:idea:test              # the plugin: 51 tests, in a real IDE instance
+
+# The compiler as one self-contained jar.
+./gradlew :neko:executableJar
+java -jar neko/build/executable/neko-1.0-SNAPSHOT-all.jar samples --output out
 ```
+
+## The command line
+
+`executableJar` writes `neko-1.0-SNAPSHOT-all.jar`, which runs on any JVM 21 or newer with nothing
+else on the classpath:
+
+```bash
+java -jar neko-1.0-SNAPSHOT-all.jar <file-or-directory>... [options]
+```
+
+A `.neko` file or a directory of them; a directory is searched recursively. All the arguments are
+compiled as **one program**, which is what lets a class in one file name a class in another.
+
+```
+Options:
+  --output <directory>   Where to write the compiled class files. Defaults to the current
+                         directory.
+  --stdlib-path <dir>    Compile against the standard library in <dir> instead of the one the
+                         compiler carries. The directory is searched recursively for .neko files.
+  --color, --no-color    Force or suppress coloured diagnostics.
+  -h, --help             Show this message.
+```
+
+The exit status is `0` on success, `1` when the program failed to compile (every diagnostic is
+printed, in source order), and `2` for an internal compiler error â€”which must never be mistaken for
+a problem with the program being compiled.
+
+### Why the jar is a separate task
+
+The module's ordinary `jar` stays a plain library jar. `:plugin:idea` depends on `:neko` and ships its
+output inside the plugin, and the IDE already provides a Kotlin standard library â€”filling that jar
+with `kotlin-stdlib` and ASM would put a second copy on the plugin's classpath, which is exactly the
+bundled-runtime conflict `verifyPluginProjectConfiguration` rejects. So `executableJar` writes a
+*second* jar, self-contained and named as such. A reader who wants the command line takes that file; a
+plugin developer keeps linking against the ordinary one.
+
+The dependencies are unpacked into the jar rather than referenced from a `Class-Path` manifest entry,
+because the point is one file that can be copied to another machine and run. The `Main-Class` entry is
+what makes `-jar` work at all: without it the JVM refuses to pick an entry point.
+
+### Bringing your own standard library
+
+`--stdlib-path` compiles against a library of your own instead of the packaged one:
+
+```bash
+java -jar neko-all.jar samples --output out --stdlib-path ./my-stdlib
+```
+
+It is for working on the library itself, or for pinning a version of it to a project. The library is
+still compiled first and a program still never names it â€”the only thing that changes is where its
+sources come from.
+
+A supplied library **replaces** the packaged one rather than adding to it, and that is deliberate: a
+reader who pinned an older library should not quietly also get the newer one's declarations. Two
+consequences follow, and both are reported rather than papered over. A path that is not a directory,
+or that holds no `.neko` file, is an error on the command line â€”falling back to the packaged library
+would make a mistyped path look like a working build. And an empty library stays empty, so a program
+using `scratch` fails with "the compiler's own standard library is missing", which is the truth.
 
 Compiled classes are written to `neko-compile/classes`, relative to the project directory. The path
 and the directories that are compiled come from `gradle.properties`:
@@ -58,7 +122,7 @@ directory.
 ```
 
 `NullableSample` exercises the nullable feature end to end, and its comments mark the lines that must
-*not* compile as clearly as the ones that must â€?the errors are as much a part of the sample as the
+*not* compile as clearly as the ones that must â€”the errors are as much a part of the sample as the
 output. It is the closest thing to a reference for [nullable types](#nullable-types):
 
 ```bash
@@ -66,9 +130,9 @@ output. It is the closest thing to a reference for [nullable types](#nullable-ty
 ```
 
 `NyaSample` does the same for [`nya`](#checking-what-the-program-believes), and `ExceptionSample` for
-`scratch`, `nyan` and `try`. `EffectRecovery` is the reference for the same mechanism â€?the one the
-`emit`/`scratch`/`nyan` section below walks through. `EnumSample` shows [`miao class`](#enum-miao) â€?
-the constants, the values they can carry, and `values()`/`valueOf()` â€?and `PurrSample` shows
+`scratch`, `nyan` and `try`. `EffectRecovery` is the reference for the same mechanism â€”the one the
+`emit`/`scratch`/`nyan` section below walks through. `EnumSample` shows [`miao class`](#enum-miao) â€”
+the constants, the values they can carry, and `values()`/`valueOf()` â€”and `PurrSample` shows
 [locking](#locking-purr-purred-purrcls-purredcls):
 
 ```bash
@@ -83,28 +147,28 @@ the constants, the values they can carry, and `values()`/`valueOf()` â€?and `Pur
 
 The library is written in Neko, in `stdlib/`, and **the compiler carries it**: every compilation
 prepends it to whatever program it was asked to build. A program therefore never names it, and a
-caller never passes it â€?`gradlew compileNeko`, the command line, the IDE and the tests all get it by
+caller never passes it â€”`gradlew compileNeko`, the command line, the IDE and the tests all get it by
 doing nothing.
 
 Its sources are packaged into the compiler's own jar as resources rather than read from `stdlib/` at
 run time. That is what makes a built jar usable from another machine, from the plugin (which receives
-the compiler as a jar on its classpath) and from a test run anywhere â€?none of which can be assumed to
+the compiler as a jar on its classpath) and from a test run anywhere â€”none of which can be assumed to
 sit next to this repository. `StandardLibrary` reads them back by a path that resolves the same way
 whether they came from a jar or from a directory of class files.
 
 The library holds only what the language cannot borrow from the JVM:
 
-* `EmitYieldException` â€?the carrier a `yield` throws. It is checked rather than unchecked on purpose:
+* `EmitYieldException` â€”the carrier a `yield` throws. It is checked rather than unchecked on purpose:
   a `yield` is only legal inside a handler a `try` declared, so every method between them has to say
   it may pass one on. That is what makes the effect visible in the class file instead of a surprise at
-  run time. Its one field is `public` â€?the code that reads it is the `try`'s generated handler, in a
+  run time. Its one field is `public` â€”the code that reads it is the `try`'s generated handler, in a
   *different* class, so `private` would compile cleanly and fail with `IllegalAccessError` the first
   time a `yield` fired.
 
 Everything else the effect mechanism needs is generated: a `try`'s `{ ... }` block becomes a `static`
 method of the class holding the `try`, and `scratch` compiles to an ordinary `invokestatic` against it.
 
-There is exactly one built-in that is not Neko source: `println`, in one overload per built-in type â€?
+There is exactly one built-in that is not Neko source: `println`, in one overload per built-in type â€”
 the seven numeric ones, `string`, `bool` and `Object`. It mirrors `System.out.println` and is modelled
 as an ordinary function so the analyzer and the emitter share one resolution path. `byte`, `short` and
 `char` have no `PrintStream` method of their own, so those three are declared with the Neko type and
@@ -120,12 +184,12 @@ writes `fun iterator(): Iterator` says `import java.util`. That is the ordinary 
 name, not a special case for the loop.
 
 `next()` returns `Object` because that is what the erased interface declares. Neko erases generics
-without emitting the bridge methods a parameterised interface needs â€?`fun next(): int` would compile
+without emitting the bridge methods a parameterised interface needs â€”`fun next(): int` would compile
 to `()I` while `Iterator<T>` declares `()Ljava/lang/Object;`, and the two would never meet. So `Object`
 is not a workaround against the JDK, it *is* the erased signature; `for` inserts the cast and the
 unboxing, and the loop variable's declared type is still what the body reads.
 
-## NekoJ â€?the IntelliJ IDEA plugin
+## NekoJ â€”the IntelliJ IDEA plugin
 
 `plugin/idea` builds **NekoJ**, which gives `.neko` files syntax highlighting, code completion and
 error reporting in IntelliJ IDEA.
@@ -148,7 +212,7 @@ There is no second grammar to drift out of step with the real one.
 ```
 
 The result is `plugin/idea/build/distributions/NekoJ-1.0.0.zip`. Install it with
-**Settings â†?Plugins â†?âš?â†?Install Plugin from Diskâ€?*, then restart the IDE.
+**Settings â†’ Plugins â†’ âš  â†’ Install Plugin from Disk**, then restart the IDE.
 
 The first build downloads IntelliJ IDEA 2026.1.4 from JetBrains' Maven repository (roughly 1.6 GB,
 cached afterwards) and compiles the plugin against it. It is pinned to an exact release rather than
@@ -159,7 +223,7 @@ patch release of the 2026.1 line is what makes that claim mean something.
 
 Because the platform comes from the repository rather than from an installation, the build needs
 network access on its first run, and it no longer depends on any particular IDE being installed on
-the machine â€?a CI runner builds the same plugin.
+the machine â€”a CI runner builds the same plugin.
 
 Note that this is the **unified** IntelliJ IDEA, not Community Edition. Since 2025.3 JetBrains
 merged Community and Ultimate into a single product, so `ideaIC` is no longer published for 2026.1
@@ -168,7 +232,7 @@ product, and at this version it is the only IntelliJ IDEA there is.
 
 One consequence is worth stating plainly, because it is a real loss: compiling against the merged
 product no longer *proves* the plugin avoids paid-only APIs, the way building against Community did.
-What keeps the plugin honest instead is `depends` in `plugin.xml`, which names exactly two modules â€?
+What keeps the plugin honest instead is `depends` in `plugin.xml`, which names exactly two modules â€”
 `com.intellij.modules.platform` and `com.intellij.modules.lang`. An IDE missing either will refuse
 to load the plugin rather than fail in some subtler way at run time.
 
@@ -184,23 +248,23 @@ Both modules target Java 21, because that is what the 2026.1 platform requires.
 The list is the compiler's own symbol table, not a hand-written catalogue, so a name appears exactly
 when it exists:
 
-- **Locals in scope** â€?the variables declared above the caret in the enclosing blocks, and the
+- **Locals in scope** â€”the variables declared above the caret in the enclosing blocks, and the
   parameters of the enclosing function, lambda or `try` extractor. A variable
   declared *below* the caret is not offered, because writing it there would not compile.
-- **The enclosing class' own members** â€?the static ones in a static body, and the instance ones as
+- **The enclosing class' own members** â€”the static ones in a static body, and the instance ones as
   well in an instance body. Members of other classes are not offered bare, because reaching one
   needs a receiver.
-- **Classes** â€?the program's own, and the Java platform's. The platform's are read from the running
+- **Classes** â€”the program's own, and the Java platform's. The platform's are read from the running
   JDK rather than listed, and only the ones this file can actually name are offered: `java.lang`,
   and the file's imported packages.
-- **Types, in a type position** â€?after a `:`, and inside an `emit [ ... ]` clause. A type position
+- **Types, in a type position** â€”after a `:`, and inside an `emit [ ... ]` clause. A type position
   gets its own list, since a variable is not a type.
 - **The built-ins**, each shown with the Java type it is, so `Integer` and `int` are visibly the same
   type rather than two.
 
 ### Automatic imports
 
-A class the file cannot name yet is offered too â€?with the `import` clause that would make it
+A class the file cannot name yet is offered too â€”with the `import` clause that would make it
 nameable, written for you when you accept it. Type `Hash`, pick `HashMap` from the popup, and the
 file gains `import java.util` as well as the name.
 
@@ -213,8 +277,8 @@ This depends on three things agreeing, which is why it is built the way it is:
   carrying `suggestedImport`, and the IDE turns that field into an Alt+Enter action. Re-deriving the
   clause in the plugin would be a second implementation free to disagree with the one that decides
   whether the file compiles.
-- **The placement is the file's.** A Neko header is ordered â€?`locate`, then every `import`, then the
-  classes â€?so `NekoImports` works out where the clause goes from the file's own text rather than
+- **The placement is the file's.** A Neko header is ordered â€”`locate`, then every `import`, then the
+  classes â€”so `NekoImports` works out where the clause goes from the file's own text rather than
   from a line number, and refuses to write a clause the file already has (a second identical import
   is an error).
 
@@ -224,14 +288,14 @@ the reader was reaching for. `java.lang` and already-imported packages need no c
 offered regardless.
 
 Note what the language itself requires: **the import is compulsory**. `HashMap` without
-`import java.util` is an error, not a warning â€?the compiler cannot know a class from a package it was
+`import java.util` is an error, not a warning â€”the compiler cannot know a class from a package it was
 never told to look in, and resolving it silently would make the name's package invisible in the source.
 The IDE writes the clause; it does not stand in for one.
 
 ### Unresolved names
 
 A name the compiler could not resolve is **painted**, not just underlined. A squiggle says "something
-on this line is wrong"; a red identifier says *which* name â€?and on a line holding five names, that is
+on this line is wrong"; a red identifier says *which* name â€”and on a line holding five names, that is
 the difference between a hint and an answer.
 
 The colour comes from the platform's own `CodeInsightColors.WRONG_REFERENCES_ATTRIBUTES`, the key
@@ -241,7 +305,7 @@ reader's theme.
 What decides it is `Diagnostic.unresolved`, a flag the compiler sets in the check that failed to find
 the declaration. It is *not* implied by the severity, and that distinction is load-bearing: "class
 'X' implements 'Y' but does not provide 'f()'" is an error anchored on `X`, a name that resolved
-perfectly well â€?painting it would send the reader to fix the wrong thing. Marking the four shapes
+perfectly well â€”painting it would send the reader to fix the wrong thing. Marking the four shapes
 that really are unresolved (a bare name, a called name, a member name, a type name) keeps the paint
 honest.
 
@@ -249,7 +313,7 @@ honest.
 
 Two details are worth knowing, because both are non-obvious and both are load-bearing.
 
-The compiler's lexer **discards** whitespace and comments â€?the parser has no use for either. An
+The compiler's lexer **discards** whitespace and comments â€”the parser has no use for either. An
 editor cannot: comments must be colourable and foldable, and the platform requires consecutive tokens
 to tile the buffer with no gaps. So `NekoHighlightingLexer` runs the compiler's lexer for its tokens
 and then re-reads the holes as whitespace, `//` comments and `/* */` comments. Everything the
@@ -283,10 +347,10 @@ class Neko() {
 `locate` gives the file's package; a class declared in it becomes
 `com/github/kusa233/sample/Neko`. A file without one is in the unnamed package.
 
-`import` names a **package**, or **one class** â€?there is no per-class alias. What an import decides is
+`import` names a **package**, or **one class** â€”there is no per-class alias. What an import decides is
 where a name the program does *not* declare is looked for, and the lookup order is:
 
-1. the program's own declarations, by simple name, whichever package they are in â€?the unit of
+1. the program's own declarations, by simple name, whichever package they are in â€”the unit of
    compilation is the whole program, so this always answers first and an import can only ever *add* a
    way to resolve a name;
 2. `java.lang`, so `Exception` and `String` need no clause;
@@ -315,10 +379,10 @@ which clause to write:
 
 ```
 Main.neko:8:20: error: unknown type 'HashMap': 'HashMap' is java.util.HashMap, which this file does
-not import â€?write 'import java.util' to reach it
+not import â€”write 'import java.util' to reach it
 ```
 
-A package the JDK does not describe â€?one compiled elsewhere â€?cannot be checked at all, so it is
+A package the JDK does not describe â€”one compiled elsewhere â€”cannot be checked at all, so it is
 taken on the file's word. That is the case an import exists for in the first place.
 
 ### Qualified names
@@ -336,8 +400,8 @@ It is the escape hatch for the two cases an import cannot express: a class whose
 would rather not import at all, and a simple name that two packages both declare.
 
 `a.b.C` and `value.member` are the same syntax, so the compiler resolves before it decides: a dotted
-chain is a qualified class only when a class of exactly that name exists. Everything else â€?`p.x`,
-`Code.OK`, `list.size` â€?stays a member access. The root of the chain is what settles it: a chain
+chain is a qualified class only when a class of exactly that name exists. Everything else â€”`p.x`,
+`Code.OK`, `list.size` â€”stays a member access. The root of the chain is what settles it: a chain
 starting at a class the program declares is a static member read, never a package.
 
 Qualified names follow the same authority rule as imports. A package the JDK describes must really
@@ -352,7 +416,7 @@ be checked and refusing it would make qualified names useless for the case they 
 
 Members of a JDK class are resolved reflectively and dispatched against the reflected owner and
 descriptor; a call that matches no overload is refused and told what the class does declare. The class
-name is matched before its receiver is treated as a value, because there is no value there â€?and since
+name is matched before its receiver is treated as a value, because there is no value there â€”and since
 Neko has no static-import syntax, `Cls.member` is the only spelling available for a static member.
 
 ### Class
@@ -385,7 +449,7 @@ class Neko() {
 }
 ```
 
-A `static { ... }` block holds fields and functions alike, and every member inside it is static â€?
+A `static { ... }` block holds fields and functions alike, and every member inside it is static â€”
 that is what the block says, so writing `static` again on a member is an error:
 
 ```neko
@@ -423,8 +487,8 @@ meow class Point(val x: int, private val y: int) {
 
 - Writing your own `equals`, `hashCode` or `toString` replaces the derived one.
 
-The header is desugared into what the language already had â€?a field, a constructor parameter and a
-`this.x = x` â€?so only the three derived methods are new. They are emitted as bytecode, because Neko
+The header is desugared into what the language already had â€”a field, a constructor parameter and a
+`this.x = x` â€”so only the three derived methods are new. They are emitted as bytecode, because Neko
 has no `is` operator and no cast, so none of them could be written in Neko.
 
 `meow` cannot be applied to an `interface` (an interface has no fields to derive from), and a meow
@@ -447,7 +511,7 @@ miao class Color {
 - **The class file is a real enum**: it extends `java.lang.Enum`, carries `ACC_ENUM`, has a
   `$VALUES` array, and declares `values()` and `valueOf(string)`. So `name()`, `ordinal()`,
   `compareTo`, `equals`, `hashCode` and `toString` all come from `java.lang.Enum` and behave the way
-  a Java caller expects â€?`println(Color.RED)` prints `RED`, not an object identity.
+  a Java caller expects â€”`println(Color.RED)` prints `RED`, not an object identity.
 - `values()` answers a **copy** of the constant array, so writing into the result cannot corrupt the
   enum.
 - A constant may carry values, in which case the fields are written in the header exactly as they are
@@ -465,7 +529,7 @@ miao class Color {
 - `==` between two constants is reference identity, which is what makes an enum usable as a set of
   tags: there is exactly one instance of each constant.
 
-An enum cannot declare a constructor â€?the constants are the only instances it has, and the compiler
+An enum cannot declare a constructor â€”the constants are the only instances it has, and the compiler
 creates them from the constant list. It cannot extend another class, since `java.lang.Enum` is
 already its superclass. It cannot override `name`, `ordinal`, `equals`, `hashCode` or `compareTo`,
 which `java.lang.Enum` declares `final`; `toString` is left open. The list must name at least one
@@ -489,12 +553,12 @@ class Counter() {
 ```
 
 The lock is a `java.util.concurrent.locks.StampedLock`, which is why this is a keyword rather than a
-library call: the release has to be emitted for **every** way out of the block â€?falling off the end,
-a `return`, a `nyan`, a `yield`, and an exception thrown by anything called inside â€?and `unlock` also
+library call: the release has to be emitted for **every** way out of the block â€”falling off the end,
+a `return`, a `nyan`, a `yield`, and an exception thrown by anything called inside â€”and `unlock` also
 needs the stamp the acquisition answered, which is a `long` the source cannot carry. A `synchronized`
 block would need neither, but it also cannot offer a read lock.
 
-There are two independent choices â€?*which* lock, and *which* mode â€?and each combination has its own
+There are two independent choices â€”which* lock, and *which* mode â€”and each combination has its own
 word:
 
 | Written | Lock | Mode |
@@ -505,7 +569,7 @@ word:
 | `purredcls { ... }` | the class' | shared with other readers |
 
 The class lock is one lock for the whole class, shared by every object and every `static` function, so
-`purrcls { }` is what `synchronized (Cls.class)` would be and what a `static` function must use â€?it
+`purrcls { }` is what `synchronized (Cls.class)` would be and what a `static` function must use â€”it
 has no `this` for an instance lock to belong to.
 
 - `purred` and `purredcls` let several threads in at once, so they are for reading a value nobody may
@@ -520,10 +584,10 @@ has no `this` for an instance lock to belong to.
 - Blocks one after another are *not* nested: the first has released before the second is entered.
 
 Four words rather than one keyword plus a modifier, because `class` and `read` are ordinary
-identifiers in this language â€?reading them as modifiers in one position and as names everywhere else
+identifiers in this language â€”reading them as modifiers in one position and as names everywhere else
 would be context-dependent lexing a reader cannot see.
 
-The locks are created on demand â€?a class that never writes one of these keywords carries no lock field
+The locks are created on demand â€”a class that never writes one of these keywords carries no lock field
 at all. The instance lock is a field of each object and the class lock is a `static` field, both
 compiler-created because `StampedLock` lives in `java.util.concurrent.locks`, which a Neko source file
 cannot name.
@@ -552,9 +616,9 @@ missing: string = null     // Error: 'null' needs a nullable type
 - **Dereferencing.** A nullable value cannot be read from, called on, indexed or assigned through.
   `obj.field`, `obj.f()` and `arr[i]` are all errors when `obj` or `arr` is nullable, because none of
   them can answer for the absent case. A test that settles the question narrows the value for the code
-  it covers, so inside the branch the ordinary spelling works â€?see **Smart cast** below.
+  it covers, so inside the branch the ordinary spelling works â€”see **Smart cast** below.
 - **`?.`** is how a nullable value is used: `h?.value` is the field's value, or `null` if `h` is null,
-  and `h?.f(...)` calls `f` only when `h` is there â€?**the arguments are not evaluated** when it is
+  and `h?.f(...)` calls `f` only when `h` is there â€”*the arguments are not evaluated** when it is
   not. The result is nullable, so safe calls chain: `a?.b?.c`.
 - **`?(...)`** is the same for a *function value*. `?.` guards the object a member is reached through,
   but a function held in a variable has no such object: the callee itself is the thing that may be
@@ -566,11 +630,11 @@ missing: string = null     // Error: 'null' needs a nullable type
   absent: ([int, int] -> int)? = null
 
   println(present?(1, 2))     // 3
-  println(absent?(1, 2))      // null â€?and the call does not happen
+  println(absent?(1, 2))      // null â€”and the call does not happen
   println(adder()?(1, 2))     // 3: the callee is the value the call answered
   ```
 
-  As with `?.`, any `?` makes the result nullable, because a call that did not happen has no result â€?
+  As with `?.`, any `?` makes the result nullable, because a call that did not happen has no result â€”
   and that holds even when the callee itself cannot be absent. So `a: int = f?(1)` is an error where
   `a: int? = f?(1)` is not. Without the `?` a nullable function value cannot be called at all.
   A `?` on a call that *cannot* be absent is refused rather than ignored: a declared function is
@@ -580,19 +644,19 @@ missing: string = null     // Error: 'null' needs a nullable type
 - **Comparing.** `x == null` and `x != null` are how absence is asked about, and `==` never throws on a
   null operand: it compiles to `java.util.Objects.equals`, which answers `true` for two nulls. A
   nullable primitive compares by value, so `count == 1` works for an `int?`.
-- **Carrying.** A nullable primitive is a Java reference type in the class file â€?`int?` is
-  `java.lang.Integer` â€?which is what lets the absent case be represented at all. Nothing about this is
+- **Carrying.** A nullable primitive is a Java reference type in the class file â€”`int?` is
+  `java.lang.Integer` â€”which is what lets the absent case be represented at all. Nothing about this is
   visible in the source.
 
 Writing `T??` is an error: a nullable nullable is the same type as a nullable one.
 
 A function type ends in its return type, so `?` on one would attach to the return type rather than to
 the function: `[int] -> int?` returns an absent `int`. To say that the *function value* may be absent,
-group it â€?`([int] -> int)?` â€?and that is the spelling `f?(...)` is called through. The two are
+group it â€”`([int] -> int)?` â€”and that is the spelling `f?(...)` is called through. The two are
 different types, and a message about one never quotes the other's spelling.
 
 `null` is read from its context, so it needs one: `x: string? = null` and `f(null)` where `f` declares
-one parameter are fine, while `println(null)` is not â€?the overloads give no single parameter type to
+one parameter are fine, while `println(null)` is not â€”the overloads give no single parameter type to
 read from, and the message says so rather than guessing. Name it first, and it prints as `null`.
 
 `NullableSample.neko` exercises all of this, including the lines that must not compile.
@@ -607,7 +671,7 @@ ordinary spelling works there and no `?` is needed.
 h: Holder? = Holder(4)
 
 if (h != null) {
-    println(h.value)       // 4 â€?`h` is a Holder here, so no `?.`
+    println(h.value)       // 4 â€”`h` is a Holder here, so no `?.`
 } else {
     println("absent")
 }
@@ -620,17 +684,17 @@ println(h.value)           // also fine
   works because the second operand is reached only when the first held; `x == null || x.f` works for the
   mirror-image reason. Each arm of an `if` sees what *its* condition proves: the `then` of `x != null`
   and the `else` of `x == null` both know the value is there. A `nya`'s failure block is the careful
-  case â€?it answers a throw as well as a false answer, so it only gets the facts of a *condition that
+  case â€”it answers a throw as well as a false answer, so it only gets the facts of a *condition that
   cannot throw*; see [checking what the program believes](#checking-what-the-program-believes).
-- **Which values.** A local or a parameter â€?including a `var`, since nothing outside its own function
-  can write it â€?and a `val` field, either read through an object (`point.x`) or written bare inside the
+- **Which values.** A local or a parameter â€”including a `var`, since nothing outside its own function
+  can write it â€”and a `val` field, either read through an object (`point.x`) or written bare inside the
   class. A `var` field is never narrowed: it is one place anything holding the object may write.
 - **For how long.** Until the declaration is written. `h = other` drops the fact, and so does a write in
   a branch that *may* have run. Facts do not survive the branch that proved them, so a read after the
   `if` is nullable again.
 - **Usable as the narrowed type.** Inside the branch the value can be used wherever the non-nullable
-  type is wanted â€?read from, called, indexed, assigned to a `T` variable, passed to a `T` parameter,
-  returned from a function that declares `T` â€?because on that path it really is a `T`. Leaving the
+  type is wanted â€”read from, called, indexed, assigned to a `T` variable, passed to a `T` parameter,
+  returned from a function that declares `T` â€”because on that path it really is a `T`. Leaving the
   branch, it is a `T?` again.
 
 For an `int?` this is more than a change of spelling: the value is stored boxed, so a narrowed read is
@@ -654,11 +718,11 @@ The primitives are Java's eight, spelled as Neko spells them:
 | `float`    | `F`            | `java.lang.Float`      |
 | `double`   | `D`            | `java.lang.Double`     |
 | `bool`     | `Z`            | `java.lang.Boolean`    |
-| `string`   | â€?             | `java.lang.String`     |
-| `Object`   | â€?             | `java.lang.Object`     |
-| `Throwable`| â€?             | `java.lang.Throwable`  |
+| `string`   | â€”            | `java.lang.String`     |
+| `Object`   | â€”            | `java.lang.Object`     |
+| `Throwable`| â€”            | `java.lang.Throwable`  |
 
-A primitive is carried as the Java reference type in the table whenever it has to be an `Object` â€?
+A primitive is carried as the Java reference type in the table whenever it has to be an `Object` â€”
 inside the `Object` a `yield` throws, inside a nullable local, or as a type argument, which the JVM
 erases.
 
@@ -680,7 +744,7 @@ are visibly the same thing.
 Neko has **no implicit conversion between named types**, and that includes the numeric ones: there is
 no Java-style widening. `x: long = someInt` is an error, `int + long` is an error, and `long + long`
 is a `long`. Arithmetic and ordering require two operands of the *same* numeric type and answer that
-type â€?switching between them is written in the source, not inferred from it.
+type â€”switching between them is written in the source, not inferred from it.
 
 A **literal** is the one exception, because it has no type of its own until a context gives it one:
 
@@ -711,11 +775,11 @@ tooBig: byte = 300        // Error: does not fit in 'byte', whose range is -128.
 | `null`         | the nullable type its context asks for |
 
 The suffix is what names a fractional type: `1.5` is a `double`, and a `float` is narrower, so
-`x: float = 1.5` is an error rather than a silent narrowing â€?write `1.5f`. A character literal
+`x: float = 1.5` is an error rather than a silent narrowing â€”write `1.5f`. A character literal
 accepts the same backslash escapes a string does, so `'\n'` is one character.
 
 `null` is the odd one out: it names no value, so it has no type of its own and is read as whatever
-nullable type its context asks for. A `null` with no such context is an error rather than a guess â€?see
+nullable type its context asks for. A `null` with no such context is an error rather than a guess â€”see
 [Nullable types](#nullable-types).
 
 ### Local variables
@@ -728,7 +792,7 @@ count = 1               // count is an int
 ```
 
 Writing the type is still allowed and still checked. A bare `name = value` is a *declaration* when
-nothing is in scope under that name, and an *assignment* when something is â€?so `str = "new value"`
+nothing is in scope under that name, and an *assignment* when something is â€”so `str = "new value"`
 still writes to the `str` declared above it, exactly as `Sample.neko` shows. The two are told apart
 by the scope alone, which is why the compiler decides it rather than the parser: a bare name may
 also be a field declared further down the same class.
@@ -755,7 +819,7 @@ for (i: int = 0; i < 100; i++) {
 }
 ```
 
-All three parts may be left out, so `for (;;)` is an endless loop â€?it has no test to fail, which is
+All three parts may be left out, so `for (;;)` is an endless loop â€”it has no test to fail, which is
 why a function whose body ends in one needs no `return`. The step may be `++`, `--`, or an assignment:
 `for (i: int = 1; i < 40; i = i * 3)` is three parts of the same kind.
 
@@ -769,12 +833,12 @@ for (element: int in values) {
 
 Two things may be iterated:
 
-* **An array**, walked directly. It needs no interface because the JVM gives arrays none â€?the
+* **An array**, walked directly. It needs no interface because the JVM gives arrays none â€”the
   compiler emits the length read and the element loads inline.
-* **A class implementing `java.lang.Iterable`** â€?the JDK's interface, not a Neko one. Its
+* **A class implementing `java.lang.Iterable`** â€”the JDK's interface, not a Neko one. Its
   `iterator()` must answer a `java.util.Iterator`, which is why such a file writes `import java.util`
   and not `import java.lang`. `next()` answers `Object` rather than a type parameter, because Neko
-  erases generics without emitting the bridge methods a parameterised interface would need â€?so the
+  erases generics without emitting the bridge methods a parameterised interface would need â€”so the
   erased shape has to *be* the declared one. The loop variable's own type still applies: the compiler
   inserts the cast (and the unboxing, for a primitive), so `for (e: int in numbers)` reads an `int`
   without the program casting anything.
@@ -784,8 +848,8 @@ loops in one method may each declare `i` and neither is visible afterwards. Read
 next pass rebinds it: an assignment would be computed and then discarded, so it is refused instead.
 
 `++` and `--` are **statements, not expressions**. They produce no value, so `x = i++` cannot be
-written and neither can appear inside a condition. They apply to a whole-number variable â€?`int`,
-`long`, `short`, `byte` â€?and to a field reached through a receiver (`holder.count++`). `byte` and
+written and neither can appear inside a condition. They apply to a whole-number variable â€”`int`,
+`long`, `short`, `byte` â€”and to a field reached through a receiver (`holder.count++`). `byte` and
 `short` are narrowed back on the way in, exactly as an assignment to them would be.
 
 ### The entry point
@@ -807,7 +871,7 @@ declared function.
 ### Error control
 
 A function that declares an `emit` clause says it may hand control to a `try`'s `{ ... }` block.
-**`scratch` enters that block and comes back with an answer** â€?it is an ordinary call, not a
+**`scratch` enters that block and comes back with an answer** â€”it is an ordinary call, not a
 departure. The block is compiled into a `static` method, so `scratch` is an `invokestatic`:
 
 ```neko
@@ -836,12 +900,12 @@ class Neko() {
 ```
 
 A `try` used as a value is worth what its call returned when it returned normally. The `nyan` answer
-travels back to the `scratch` site, not to the `try` â€?so the two are independent:
+travels back to the `scratch` site, not to the `try` â€”so the two are independent:
 
 ```neko
 class Neko() {
   fun invoker() {
-    // The call returns 0, so this is 0 â€?the handler's `nyan` went to the `scratch` site instead.
+    // The call returns 0, so this is 0 â€”the handler's `nyan` went to the `scratch` site instead.
     result: int = try test(false) { emit1, emit2 ->
       nyan emit1 * emit2
     }
@@ -860,7 +924,7 @@ class Neko() {
 ```
 
 **`yield` leaves through the `try` instead.** It throws `EmitYieldException` carrying its value, the
-`try` catches it, and that value becomes what the `try` is worth â€?so it works from any depth, and a
+`try` catches it, and that value becomes what the `try` is worth â€”so it works from any depth, and a
 `try` that is used as a value can be answered even by a call that never scratches:
 
 ```neko
@@ -888,7 +952,7 @@ The three keywords are not interchangeable, and the difference is the whole desi
 | `yield v` | leaves by throwing | the `try` that declared the handler |
 
 A `scratch` is matched to a handler by its `emit` signature alone, so **each signature may have only
-one handler in the program** â€?two would be indistinguishable from a site's point of view, and that is
+one handler in the program** â€”two would be indistinguishable from a site's point of view, and that is
 reported rather than resolved by declaration order.
 
 ### Checking what the program believes
@@ -914,23 +978,23 @@ v: int = nya count == 3 {                  // worth a value: one block per outco
 ```
 
 `nya <condition>` writes down something the program believes, and says what a failure means. Bare, the
-condition is an ordinary `bool` expression â€?a comparison, a `bool` variable, a call â€?so `nya` only
+condition is an ordinary `bool` expression â€”a comparison, a `bool` variable, a call â€”so `nya` only
 ever adds "and this must be true" to whatever you already wrote.
 
 The three forms differ in what a failure is worth, not in how the test is compiled:
 
-- **`nya condition`** â€?a false condition throws `java.lang.AssertionError`. **The message is the
+- **`nya condition`** â€”a false condition throws `java.lang.AssertionError`. **The message is the
   condition's own source text**, so a failure reads `count == 4` rather than a message written out
   again, and the report cannot drift from the check.
-- **`nya condition { ... }`** â€?the block runs instead of throwing, and **control carries on after
+- **`nya condition { ... }`** â€”the block runs instead of throwing, and **control carries on after
   it**. This is what the language uses in place of `try`/`catch`: a failure that can be dealt with is
   dealt with where it happened, and the program continues. The block is the answer to **two** kinds of
   failure: a condition that came back `false`, and an `AssertionError` thrown while the condition was
-  being evaluated â€?its own bare `nya`, or one inside a function it called. So `nya method() { ... }`
+  being evaluated â€”its own bare `nya`, or one inside a function it called. So `nya method() { ... }`
   is a call whose failed checks are handled at the call site, and the condition **does not have to be
   a `bool`** when a block says what failing means: `void` has no false to test, which is exactly why
   the throw is the only way in.
-- **`nya condition { ... } else { ... }`** â€?the construct is worth a value. The `else` block yields
+- **`nya condition { ... } else { ... }`** â€”the construct is worth a value. The `else` block yields
   it when the condition ran to a true answer and the failure block yields it when it was false or
   threw; both must yield, and both must yield the same type. A lone failure block in value position is
   refused, because there would be nothing to say what the expression is worth when the condition
@@ -941,11 +1005,11 @@ Everything else follows from the condition:
 - **The check is always on.** Unlike Java's `assert` there is no `-ea` flag to remember; a `nya` that
   silently did nothing would be worse than no `nya` at all.
 - **A bare check narrows like a guard.** Only the reading where the condition held reaches the next
-  statement, so `nya h != null` proves `h` is there for everything after it â€?exactly as
+  statement, so `nya h != null` proves `h` is there for everything after it â€”exactly as
   `if (h == null) { return }` does, so `h.value` needs no `?.` afterwards. A check *with* a failure
   block does not narrow afterwards: control gets there either way, so nothing is proved by then.
 - **A failure block only believes what both ways in prove.** The `else` block of a value form is
-  entered only when the condition ran to an answer, so it may take the condition's own reading â€?
+  entered only when the condition ran to an answer, so it may take the condition's own reading â€”
   `nya h != null { ... } else { h.value }` needs no `?.` in the `else`. The failure block is reached
   by a throw as well, so it gets those facts only when the condition cannot throw: in
   `nya h == null || ready() { ... }` a throw out of `ready()` arrives with `h` still null, so `h.value`
@@ -953,7 +1017,7 @@ Everything else follows from the condition:
   the ordinary `nya h == null { ... }` still narrows as you would expect.
 
 `nya` is deliberately not a function call: what it lowers to is not a call but a branch that either
-throws or runs a block â€?plus, when there is a block, a handler that catches the `AssertionError` the
+throws or runs a block â€”plus, when there is a block, a handler that catches the `AssertionError` the
 condition may throw, covering the condition and nothing else.
 
 The bare form is compiled exactly the way Java's own `assert` is: branch **past** the throw, and let
@@ -965,7 +1029,7 @@ throw new AssertionError("cond")
 passed:
 ```
 
-The two forms with a block cannot keep that shape â€?an `else` body, a failure block and a handler all
-have to converge on one point afterwards â€?so they branch *to* the failure and jump over it. Both
+The two forms with a block cannot keep that shape â€”an `else` body, a failure block and a handler all
+have to converge on one point afterwards â€”so they branch *to* the failure and jump over it. Both
 shapes are pinned by tests that read the emitted instructions, because a jump that lands on the next
 instruction runs identically to no jump at all; only the bytecode tells them apart.

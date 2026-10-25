@@ -101,8 +101,26 @@ object Compiler {
      * in the standard library is reported before a program's own type errors — which is the order a
      * reader needs, because until the library parses nothing it declares can be resolved.
      */
-    fun compileProgram(sources: List<SourceFile>, outputDirectory: Path? = null): CompilationResult {
-        val allSources = mergeLibrary(StandardLibrary.sources(), sources)
+    fun compileProgram(sources: List<SourceFile>, outputDirectory: Path? = null): CompilationResult =
+        compileProgram(sources, outputDirectory, library = StandardLibrary.sources())
+
+    /**
+     * Compiles several files against an explicit standard [library].
+     *
+     * The library is a parameter rather than a constant so that a reader may supply their own —
+     * `--stdlib-path` on the command line. Everything below is identical either way: the library is
+     * still prepended, so it is compiled first and a program still never names it.
+     *
+     * An **empty** library is honoured rather than replaced by the packaged one. "I have my own and it
+     * is empty" and "I did not say" are different statements, and quietly substituting the built-in
+     * library for the former would make a broken `--stdlib-path` look like a working one.
+     */
+    fun compileProgram(
+        sources: List<SourceFile>,
+        outputDirectory: Path? = null,
+        library: List<SourceFile>,
+    ): CompilationResult {
+        val allSources = mergeLibrary(library, sources)
 
         if (allSources.isEmpty()) {
             val diagnostics = DiagnosticBag()

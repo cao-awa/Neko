@@ -3,6 +3,7 @@ package com.github.kusa233.neko
 import com.github.kusa233.neko.diagnostics.RenderStyle
 import com.github.kusa233.neko.diagnostics.Severity
 import com.github.kusa233.neko.source.SourceFile
+import com.github.kusa233.neko.source.StandardLibrary
 import java.nio.file.Files
 import java.nio.file.InvalidPathException
 import java.nio.file.Path
@@ -65,12 +66,37 @@ fun main(args: Array<String>) {
         }
     }
 
+    // The standard library: the copy the compiler carries, or the reader's own. A `--stdlib-path` that
+    // is missing, or holds no `.neko` file, is reported rather than silently falling back to the
+    // packaged library: the reader asked for a specific library, and quietly compiling against a
+    // different one would make a typo in the path look like a working build.
+    val library = options.standardLibraryPath?.let { directory ->
+        if (!directory.exists() || !directory.isDirectory()) {
+            System.err.println("neko: --stdlib-path is not a directory: $directory")
+            kotlin.system.exitProcess(1)
+        }
+        val found = try {
+            StandardLibrary.sourcesIn(directory)
+        } catch (failure: Exception) {
+            System.err.println("neko: cannot read $directory: ${failure.message}")
+            kotlin.system.exitProcess(1)
+        }
+        if (found.isEmpty()) {
+            System.err.println(
+                "neko: no .${Compiler.SOURCE_EXTENSION} files in $directory, so the standard " +
+                    "library would be empty",
+            )
+            kotlin.system.exitProcess(1)
+        }
+        found
+    } ?: StandardLibrary.sources()
+
     val summary = if (options.sources.size == 1) options.sources.single().toString() else {
         "${options.sources.size} paths"
     }
 
     val result = try {
-        Compiler.compileProgram(sources, options.outputDirectory)
+        Compiler.compileProgram(sources, options.outputDirectory, library)
     } catch (failure: Exception) {
         // An internal failure must never look like a program error, so the trace is shown in full.
         System.err.println("neko: internal error while compiling $summary")
@@ -139,6 +165,10 @@ Options:
   --output <directory>   Where to write the compiled class files. A relative path is
                          resolved against the current directory, so the classes can be
                          kept inside the project. Defaults to the current directory.
+  --stdlib-path <dir>    Compile against the standard library in <dir> instead of the one
+                         the compiler carries. The directory is searched recursively for
+                         .neko files. Use it to work on the library itself, or to pin a
+                         version of it for a project.
   --color, --no-color    Force or suppress coloured diagnostics.
                          By default colour is used only on an interactive terminal.
   -h, --help             Show this message.
@@ -148,12 +178,14 @@ Options:
 private class CommandLine(
     val sources: List<Path>,
     val outputDirectory: Path?,
+    val standardLibraryPath: Path?,
     val useColor: Boolean,
 ) {
     companion object {
         fun parse(args: Array<String>): CommandLine? {
             val sources = mutableListOf<Path>()
             var output: String? = null
+            var standardLibrary: String? = null
             var color: Boolean? = null
 
             var index = 0
@@ -167,6 +199,14 @@ private class CommandLine(
                             throw CommandLineException("'$argument' requires a directory argument")
                         }
                         output = args[index]
+                    }
+
+                    "--stdlib-path" -> {
+                        index++
+                        if (index >= args.size) {
+                            throw CommandLineException("'$argument' requires a directory argument")
+                        }
+                        standardLibrary = args[index]
                     }
 
                     "--color" -> color = true
@@ -190,6 +230,7 @@ private class CommandLine(
             return CommandLine(
                 sources = sources,
                 outputDirectory = output?.let { toPath(it) },
+                standardLibraryPath = standardLibrary?.let { toPath(it) },
                 useColor = color ?: RenderStyle.supportsColor(),
             )
         }

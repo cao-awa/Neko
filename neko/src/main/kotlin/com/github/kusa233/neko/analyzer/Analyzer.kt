@@ -4540,13 +4540,56 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         ),
     )
 
-    /** Whether a value of Neko type [argument] may be passed where the JVM declares [parameter]. */
+    /**
+     * Whether a value of Neko type [argument] may be passed where the JVM declares [parameter].
+     *
+     * A primitive parameter only ever takes its own type: Neko has no implicit numeric widening, so
+     * `sleep(1)` is *not* an argument for `sleep(long)` here and is reported rather than guessed at.
+     *
+     * A reference parameter takes:
+     *
+     *  * any reference value, because the emitter inserts whatever conversion is needed and the
+     *    exact class is not this check's business;
+     *  * a primitive value only when the parameter is that primitive's **own** box (`Integer` for
+     *    `int`), because that is the one reference a primitive can become without changing meaning.
+     *
+     * That second rule is not fussiness — it is a correctness fix. `Thread` declares both
+     * `sleep(long)` and `sleep(Duration)`, and reflection returns them in **no fixed order**: JDK 21
+     * lists `sleep(Duration)` first, JDK 25 lists `sleep(long)` first. Under a rule of "a reference
+     * parameter accepts anything", `Thread.sleep(1L)` therefore chose `sleep(Duration)` on JDK 21 and
+     * `sleep(long)` on JDK 25 — the same program, a different descriptor. The wrong one pushes a
+     * `long` where a `Duration` is declared, and the class writer then fails computing stack-map
+     * frames (`ArrayIndexOutOfBoundsException` inside ASM's `Frame.merge`), because the operand stack
+     * no longer matches what the code put there. Choosing overloads by a rule that does not depend on
+     * reflection's ordering is what makes compilation reproducible across JDKs.
+     */
     private fun argumentFits(argument: NekoType, parameter: Class<*>): Boolean {
         val primitive = parameterPrimitive(parameter)
         if (primitive != null) return argument == primitive
-        // A reference parameter accepts anything Neko can box into it. The emitter inserts the
-        // conversion, so the exact class is not this check's business; only nullability is.
-        return argument !is VoidType
+        if (argument === VoidType) return false
+        val box = boxOf(argument)
+        return box == null || box == parameter
+    }
+
+    /**
+     * The JDK class a Neko value boxes to, or `null` when it is already a reference type.
+     *
+     * This is the wrapper `Integer.valueOf` and friends return, spelled as the `Class` object so it
+     * can be compared with a reflected parameter type directly.
+     *
+     * `string`, `Object` and `Throwable` answer `null` because they are references already: a
+     * `String` parameter is satisfied by a `string` without any conversion at all.
+     */
+    private fun boxOf(argument: NekoType): Class<*>? = when (argument) {
+        IntType -> java.lang.Integer::class.java
+        LongType -> java.lang.Long::class.java
+        ShortType -> java.lang.Short::class.java
+        ByteType -> java.lang.Byte::class.java
+        CharType -> java.lang.Character::class.java
+        FloatType -> java.lang.Float::class.java
+        DoubleType -> java.lang.Double::class.java
+        BoolType -> java.lang.Boolean::class.java
+        else -> null
     }
 
     /** The Neko type a reflected [type] corresponds to. */

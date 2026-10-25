@@ -64,6 +64,63 @@ tasks.processResources {
     dependsOn(standardLibraryResources)
 }
 
+/**
+ * The compiler as one runnable jar: `java -jar neko.jar <files...>`.
+ *
+ * **Why this is not the module's own `jar`.** `:plugin:idea` depends on this module and ships its
+ * output *inside the plugin* — I saw `NekoJ/lib/neko-1.0-SNAPSHOT.jar` in the IDE's sandbox — and the
+ * IDE already provides a Kotlin standard library. Folding `kotlin-stdlib` or ASM into that jar would
+ * put a second copy on the plugin's classpath, which is exactly the "bundled runtime conflict" the
+ * root `gradle.properties` warns about and `verifyPluginProjectConfiguration` rejects.
+ *
+ * So the plain `jar` stays a library jar, and this task writes a *second*, self-contained one under a
+ * name of its own. A reader who wants the command line takes that file; a plugin developer keeps
+ * linking against the ordinary one.
+ *
+ * The dependencies are unpacked into the jar rather than referenced from a `Class-Path` manifest
+ * entry, because the whole point is one file that can be copied to another machine and run. The
+ * manifest is what makes `-jar` work at all: without `Main-Class` the JVM refuses to pick an entry
+ * point. `Multi-Release` is dropped from the copied manifests on purpose — the merged jar has no
+ * `META-INF/versions` tree to go with it.
+ */
+val executableJar = tasks.register<Jar>("executableJar") {
+    group = "neko"
+    description = "Builds a self-contained jar that runs the command-line compiler"
+
+    dependsOn(tasks.named("classes"))
+    archiveFileName.set("neko-${project.version}-all.jar")
+    destinationDirectory.set(layout.buildDirectory.dir("executable"))
+
+    manifest {
+        attributes(
+            "Main-Class" to "com.github.kusa233.neko.MainKt",
+            "Implementation-Title" to "Neko",
+            "Implementation-Version" to project.version,
+        )
+    }
+
+    // This module's own classes and resources — the resources matter as much as the classes, because
+    // that is where `StandardLibrary` finds the `.neko` sources it compiles ahead of every program.
+    from(sourceSets["main"].output)
+
+    // Everything it needs at run time, unpacked. `runtimeClasspath` already includes the standard
+    // library and ASM, and it excludes whatever is `compileOnly`.
+    from({
+        configurations.runtimeClasspath.get()
+            .filter { it.name.endsWith(".jar") }
+            .map { zipTree(it) }
+    }) {
+        // A dependency's signature file would fail verification against the merged contents, since
+        // the bytes it signs are no longer the bytes in this jar.
+        exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA", "META-INF/MANIFEST.MF")
+        exclude("META-INF/versions/**")
+        // Module descriptors name packages that are now split across the merged jar; keeping them
+        // would make the JVM treat the file as a module and refuse it.
+        exclude("module-info.class")
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    }
+}
+
 tasks.test {
     useJUnitPlatform()
 }

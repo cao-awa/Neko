@@ -47,6 +47,41 @@ object StandardLibrary {
     }
 
     /**
+     * The library's sources read from [directory], for a reader who keeps their own.
+     *
+     * This is what `--stdlib-path` uses. The directory is walked recursively, because a library is a
+     * set of packages and a package is a folder — `com/github/kusa233/neko/stdlib/emitter/` — so
+     * requiring them all to sit flat would make the option useless for anything but a toy.
+     *
+     * Each source keeps its [SourceFile.path], unlike the packaged ones. That is the honest
+     * difference between the two: these files really exist on disk, so a diagnostic about one can
+     * name the file and line the reader has to open. The packaged copy has no path because there is
+     * no file behind it.
+     *
+     * Sorted by path for the same reason as [sources]: resolution takes the first declaration it
+     * meets, so a directory enumeration must not decide what a program means.
+     *
+     * An empty result is *not* an error here — this function reports nothing. The caller knows
+     * whether it was reading a library or merely probing, and only the command line has a reader to
+     * tell that the directory was empty.
+     */
+    fun sourcesIn(directory: Path): List<SourceFile> {
+        if (!Files.isDirectory(directory)) return emptyList()
+        return Files.walk(directory).use { stream ->
+            stream.filter { Files.isRegularFile(it) && it.fileName.toString().endsWith(".neko") }
+                .sorted()
+                .map { path ->
+                    SourceFile(
+                        name = path.fileName.toString(),
+                        content = Files.readString(path),
+                        path = path,
+                    )
+                }
+                .toList()
+        }
+    }
+
+    /**
      * The library's sources as `path -> text`, empty when the resource root cannot be read.
      *
      * **Two lookups, in this order.** A bare `getResource("neko/stdlib")` answers only when the
