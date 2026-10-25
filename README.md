@@ -36,8 +36,8 @@ Tasks are module-qualified now that there is more than one module.
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # Tests.
-./gradlew :neko:test                     # the compiler: 513 tests
-./gradlew :plugin:idea:test              # the plugin: 51 tests, in a real IDE instance
+./gradlew :neko:test                     # the compiler: 525 tests
+./gradlew :plugin:idea:test              # the plugin: 56 tests, in a real IDE instance
 
 # The compiler as one self-contained jar.
 ./gradlew :neko:executableJar
@@ -266,17 +266,19 @@ when it exists:
 
 A class the file cannot name yet is offered too —with the `import` clause that would make it
 nameable, written for you when you accept it. Type `Hash`, pick `HashMap` from the popup, and the
-file gains `import java.util` as well as the name.
+file gains `import java.util` as well as the name. The same holds for the program's own classes: a
+class declared in another `locate` package is offered with its package shown, and pressing Enter
+writes `import other.pkg.Helper` so that the name you accepted actually compiles.
 
 This depends on three things agreeing, which is why it is built the way it is:
 
 - **The index is the compiler's.** `PlatformLibrary` reads the package and class list out of the
   running JDK's `java.base` module, so a name is offered exactly when the analyzer would resolve it.
   No table is kept, because a JDK gains and loses classes between releases.
-- **The fix is the compiler's.** The analyzer reports an unresolvable platform class as an error
-  carrying `suggestedImport`, and the IDE turns that field into an Alt+Enter action. Re-deriving the
-  clause in the plugin would be a second implementation free to disagree with the one that decides
-  whether the file compiles.
+- **The fix is the compiler's.** The analyzer reports an unresolvable class as an error carrying
+  `suggestedImport`, and the IDE turns that field into an Alt+Enter action. Re-deriving the clause in
+  the plugin would be a second implementation free to disagree with the one that decides whether the
+  file compiles.
 - **The placement is the file's.** A Neko header is ordered —`locate`, then every `import`, then the
   classes —so `NekoImports` works out where the clause goes from the file's own text rather than
   from a line number, and refuses to write a clause the file already has (a second identical import
@@ -290,7 +292,8 @@ offered regardless.
 Note what the language itself requires: **the import is compulsory**. `HashMap` without
 `import java.util` is an error, not a warning —the compiler cannot know a class from a package it was
 never told to look in, and resolving it silently would make the name's package invisible in the source.
-The IDE writes the clause; it does not stand in for one.
+The IDE writes the clause; it does not stand in for one. The same rule applies to the program's own
+classes: `locate` decides, and two files in different packages are two packages.
 
 ### Unresolved names
 
@@ -350,11 +353,54 @@ class Neko() {
 `import` names a **package**, or **one class** —there is no per-class alias. What an import decides is
 where a name the program does *not* declare is looked for, and the lookup order is:
 
-1. the program's own declarations, by simple name, whichever package they are in —the unit of
-   compilation is the whole program, so this always answers first and an import can only ever *add* a
-   way to resolve a name;
-2. `java.lang`, so `Exception` and `String` need no clause;
-3. the imported packages, in source order.
+1. the program's own declarations **in the file's own package** —two files with the same `locate` are
+   one package, so neither needs to say anything to see the other;
+2. the program's own declarations in a package this file **imports** (see below);
+3. `java.lang`, so `Exception` and `String` need no clause;
+4. the imported packages, in source order.
+
+Step 1 and step 2 are the same lookup with one condition between them, and that condition is the
+whole of `locate`'s second job. A class in another Neko package is **not** reachable by its simple
+name until the file imports it:
+
+```neko
+// other/Helper.neko
+locate other.pkg
+
+class Helper {
+    static {
+        var shared: int = 1
+    }
+}
+```
+
+```neko
+// Sample.neko
+locate my.pkg
+
+import other.pkg.Helper
+
+class Sample {
+    static {
+        fun main() {
+            println(Helper.shared)   // legal: imported
+        }
+    }
+}
+```
+
+Without the `import` line the name does not resolve, and the compiler says exactly what to write:
+
+```
+Sample.neko:6:21: error: unresolved reference 'Helper': it is declared in another package this file
+does not import —write 'import other.pkg.Helper' to reach it
+```
+
+That diagnostic carries `suggestedImport`, so Alt+Enter writes the clause for you in the IDE —the same
+mechanism a platform class already used, now covering the program's own classes.
+
+A **qualified** name needs no import, because spelling the package out *is* saying where the name comes
+from; `other.pkg.Helper.shared` works in the file above with no clause.
 
 The two spellings are the same syntax and are told apart by what the name *is*, which only the
 platform can answer:

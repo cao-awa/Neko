@@ -35,8 +35,8 @@ Neko 是一门用来做编译器实验的玩具 JVM 语言：它有类、接口�
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # 测试。
-./gradlew :neko:test                     # 编译器：513 个测试
-./gradlew :plugin:idea:test              # 插件：51 个测试，跑在真实 IDE 实例里
+./gradlew :neko:test                     # 编译器：525 个测试
+./gradlew :plugin:idea:test              # 插件：56 个测试，跑在真实 IDE 实例里
 
 # 把编译器打成单个自包含 jar。
 ./gradlew :neko:executableJar
@@ -234,13 +234,15 @@ IDE 会拒绝加载插件，而不是在运行时以某种更隐蔽的方式失�
 ### 自动 import
 
 文件还不能指名的类也会被列出——连同让它可被指名的 `import` 子句，接受补全时替你写好。输入
-`Hash`，从弹窗里选 `HashMap`，文件就同时得到 `java.util` 的 import 和那个名字。
+`Hash`，从弹窗里选 `HashMap`，文件就同时得到 `java.util` 的 import 和那个名字。程序自己的类也一样：
+声明在另一个 `locate` 包里的类会被列出并显示它所在的包，按回车就会写进
+`import other.pkg.Helper`，让你刚接受的名字真的能编译。
 
 这依赖于三件事保持一致，也正是它这样设计的原因：
 
 - **索引是编译器的。** `PlatformLibrary` 从运行中 JDK 的 `java.base` 模块读出包和类列表，所以
   名字恰好在分析器能够解析它的时候被列出。这里不维护任何表，因为 JDK 会在版本之间增减类。
-- **修复方案是编译器的。** 分析器把无法解析的平台类报成一个携带 `suggestedImport` 的错误，IDE
+- **修复方案是编译器的。** 分析器把无法解析的类报成一个携带 `suggestedImport` 的错误，IDE
   把那个字段变成 Alt+Enter 动作。在插件里重新推导该子句，会是第二份实现，而它完全可以和决定
   文件能否编译的那份产生分歧。
 - **插入位置由文件决定。** Neko 的文件头是有顺序的——先是 `locate`，然后是所有 `import`，最后
@@ -253,7 +255,8 @@ IDE 会拒绝加载插件，而不是在运行时以某种更隐蔽的方式失�
 
 注意语言本身的要求：**import 是强制的**。没有 `import java.util` 的 `HashMap` 是错误而不是警告——
 编译器无法从一个从没被告知要去查的包里认识一个类，而悄悄解析它会让该名字的包在源码里隐形。
-IDE 负责写这个子句，它并不代替这个子句。
+IDE 负责写这个子句，它并不代替这个子句。同一条规则也适用于程序自己的类：由 `locate` 说了算，
+不同包的两个文件就是两个包。
 
 ### 无法解析的名字
 
@@ -305,10 +308,53 @@ class Neko() {
 `import` 指名一个**包**，或者**一个类**——没有逐类别名。import 决定的是：程序**没有**声明的名字
 去哪里找。查找顺序是：
 
-1. 程序自己的声明，按简单名，不论在哪个包——编译单元是整个程序，所以这一步永远最先命中，
-   import 只可能*增加*解析一个名字的途径；
-2. `java.lang`，所以 `Exception` 和 `String` 不需要任何子句；
-3. 已导入的包，按源码顺序。
+1. 程序自己的声明，但**限于本文件自己的包**——两个文件写了相同的 `locate` 就是同一个包，
+   谁也不用说什么就能看见对方；
+2. 程序自己的声明，位于本文件**已导入**的包里（见下）；
+3. `java.lang`，所以 `Exception` 和 `String` 不需要任何子句；
+4. 已导入的包，按源码顺序。
+
+第 1 步和第 2 步是同一个查找，中间只隔一个条件，而这条件就是 `locate` 的第二个职责。另一个 Neko
+包里的类，在文件导入它之前**不能**直接用简单名写：
+
+```neko
+// other/Helper.neko
+locate other.pkg
+
+class Helper {
+    static {
+        var shared: int = 1
+    }
+}
+```
+
+```neko
+// Sample.neko
+locate my.pkg
+
+import other.pkg.Helper
+
+class Sample {
+    static {
+        fun main() {
+            println(Helper.shared)   // 合法：已导入
+        }
+    }
+}
+```
+
+少了那行 `import`，名字就解析不到，而编译器会明确说出该写什么：
+
+```
+Sample.neko:6:21: error: unresolved reference 'Helper': it is declared in another package this file
+does not import — write 'import other.pkg.Helper' to reach it
+```
+
+这条诊断带着 `suggestedImport`，所以在 IDE 里按 Alt+Enter 就会替你把子句写上——平台类一直用的就是
+这套机制，现在也覆盖程序自己的类。
+
+**限定名**不需要 import，因为把包写出来*本身*就是在说明名字来自哪里；上面那个文件里写
+`other.pkg.Helper.shared` 不加任何子句也能用。
 
 两种写法语法相同，靠名字**实际是什么**来区分，而这只有平台能回答：
 

@@ -2326,7 +2326,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // spelling `analyzeMemberAccess` accepts for reading one. It is matched before the receiver
         // is analysed, because a class name is not a value and has no type of its own.
         val className = (target.receiver as? NameExpression)?.name
-        val namedClass = className?.let { classes[it] }
+        val namedClass = className?.let { classNamed(it) }
         if (namedClass != null) {
             target.receiverIsClass = true
             target.receiver.resolvedType = ClassType(namedClass.jvmInternalName, namedClass.name)
@@ -2953,14 +2953,45 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         null
     }
 
+    /**
+     * Whether the platform class named [jvmInternalName] is, or descends from, `java.lang.Throwable`.
+     *
+     * The program's own classes are walked through their symbols, but a chain that leaves the program
+     * — `EmitYieldException: Exception()` names `java/lang/Exception`, which the compiler does not
+     * compile — can only be read from the platform. Asking the JDK keeps the answer correct for any
+     * base class the standard library might pick (`RuntimeException`, `IllegalStateException`, …)
+     * instead of special-casing `Exception`.
+     *
+     * A name the JVM cannot load answers `false`: nothing can be said about it, and guessing would be
+     * worse than the refusal.
+     */
+    private fun isThrowableClass(jvmInternalName: String): Boolean {
+        val loaded = loadQualifiedClass(jvmInternalName.replace('/', '.')) ?: return false
+        return java.lang.Throwable::class.java.isAssignableFrom(loaded)
+    }
+
     /** Whether a value of type [sub] is acceptable where [supertype] is expected. */
     private fun isSubtype(sub: NekoType, supertype: NekoType): Boolean {
         if (sub.isError || supertype.isError) return false
         if (sub == supertype) return true
-        // `Throwable` is a type from outside the program, so its symbol cannot be walked: the one
-        // fact available about it is that everything below it is named by a class the program
-        // declares, which is what this arm answers for an explicitly `Throwable`-typed slot.
-        if (supertype === ThrowableType) return sub === ThrowableType
+        // `Throwable` is a type from outside the program, so the JDK side of the hierarchy cannot be
+        // walked. What *can* be walked is the program's own side: a class it declares has a symbol,
+        // and that symbol knows whether `Exception` is among its ancestors. So a declared class fits
+        // an explicitly `Throwable`-typed slot exactly when it descends from `java/lang/Throwable` —
+        // which is what lets `EmitYieldException: Exception()` satisfy a `Throwable` return type
+        // instead of being refused for not being `Throwable` itself.
+        if (supertype === ThrowableType) {
+            if (sub === ThrowableType) return true
+            val thrown = (sub as? ClassType) ?: return false
+            val thrownSymbol = classes[thrown.simpleName] ?: return false
+            // Either the program walked all the way to `Throwable` itself, or it stopped at a JDK
+            // class that is itself a `Throwable` — `EmitYieldException: Exception()` names
+            // `java/lang/Exception`, which the program does not compile, so the chain above it has to
+            // be read from the platform rather than from symbols.
+            if (thrownSymbol.descendsFrom("java/lang/Throwable")) return true
+            val immediate = thrownSymbol.superclass?.internalName ?: return false
+            return isThrowableClass(immediate)
+        }
 
         val subClass = sub as? ClassType ?: return false
         val superClass = supertype as? ClassType ?: return false
@@ -3812,7 +3843,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private fun analyzeMemberCall(expression: CallExpression, callee: MemberAccessExpression): NekoType {
         // `Sample.f(1)` calls a static function by class name, which needs no object.
         val className = (callee.receiver as? NameExpression)?.name
-        val namedClass = className?.let { classes[it] }
+        val namedClass = className?.let { classNamed(it) }
         if (namedClass != null) {
             if (callee.isSafeCall) reportSafeCallOnClassName(callee.memberSpan, className)
             callee.receiverIsClass = true
@@ -4373,7 +4404,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // syntax and no qualified type syntax, falling through left no way at all to reach a JDK
         // static member. Resolving the name as a class first is what makes the ordinary spelling work.
         val className = (expression.receiver as? NameExpression)?.name
-        val namedClass = className?.let { classes[it] }
+        val namedClass = className?.let { classNamed(it) }
         if (namedClass != null) {
             if (expression.isSafeCall) reportSafeCallOnClassName(expression.memberSpan, className)
             expression.receiverIsClass = true
@@ -4915,6 +4946,20 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private fun resolveName(expression: NameExpression): Symbol? {
         val symbol = lookup(expression.name)
         if (symbol == null) {
+            // A name that the program *does* declare, just not where this file can see it, is a
+            // different mistake from a typo — and the fix is a line the author can be told to write.
+            // Reported first so `Holder.shared` in another package says "import it" rather than
+            // "unresolved", which is what the IDE's quick fix keys on.
+            importNeededFor(expression.name)?.let { clause ->
+                diagnostics.error(
+                    "unresolved reference '${expression.name}': it is declared in another package " +
+                        "this file does not import — write 'import $clause' to reach it",
+                    expression.span,
+                    suggestedImport = clause,
+                    unresolved = true,
+                )
+                return null
+            }
             diagnostics.error(
                 "unresolved reference '${expression.name}'",
                 expression.span,
@@ -5438,6 +5483,22 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             return ErrorType
         }
 
+        // The program declares this name, but in a package this file cannot see. Reported here rather
+        // than left to the fallback below, which would otherwise invent `<this file's package>/Name`
+        // and fail at run time with `NoClassDefFoundError` — an error whose message never mentions the
+        // import that was missing. The suggested clause names the class rather than its package so the
+        // fix is unambiguous, and it is the exact text the IDE's quick fix writes.
+        importNeededFor(name)?.let { clause ->
+            diagnostics.error(
+                "unknown type '$name': it is declared in another package this file does not import — " +
+                    "write 'import $clause' to reach it",
+                span,
+                suggestedImport = clause,
+                unresolved = true,
+            )
+            return ErrorType
+        }
+
         // No declaration to read an internal name from, so the package has to be picked: the first
         // import if the file wrote one, and otherwise the file's own package.
         //
@@ -5491,14 +5552,93 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     }
 
     /**
-     * The class named [simpleName] the program declares, or `null` when nothing does.
+     * The class named [simpleName] the program declares and the *current file* is allowed to name.
      *
-     * Every declaration is known by its simple name, whichever package it lives in, because the unit
-     * of compilation is the whole program: a name that two packages both declare is rejected when
-     * the classes are declared rather than silently resolved to one of them, so this lookup can
-     * never pick the wrong class.
+     * `locate` is what decides that, and it decides it the way a package decides it in Java: a class
+     * in the file's own package is visible by its simple name, and a class in another package is not
+     * — the file has to `import` that package (or a class in it) first. Before this rule existed the
+     * lookup ignored packages entirely, so a name resolved to whatever the program declared
+     * anywhere, and an `import` was decoration: a file could name `Helper` from a package it had
+     * never mentioned and the compiler would quietly find it. That made every class effectively
+     * global and left nothing for `import` to do.
+     *
+     * [classes] still holds every declaration by simple name, because duplicate simple names across
+     * packages remain an error and so this map can never hold two candidates. What is added here is
+     * the *permission* check, not a second lookup: [isVisible] answers "may this file name that
+     * class", and the answers differ per file, which is why the question is asked at resolution time
+     * rather than once at declaration time.
      */
-    private fun declaredClass(simpleName: String): ClassSymbol? = classes[simpleName]
+    private fun declaredClass(simpleName: String): ClassSymbol? = classes[simpleName]?.takeIf { isVisible(it) }
+
+    /**
+     * Whether the current file may name [symbol] — the same package, or an import that reaches it.
+     *
+     * Two things count as "reaching it":
+     *
+     *  * **The same `locate` package.** This is the rule the request is about: two files that declare
+     *    the same `locate` are one package, so neither needs to say anything to see the other.
+     *  * **An import naming that package.** `import other.pkg` brings `other.pkg` into reach. A
+     *    single-class import such as `import other.pkg.Helper` contributes its *package* too, which is
+     *    the rule [NekoFile.importPrefixes] already documented for platform classes: naming one class
+     *    of a package says where your names come from, and [importedClasses] is what additionally
+     *    *pins* a simple name so a second package cannot quietly answer for it.
+     *
+     * A file with no `locate` clause lives in the unnamed package, and so does every other file
+     * without one — which is what makes a directory of `locate`-less files work with no imports.
+     *
+     * The standard library is deliberately *not* exempt. It is written in Neko and compiled into the
+     * program like any other source, so a program that names `EmitYieldException` has to see it the
+     * way it sees everything else. Nothing in the library is named by hand by a Neko author, though:
+     * `scratch`, `nyan` and `yield` are lowered by the compiler against a symbol it resolves from
+     * [classes] directly, which is why those three still work with no import at all.
+     */
+    private fun isVisible(symbol: ClassSymbol): Boolean {
+        val owner = currentClass ?: return true
+        if (symbol.packagePrefix == owner.packagePrefix) return true
+        return importPrefixes[owner].orEmpty().contains(symbol.packagePrefix)
+    }
+
+    /**
+     * The class [simpleName] names when it is *not* visible from here, for the diagnostic that says
+     * so — or `null` when the program declares nothing by that name.
+     *
+     * Kept separate from [declaredClass] so the error path can still explain itself: a name that
+     * resolves to a class in another package is a very different mistake from a name that resolves to
+     * nothing, and telling the author which one they made is the difference between "you forgot an
+     * import" and "you misspelled it".
+     */
+    private fun invisibleClass(simpleName: String): ClassSymbol? =
+        classes[simpleName]?.takeIf { !isVisible(it) }
+
+    /**
+     * The `import` clause that would make [symbol] reachable, e.g. `other.pkg.Helper`.
+     *
+     * The class itself is named rather than its package, because that is the narrower statement: it
+     * says which class is meant and cannot accidentally admit a second one. The IDE's quick fix
+     * writes exactly this, so the diagnostic and the fix agree on the text.
+     */
+    private fun importFor(symbol: ClassSymbol): String {
+        val packageName = symbol.packagePrefix.removeSuffix("/").replace('/', '.')
+        return if (packageName.isEmpty()) symbol.name else "$packageName.${symbol.name}"
+    }
+
+    /** The `import` text that would make [simpleName] reachable, or `null` when nothing declares it. */
+    private fun importNeededFor(simpleName: String): String? = invisibleClass(simpleName)?.let { importFor(it) }
+
+    /**
+     * The class [name] denotes when it is written on the left of a `.` — `Holder.shared`,
+     * `Holder.util(1)` — or `null` when the name is an ordinary value rather than a class.
+     *
+     * This is the same question [declaredClass] answers, and it is routed through it deliberately.
+     * There are three places that decide whether a capitalized name is a class (a static field read, a
+     * static field write, and a static call), and each used to consult `classes` directly. That made
+     * `Holder.shared` resolve across packages while `Holder` in a *type* position did not, so the
+     * package rule could be walked around by reaching for a member instead of the class itself.
+     * Funnelling them through one function is what keeps the two paths saying the same thing.
+     */
+    private fun classNamed(name: String): ClassSymbol? = declaredClass(name)
+
+
 
     /**
      * `java/[package]/[simpleName]` for a platform class the file's imports make reachable, or `null`.

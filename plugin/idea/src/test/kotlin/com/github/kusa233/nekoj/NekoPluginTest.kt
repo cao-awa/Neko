@@ -1139,6 +1139,217 @@ class NekoPluginTest : BasePlatformTestCase() {
         )
     }
 
+    // ------------------------------------------------------- imports between Neko packages
+
+    /**
+     * Adds a second Neko file to the project, so a test can exercise a name from another package.
+     *
+     * `myFixture.configureByText` only ever creates the file under test, and the whole point of these
+     * cases is a *second* package — so the helper file has to be added to the same in-memory project
+     * before the file under test is configured, or the model would never see it.
+     */
+    private fun addHelperFile(path: String, text: String) {
+        myFixture.addFileToProject(path, text)
+    }
+
+    fun testAClassInAnotherPackageIsReportedAsNeedingAnImport() {
+        addHelperFile(
+            "other/Helper.neko",
+            """
+            locate other.pkg
+
+            class Helper {
+                static {
+                    var shared: int = 1
+                }
+            }
+            """.trimIndent(),
+        )
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            locate my.pkg
+
+            class Sample {
+                static {
+                    fun main() {
+                        println(Helper.shared)
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // `locate` decides what a file may name, so `Helper` from `other.pkg` is not writable here
+        // until the file imports it. The error has to say so — an unresolved reference with no
+        // explanation would leave the reader guessing which package to write.
+        val errors = myFixture.doHighlighting()
+            .filter { it.severity == com.intellij.lang.annotation.HighlightSeverity.ERROR }
+            .map { it.description }
+        assertTrue(
+            "expected an error about the missing import, but got: $errors",
+            errors.any { "other.pkg.Helper" in it },
+        )
+    }
+
+    fun testAnUnimportedClassFromAnotherPackageOffersAnImportFix() {
+        addHelperFile(
+            "other/Helper.neko",
+            """
+            locate other.pkg
+
+            class Helper {
+                static {
+                    var shared: int = 1
+                }
+            }
+            """.trimIndent(),
+        )
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            locate my.pkg
+
+            class Sample {
+                static {
+                    fun main() {
+                        println(Helper.shared)
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // The compiler fills in `suggestedImport`, and the annotator turns it into Alt+Enter — the
+        // same mechanism a platform class already used, now covering the program's own classes.
+        val fixes = myFixture.getAllQuickFixes().map { it.text }
+        assertTrue(
+            "expected an import quick fix naming the class, but the editor offered: $fixes",
+            fixes.any { "other.pkg.Helper" in it },
+        )
+    }
+
+    fun testAcceptingTheQuickFixWritesTheImport() {
+        addHelperFile(
+            "other/Helper.neko",
+            """
+            locate other.pkg
+
+            class Helper {
+                static {
+                    var shared: int = 1
+                }
+            }
+            """.trimIndent(),
+        )
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            locate my.pkg
+
+            class Sample {
+                static {
+                    fun main() {
+                        println(Hel<caret>per.shared)
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        val fix = myFixture.getAllQuickFixes().first { "other.pkg.Helper" in it.text }
+        myFixture.launchAction(fix)
+
+        // Applying it has to make the file legal, which means the clause and nothing else: the name
+        // was already written, so only the header was missing.
+        val text = myFixture.editor.document.text
+        assertTrue(
+            "expected the import to be written, but the file is:\n$text",
+            text.contains("import other.pkg.Helper"),
+        )
+    }
+
+    fun testCompletionOfAClassFromAnotherPackageWritesTheImport() {
+        addHelperFile(
+            "other/Helper.neko",
+            """
+            locate other.pkg
+
+            class Helper {
+                static {
+                    var shared: int = 1
+                }
+            }
+            """.trimIndent(),
+        )
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            locate my.pkg
+
+            class Sample {
+                static {
+                    fun main() {
+                        println(Hel<caret>)
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        val helper = myFixture.completeBasic()?.firstOrNull { it.lookupString == "Helper" }
+        assertNotNull("expected 'Helper' in the completion popup", helper)
+        myFixture.lookup.currentItem = helper
+        myFixture.finishLookup('\n')
+
+        // Pressing Enter on a row that needs an import must write it, or the accepted name would
+        // leave the file uncompilable — the completion would have made things worse.
+        val text = myFixture.editor.document.text
+        assertTrue(
+            "expected the import to be written on Enter, but the file is:\n$text",
+            text.contains("import other.pkg.Helper"),
+        )
+        assertTrue("expected the name to be inserted, but the file is:\n$text", "Helper" in text)
+    }
+
+    fun testASamePackageClassNeedsNoImportAndGetsNoFix() {
+        addHelperFile(
+            "mine/Helper.neko",
+            """
+            locate my.pkg
+
+            class Helper {
+                static {
+                    var shared: int = 1
+                }
+            }
+            """.trimIndent(),
+        )
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            locate my.pkg
+
+            class Sample {
+                static {
+                    fun main() {
+                        println(Helper.shared)
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // The other half of the rule: two files with the same `locate` are one package, so this must
+        // resolve with nothing written — and offering an import here would be noise.
+        val errors = myFixture.doHighlighting()
+            .filter { it.severity == com.intellij.lang.annotation.HighlightSeverity.ERROR }
+            .map { it.description }
+        assertTrue("a same-package name should resolve, but got: $errors", errors.isEmpty())
+        val fixes = myFixture.getAllQuickFixes().map { it.text }
+        assertTrue("no import should be offered, but got: $fixes", fixes.none { "Helper" in it })
+    }
+
     // -------------------------------------------------------------------------------- helpers
 
     /** Every token the highlighting lexer produces for [text], as type/text pairs. */

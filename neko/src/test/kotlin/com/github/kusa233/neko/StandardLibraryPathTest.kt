@@ -24,11 +24,19 @@ import kotlin.test.assertTrue
  */
 class StandardLibraryPathTest {
 
-    /** A program in package `demo` that names [className] without declaring it. */
-    private fun programNaming(className: String): SourceFile = SourceFile.of(
+    /**
+     * A program in package `demo` that names [className], which lives in [packageName].
+     *
+     * The `import` is written out because a class in another package is not reachable by its simple
+     * name without one — a rule these tests have to respect like any other program. What they are
+     * about is whether the *supplied library* was read, so the import is scaffolding: the assertion
+     * is that the class was found once the name was legal to write.
+     */
+    private fun programNaming(className: String, packageName: String): SourceFile = SourceFile.of(
         "Uses.neko",
         buildString {
-            append("locate demo\n\n")
+            append("locate demo\n")
+            append("import $packageName.$className\n\n")
             append("class Uses {\n")
             append("    static {\n")
             append("        fun f(): $className {\n")
@@ -59,7 +67,7 @@ class StandardLibraryPathTest {
         )
 
         val result = Compiler.compileProgram(
-            listOf(programNaming("Marker")),
+            listOf(programNaming("Marker", "custom")),
             library = StandardLibrary.sourcesIn(library),
         )
 
@@ -159,7 +167,7 @@ class StandardLibraryPathTest {
         )
 
         val result = Compiler.compileProgram(
-            listOf(programNaming("Nested")),
+            listOf(programNaming("Nested", "com.example.deep")),
             library = StandardLibrary.sourcesIn(library),
         )
 

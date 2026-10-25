@@ -101,7 +101,7 @@ private class NekoCompletionProvider : CompletionProvider<CompletionParameters>(
         // in scope. The members a reader can actually write bare are the enclosing class' own, and
         // those come from `addNamesFromTheCurrentFile`.
         for (symbol in model.classes.values) {
-            result.addElement(classLookup(symbol))
+            result.addElement(classLookup(symbol, importClauseFor(ast, symbol)))
         }
         for (location in platformClasses(ast, prefix)) {
             result.addElement(platformClassLookup(location))
@@ -126,7 +126,7 @@ private class NekoCompletionProvider : CompletionProvider<CompletionParameters>(
             result.addElement(builtinTypeLookup(name, type))
         }
         for (symbol in model.classes.values) {
-            result.addElement(classLookup(symbol))
+            result.addElement(classLookup(symbol, importClauseFor(ast, symbol)))
         }
         for (location in platformClasses(ast, prefix)) {
             result.addElement(platformClassLookup(location))
@@ -317,6 +317,29 @@ private fun NekoPsiFile.parsedFile(model: NekoProgramModel): NekoFile? =
     model.fileOf(virtualFile?.path?.let { Path.of(it) })
 
 /**
+ * The `import` clause [symbol] needs to be nameable from [ast], or `null` when it needs none.
+ *
+ * `locate` makes two files that declare the same package one package, so those need nothing. A file
+ * naming a class from another package must import it, and this is what lets the completion list say
+ * so before the reader accepts the row rather than after they discover the error.
+ *
+ * The clause names the *class* (`other.pkg.Helper`) rather than its package. Both would compile, but
+ * naming the class is the narrower statement and it is what the compiler's own diagnostic suggests —
+ * so the popup, the Alt+Enter fix and the error message all tell the reader to write the same line.
+ *
+ * A file whose `locate` is absent-and-so-is-the-symbol's needs nothing, which is the unnamed package
+ * seeing itself. [ast] being `null` means the file has no parse yet, and then nothing is claimed: an
+ * import written on a guess is worse than one the reader adds themselves.
+ */
+private fun importClauseFor(ast: NekoFile?, symbol: ClassSymbol): String? {
+    if (ast == null) return null
+    val filePackage = ast.packageDeclaration?.name.orEmpty()
+    val classPackage = symbol.packagePrefix.removeSuffix("/").replace('/', '.')
+    if (filePackage == classPackage) return null
+    return if (classPackage.isEmpty()) symbol.name else "$classPackage.${symbol.name}"
+}
+
+/**
  * A local or a parameter, labelled as such.
  *
  * The two are worth telling apart: a parameter was handed to the reader by whoever called the
@@ -328,14 +351,28 @@ private fun localLookup(local: LocalName): LookupElementBuilder = LookupElementB
     .withTypeText(local.type?.let { typeLabel(it) }.orEmpty(), true)
     .withTailText(if (local.isParameter) "  parameter" else "  local", true)
 
-private fun classLookup(symbol: ClassSymbol): LookupElementBuilder {
+private fun classLookup(symbol: ClassSymbol, importClause: String? = null): LookupElementBuilder {
     val kind = if (symbol.isInterface) "interface" else "class"
     val parameters = symbol.typeParameters
     val tail = if (parameters.isEmpty()) "" else "<${parameters.joinToString(", ")}>"
-    // Neko lets a class be named from any package without an import, so no package is shown.
-    return LookupElementBuilder.create(symbol.name)
+    val packageName = symbol.packagePrefix.removeSuffix("/").replace('/', '.')
+
+    // `locate` decides which of the program's classes a file may name, so a class from another
+    // package is shown with its package — two rows reading `Helper` are otherwise indistinguishable —
+    // and accepting it writes the `import` that makes it legal. Without the clause the file would
+    // not compile, which is the one thing a completion must never do.
+    var builder = LookupElementBuilder.create(symbol.name)
         .withTypeText(kind, true)
-        .withTailText(tail, true)
+        .withTailText(if (packageName.isEmpty()) tail else "$tail  in $packageName", true)
+
+    if (importClause != null) {
+        builder = builder
+            .withTailText("  needs import", true)
+            .withInsertHandler { context, _ ->
+                context.file?.let { NekoImports.addImport(it, importClause) }
+            }
+    }
+    return builder
 }
 
 private fun functionLookup(
