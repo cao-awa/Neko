@@ -35,7 +35,7 @@ Neko 是一门用来做编译器实验的玩具 JVM 语言：它有类、接口�
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # 测试。
-./gradlew :neko:test                     # 编译器：476 个测试
+./gradlew :neko:test                     # 编译器：491 个测试
 ./gradlew :plugin:idea:test              # 插件：51 个测试，跑在真实 IDE 实例里
 
 # 把编译器打成单个自包含 jar。
@@ -376,8 +376,46 @@ if (h != null) {
 
 ### 数值规则
 
-类型之间没有隐式转换，`int + string` 是错误。`long` 不是「更宽的 `int`」，而是一个恰好拼写相近的
-不同类型。字面量是唯一的例外。
+类型之间没有隐式转换，也没有 Java 那种拓宽：`x: long = someInt` 是错误，`int + long` 是错误，
+而 `long + long` 才是 `long`。算术和比较要求两侧是**同一个**数值类型，结果也是那个类型——
+类型之间的切换写在源码里，而不是由编译器推断。字面量是唯一的例外，因为它在被上下文赋予类型
+之前没有自己的类型：
+
+```neko
+small: byte = 1           // 读作 byte
+big: long = 1             // 读作 long
+total: long = 1 + 2       // 两个都读作 long，所以是 long + long
+```
+
+放不进上下文所要求类型的字面量会在字面量本身报错并给出范围，而不是被悄悄收窄：
+
+```neko
+tooBig: byte = 300        // 错误：放不进 'byte'，其范围是 -128..127
+```
+
+### 字符串拼接
+
+当**任意一侧**是 `string` 时，`+` 就是拼接，另一侧可以是任何类型：
+
+```neko
+n: int = 42
+println("n=" + n)             // n=42
+println(n + " 是答案")         // 42 是答案
+println("ok? " + true)        // ok? true
+println("c=" + 'x')           // c=x
+println("at " + 1L)           // at 1
+```
+
+`string + string` 是同一条规则在两侧都是字符串时的情形。结果永远是 `string`，这正是链式拼接能
+继续成立的原因：`"x" + 1 + true` 里第一个 `+` 已经产出 `string`，所以第二个也是拼接。
+想先做算术就加括号——`"sum=" + (1 + 2)` 打印 `sum=3`。
+
+这不是把数值规则放宽了。`1 + 2` 依然是算术、依然是 `int`；两侧都没有字符串的 `+` 完全不受影响，
+所以 `s: string = 1 + 2` 仍然是错误——报的是初始化式的类型与声明不符，这才是真正的错误。
+
+类类型的值通过 `String.valueOf` 加入，所以它自己的 `toString` 决定打印成什么。缺席的值打印
+`null`，而 `null + null` 是错误：两侧都没说这个值是从什么类型缺席的，也就没有字符串可供拼接。
+不产出值的调用同样不能拼接——没有东西可以追加。
 
 ### 字面量
 

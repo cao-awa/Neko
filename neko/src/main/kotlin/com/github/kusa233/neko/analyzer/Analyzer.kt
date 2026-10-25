@@ -3381,12 +3381,22 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             }
         }
 
-        val left = analyzeExpression(expression.left, expectedType)
-        // The right operand is read in the *left* operand's type, which is the same rule the
-        // declaration gave the whole expression one level up: it is what lets `b == 1` read the `1` as
-        // a `byte` — the only type that comparison could be about — while leaving `aInt + aLong` an
-        // error, because a `long` has a type of its own and no context can take it away.
-        val right = analyzeExpression(expression.right, left)
+        // The one exception is concatenation. When either the left operand or the declaration already
+        // says `string`, both operands are read on their **own** terms, because in `"n = " + 1L` the
+        // `1L` is a `long` and saying so would be true but useless: the `L` is correct, and nothing
+        // asks it to be anything else. Passing the `string` down instead made the literal report
+        // "the 'L' suffix makes this literal a long, which cannot be used where string is expected;
+        // write 1 without the 'L'" — advice that would narrow a `long` to an `int` and change what
+        // the program prints.
+        //
+        // `s: string = 1 + 2` is still refused, just one step later: neither operand is a `string`,
+        // so the `+` is arithmetic and answers an `int`, which the declaration then rejects — the
+        // real mistake, rather than a complaint about either operand.
+        val concatenating = operator == BinaryOperator.ADD &&
+            (expectedType == StringType || expression.left.isStringLiteral())
+        val left = analyzeExpression(expression.left, if (concatenating) null else expectedType)
+        val rightExpected = if (concatenating || left == StringType) null else left
+        val right = analyzeExpression(expression.right, rightExpected)
 
         if (left.isError || right.isError) return ErrorType
 
@@ -3395,8 +3405,15 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             BinaryOperator.DIVIDE, BinaryOperator.REMAINDER,
             -> requireSameNumericType(left, right, expression, operator)
 
+            // `string + x` is concatenation, and `x` may be of **any** type: that is what makes
+            // string building usable at all — `"n = " + count` is the whole point. The JVM agrees,
+            // and has an `append` overload per type, so nothing is guessed or converted here.
+            //
+            // Checked before the numeric rule, because `"a" + 1` must not be reported as "requires
+            // int operands": the operand that is `string` is not the mistake, and telling the reader
+            // to write `1` as a number would be advice pointing the wrong way.
             BinaryOperator.ADD -> when {
-                left == StringType && right == StringType -> StringType
+                left == StringType || right == StringType -> checkConcatenation(left, right, expression)
                 else -> requireSameNumericType(left, right, expression, operator)
             }
 
@@ -3480,6 +3497,64 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             return ErrorType
         }
         return if (operator.isRelational) BoolType else left
+    }
+
+    /**
+     * Whether this operand is a `string` literal, so the `+` it takes part in can only be concatenation.
+     *
+     * It is worth asking about the *syntax* rather than the type because the left operand is analysed
+     * before the decision is made: in `s: string = 1 + "a"` the `string` context the declaration
+     * supplies must not be handed to the `1`, or the literal would be read as a `string` and the
+     * concatenation never recognised. A literal says outright what it is; nothing has to be inferred.
+     *
+     * Grouping needs no case of its own: the parser drops the parentheses and keeps the expression.
+     */
+    private fun Expression.isStringLiteral(): Boolean = this is StringLiteral
+
+    /**
+     * Checks one side of a `+` that is concatenation because the other side is a `string`.
+     *
+     * The rule is deliberately wide: **any** type may stand beside a `string`, because the class the
+     * emitter builds this with — `StringBuilder` — has an `append` overload for every one of them.
+     * `"n = " + count`, `"ok? " + flag`, `"at " + point` all work, and a value of a class type joins
+     * through `append(Object)`, which is `String.valueOf`, so a class's own `toString` decides what
+     * it prints.
+     *
+     * Three things are *not* allowed, and each is refused for a different reason:
+     *
+     *  * **`void`**, because a call that answers nothing has no value to concatenate. Accepting it
+     *    would emit an `append` with nothing on the stack under it.
+     *  * **`null` on both sides** (`null + null`), because neither operand says what it is absent
+     *    from, so there is no `string` in the expression to concatenate onto. The literal is analysed
+     *    without a context and reports its own, better diagnostic.
+     *
+     * A single `null` beside a `string` *is* allowed, and prints `null` — that is what
+     * `StringBuilder.append(Object)` does, and what a reader expects of a missing value inside a
+     * message. It needs no special case here: the nullable check already ran when the literal was
+     * analysed in the `string` context the other operand supplied.
+     */
+    private fun checkConcatenation(
+        left: NekoType,
+        right: NekoType,
+        expression: BinaryExpression,
+    ): NekoType {
+        if (left === VoidType) {
+            diagnostics.error(
+                "operator '+' cannot concatenate ${expression.left.span.text}, which produces no " +
+                    "value; a function with no declared return type has nothing to append",
+                expression.left.span,
+            )
+            return ErrorType
+        }
+        if (right === VoidType) {
+            diagnostics.error(
+                "operator '+' cannot concatenate ${expression.right.span.text}, which produces no " +
+                    "value; a function with no declared return type has nothing to append",
+                expression.right.span,
+            )
+            return ErrorType
+        }
+        return StringType
     }
 
     private fun requireBoolOperand(type: NekoType, operand: Expression, operator: BinaryOperator) {

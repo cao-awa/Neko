@@ -162,11 +162,14 @@ class TypeCheckingTest {
     }
 
     @Test
-    fun `arithmetic requires int operands`() {
+    fun `arithmetic between two non-numeric types is reported at the operand`() {
+        // `1 + "text"` is *not* this test any more: one side is a string, so it is concatenation.
+        // Arithmetic between two values that are neither numeric nor a string still has to be
+        // refused, and the message points at the operand whose type is the surprise.
         val source = TestSupport.program(
             "static {",
             "    fun main() {",
-            "        value: int = 1 + \"text\"",
+            "        value: int = true + 1",
             "    }",
             "}",
         )
@@ -176,7 +179,7 @@ class TypeCheckingTest {
             "unexpected message: ${error.message}",
         )
         assertEquals(
-            TestSupport.locationOf(source, "\"text\""),
+            TestSupport.locationOf(source, "true"),
             "${error.span?.line}:${error.span?.column}",
             "the error should point at the operand that has the wrong type",
         )

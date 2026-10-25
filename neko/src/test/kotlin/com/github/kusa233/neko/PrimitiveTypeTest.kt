@@ -429,17 +429,21 @@ class PrimitiveTypeTest {
     }
 
     @Test
-    fun `adding a string to a long is still an error`() {
-        messageFor(
-            TestSupport.program(
-                "static {",
-                "    fun main() {",
-                "        value: long = 1L + \"text\"",
-                "    }",
-                "}",
-            ),
-            "int operands",
+    fun `a long concatenates with a string`() {
+        // `1L + "text"` used to be rejected as "requires int operands", which was wrong twice over:
+        // one side *is* a string, so this is concatenation, and the `L` is correct — telling the
+        // reader to drop it would narrow the value to an `int`. The printed form proves the `long`
+        // overload of `append` was chosen, since `append(int)` could not have taken that value.
+        val output = run(
+            "static {",
+            "    fun main() {",
+            "        value: string = 1L + \"text\"",
+            "        println(value)",
+            "    }",
+            "}",
         )
+
+        assertEquals("1text", output.trim())
     }
 
     @Test

@@ -1170,6 +1170,63 @@ class BytecodeGenerator(
     }
 
     /**
+     * `a + b` where the expression's own type is `string`, so at least one side is a `string`.
+     *
+     * ```
+     *   new StringBuilder
+     *   dup
+     *   invokespecial <init>()V
+     *   <left>                         // emitted in its own type
+     *   invokevirtual append(<left>)    // the overload that type needs
+     *   <right>
+     *   invokevirtual append(<right>)
+     *   invokevirtual toString()Ljava/lang/String;
+     * ```
+     *
+     * **Why not `String.concat`.** That method takes a `String` and nothing else, so it could only
+     * ever have served `string + string`. The reason to write `"n = " + count` is precisely that
+     * `count` is not a string, so the operand has to go through `append`, which has an overload per
+     * type and prints a class instance with its own `toString`.
+     *
+     * **Why not `invokedynamic`.** The `StringConcatFactory` call site is what `javac` emits for Java
+     * 9 and later, and it is faster. It is not used here because it would tie the generated class to
+     * a bootstrap method the language does not otherwise need: `StringBuilder` works on every JVM the
+     * language targets, and a reader debugging a generated class can see the appends one by one.
+     *
+     * The operand types are read off the **analysed** expressions, not off the operands' syntax, so a
+     * `byte` appends as `(I)` — there is no `append(byte)` — and a `char` as `(C)`, which is the
+     * difference between printing a letter and printing its code point.
+     */
+    private fun emitConcatenation(expression: BinaryExpression, scope: MethodScope) {
+        val mv = scope.mv
+        mv.visitTypeInsn(NEW, "java/lang/StringBuilder")
+        mv.visitInsn(DUP)
+        mv.visitMethodInsn(INVOKESPECIAL, "java/lang/StringBuilder", "<init>", "()V", false)
+
+        for (operand in listOf(expression.left, expression.right)) {
+            emitExpression(operand, scope)
+            // A nullable operand is carried boxed, which is what `append(Object)` expects; the same
+            // descriptor covers `Object`, a class instance and `string` itself. `VoidType` cannot
+            // reach here — the analyzer refuses to concatenate a call that produces no value.
+            mv.visitMethodInsn(
+                INVOKEVIRTUAL,
+                "java/lang/StringBuilder",
+                "append",
+                appendDescriptorOf(operand.type),
+                false,
+            )
+        }
+
+        mv.visitMethodInsn(
+            INVOKEVIRTUAL,
+            "java/lang/StringBuilder",
+            "toString",
+            "()Ljava/lang/String;",
+            false,
+        )
+    }
+
+    /**
      * The `StringBuilder.append` overload [type] needs, so a field prints the way its own `toString`
      * does.
      *
@@ -3119,20 +3176,21 @@ class BytecodeGenerator(
             return
         }
 
-        emitExpression(expression.left, scope)
-        emitExpression(expression.right, scope)
-
+        // Concatenation builds a `StringBuilder` and appends each operand with the overload its own
+        // type needs. `String.concat` would not do: it takes a `String`, and the whole point of `+`
+        // beside a string is that the other side may be a number, a `bool` or a class instance.
+        //
+        // Both operands are appended, including the one that *is* a `string` — `append(String)` is
+        // exactly as cheap as starting from it, and keeping the two sides symmetric is what lets the
+        // same code handle `"a" + 1` and `1 + "a"`. Since the analyzer only marks the expression a
+        // `string` when one side is, at least one `append` here always appends a `String`.
         if (operator == BinaryOperator.ADD && expression.type == StringType) {
-            // String concatenation via StringBuilder keeps `"a" + "b"` independent of indy support.
-            mv.visitMethodInsn(
-                INVOKEVIRTUAL,
-                "java/lang/String",
-                "concat",
-                "(Ljava/lang/String;)Ljava/lang/String;",
-                false,
-            )
+            emitConcatenation(expression, scope)
             return
         }
+
+        emitExpression(expression.left, scope)
+        emitExpression(expression.right, scope)
 
         // The operands' *own* type picks the instruction, not the expression's: a comparison is worth
         // a `bool` but adds two `long`s. The analyzer has already established that both operands share

@@ -36,7 +36,7 @@ Tasks are module-qualified now that there is more than one module.
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # Tests.
-./gradlew :neko:test                     # the compiler: 476 tests
+./gradlew :neko:test                     # the compiler: 491 tests
 ./gradlew :plugin:idea:test              # the plugin: 51 tests, in a real IDE instance
 
 # The compiler as one self-contained jar.
@@ -760,6 +760,32 @@ range, rather than being narrowed:
 ```neko
 tooBig: byte = 300        // Error: does not fit in 'byte', whose range is -128..127
 ```
+
+### String concatenation
+
+`+` concatenates when **either** side is a `string`, and the other side may be of any type:
+
+```neko
+n: int = 42
+println("n=" + n)             // n=42
+println(n + " is the answer") // 42 is the answer
+println("ok? " + true)        // ok? true
+println("c=" + 'x')           // c=x
+println("at " + 1L)           // at 1
+```
+
+`string + string` is the same rule with both sides strings. The result is always a `string`, which is
+why a chain keeps concatenating: in `"x" + 1 + true` the first `+` produces a `string`, so the second
+one concatenates too. Parenthesise to do arithmetic first — `"sum=" + (1 + 2)` prints `sum=3`.
+
+This is not the numeric rule being relaxed. `1 + 2` is still arithmetic and answers an `int`; a `+`
+with no string on either side is untouched, so `s: string = 1 + 2` remains an error — reported as the
+initializer's type disagreeing with the declaration, which is the actual mistake.
+
+A value of a class type joins through `String.valueOf`, so the class's own `toString` decides what it
+prints. An absent value prints `null`, and `null + null` is an error: neither side says what type the
+value is absent from, so there is no string to concatenate onto. A call that produces no value cannot
+be concatenated either — there would be nothing to append.
 
 ### Literals
 
