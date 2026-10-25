@@ -37,7 +37,7 @@ Tasks are module-qualified now that there is more than one module.
 
 # Tests.
 ./gradlew :neko:test                     # the compiler: 552 tests
-./gradlew :plugin:idea:test              # the plugin: 56 tests, in a real IDE instance
+./gradlew :plugin:idea:test              # the plugin: 57 tests, in a real IDE instance
 
 # The compiler as one self-contained jar.
 ./gradlew :neko:executableJar

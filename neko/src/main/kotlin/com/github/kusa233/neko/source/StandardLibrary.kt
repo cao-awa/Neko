@@ -47,6 +47,24 @@ object StandardLibrary {
     }
 
     /**
+     * The library's sources, each paired with the path it occupies **inside the library**.
+     *
+     * The path is relative to the library root — `com/github/kusa233/neko/stdlib/emitter/handler/ScratchHandler1.neko`
+     * — which is the same path a reader's own copy of the library has under their `stdlib/` directory.
+     * That is what makes it useful: it says which project file, if any, *is* this source.
+     *
+     * The IDE needs that. It prepends the library to the program it analyses so the editor can see
+     * `scratch`, `nyan` and `yield`, but when the project is the library itself — the Neko repository
+     * — those very files are already among the project's. Prepending the packaged copy as well made
+     * every library class declared twice, and the duplicate was reported against the project's file:
+     * "interface 'ScratchHandler1' is already declared" on a file holding exactly one.
+     */
+    fun sourcesWithPaths(): List<Pair<String, SourceFile>> = load().map { (name, content) ->
+        name.removePrefix("$RESOURCE_ROOT/") to
+            SourceFile(name = name.substringAfterLast('/'), content = content)
+    }
+
+    /**
      * The library's sources read from [directory], for a reader who keeps their own.
      *
      * This is what `--stdlib-path` uses. The directory is walked recursively, because a library is a

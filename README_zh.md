@@ -36,7 +36,7 @@ Neko 是一门用来做编译器实验的玩具 JVM 语言：它有类、接口�
 
 # 测试。
 ./gradlew :neko:test                     # 编译器：552 个测试
-./gradlew :plugin:idea:test              # 插件：56 个测试，跑在真实 IDE 实例里
+./gradlew :plugin:idea:test              # 插件：57 个测试，跑在真实 IDE 实例里
 
 # 把编译器打成单个自包含 jar。
 ./gradlew :neko:executableJar

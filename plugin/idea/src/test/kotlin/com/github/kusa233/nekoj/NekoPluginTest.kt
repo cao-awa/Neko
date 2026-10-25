@@ -249,6 +249,55 @@ class NekoPluginTest : BasePlatformTestCase() {
         )
     }
 
+    /**
+     * A project copy of a standard library file is that file, not a second declaration.
+     *
+     * The IDE prepends the packaged library so the editor can resolve `scratch`, `nyan` and `yield`.
+     * When the project *is* the library — this repository — those very files are also project files,
+     * so prepending the packaged copy declared every library class twice. The duplicate was reported
+     * against the project's own file, which is the one the reader has open: "interface
+     * 'ScratchHandler1' is already declared" on a file that declares it once.
+     *
+     * The fixture recreates that layout by putting a library file at the path the library keeps it at,
+     * and then highlights *that* file — highlighting an unrelated one would see nothing, because the
+     * diagnostic is anchored where the second declaration is.
+     */
+    fun testAProjectCopyOfALibraryFileIsNotAnalysedTwice() {
+        val file = myFixture.addFileToProject(
+            "stdlib/com/github/kusa233/neko/stdlib/emitter/handler/ScratchHandler1.neko",
+            """
+            locate com.github.kusa233.neko.stdlib.emitter.handler
+
+            interface ScratchHandler1 {
+                fun scratching(arg0: Object): Object
+            }
+            """.trimIndent(),
+        )
+        myFixture.configureFromExistingVirtualFile(file.virtualFile)
+
+        // The packaged library really has to be there, or this test would pass by having nothing to
+        // duplicate against.
+        assertTrue(
+            "the standard library should reach the test runtime",
+            com.github.kusa233.neko.source.StandardLibrary.sources().isNotEmpty(),
+        )
+
+        // The reader's symptom, first: the file they have open must not be told it is a duplicate.
+        val errors = myFixture.doHighlighting()
+            .filter { it.severity == com.intellij.lang.annotation.HighlightSeverity.ERROR }
+        assertTrue(
+            "a library file the project provides must not be declared twice, but got " +
+                "${errors.map { it.description }}",
+            errors.none { it.description.contains("already declared") },
+        )
+
+        // And the mechanism behind it: one copy in the program, not two.
+        val model = NekoProgramModel.forProject(myFixture.project)
+        val declaring = model.sources.count { it.content.contains("interface ScratchHandler1") }
+        assertEquals("the project's copy should replace the packaged one, not join it", 1, declaring)
+    }
+
+
     fun testAnnotatorReportsAnUnknownName() {
         // Resolution across the project, not just within one file: `println` is a built-in, so the
         // analyzer accepts it, while `print` is not and must be reported.

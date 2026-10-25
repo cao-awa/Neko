@@ -36,7 +36,12 @@ class NekoProgramModel(
     val sources: List<SourceFile>,
     /** The parsed files, empty when parsing failed early. */
     val files: List<NekoFile>,
-    /** Every class the analyzer resolved, keyed by simple name. */
+    /**
+     * Every class the analyzer resolved, keyed by fully qualified name.
+     *
+     * The key carries the package because two packages may each declare a `Helper`; completion reads
+     * the values rather than the keys, since it offers short names.
+     */
     val classes: Map<String, ClassSymbol>,
     /** Everything the compiler reported, across all files. */
     val diagnostics: List<Diagnostic>,
@@ -104,7 +109,7 @@ class NekoProgramModel(
          * as missing its exception, while `gradlew compileNeko` compiled the very same files cleanly.
          */
         private fun analyse(sources: List<SourceFile>): NekoProgramModel {
-            val withLibrary = StandardLibrary.sources() + sources
+            val withLibrary = libraryNotInProject(sources) + sources
             val diagnostics = DiagnosticBag()
             val files = withLibrary.map { Parser(it, diagnostics).parseFile() }
             if (diagnostics.hasErrors) {
@@ -120,6 +125,26 @@ class NekoProgramModel(
                 emptyMap()
             }
             return NekoProgramModel(withLibrary, files, classes, diagnostics.diagnostics)
+        }
+
+        /**
+         * The packaged library, minus the sources [project] already provides.
+         *
+         * When the project *is* the library — this repository — its `stdlib/` files are among
+         * [project], and prepending the packaged copies would declare every library class twice. The
+         * duplicate was then reported against the project's own file, which is the one the reader has
+         * open: "interface 'ScratchHandler1' is already declared" on a file that declares it once.
+         *
+         * A project file counts as the library's when it sits at the library source's own path inside
+         * the library, so a project file that merely shares a name is left alone: `Helper.neko` in
+         * someone's program is not `.../stdlib/.../Helper.neko`. The project's copy wins, because the
+         * reader editing the library must see their edit rather than the packaged version.
+         */
+        private fun libraryNotInProject(project: List<SourceFile>): List<SourceFile> {
+            val paths = project.mapNotNull { it.path?.toString()?.replace('\\', '/') }
+            return StandardLibrary.sourcesWithPaths()
+                .filterNot { (relative, _) -> paths.any { it.endsWith("/$relative") } }
+                .map { (_, source) -> source }
         }
     }
 }
