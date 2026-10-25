@@ -77,22 +77,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private var currentExtractor: ExtractorTry? = null
 
     /**
-     * Every `scratch` site seen so far, held until the whole program has been analyzed.
-     *
-     * A site picks its handler by emit signature alone — the handler is a `try` written anywhere in
-     * the program whose callee's clause matches — so the link cannot be made while walking one
-     * function: the matching `try` may not have been reached yet. Recording the sites and resolving
-     * them at the end also makes "the first site decides the handler's return type" mean the first in
-     * *source* order rather than the first the walk happened to visit.
-     */
-    private val scratchSites = mutableListOf<ScratchSite>()
-
-    /**
      * Every `try` that declared a handler, in source order.
      *
-     * A `scratch` picks its handler by emit signature alone, so this is what a site is matched
-     * against. Two handlers whose callees declare the same clause would be indistinguishable — a site
-     * has nothing else to go on — so the second is reported rather than silently shadowing the first.
+     * Nothing is matched against this any more — a handler is a value a call carries, so a `scratch`
+     * reads the one its own function was given — but the list is what the last declaration pass walks
+     * to know a handler's value types without re-walking the tree.
      */
     private val handlers = mutableListOf<ExtractorTry>()
 
@@ -215,10 +204,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         declareClasses()
         resolveSignatures()
         checkBodies()
-        // `scratch` and its handler are the one pair that cannot be checked as they are met: a site
-        // picks a `try` by emit signature, and either may be declared first. So the pairing happens
-        // here, once every declaration and every handler is known.
-        linkScratchHandlers()
+        // Nothing has to be linked afterwards any more. A `scratch` used to be paired with a `try`
+        // here, by matching emit signatures once the whole program was known — which meant one
+        // handler per signature, and a program whose behaviour depended on what else was declared.
+        // A handler is now a value the call carries, so each site reads the handler in its own
+        // function's parameter and every `try` is independent. See [analyzeScratch].
         return classes
     }
 
@@ -685,6 +675,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 isStatic = function.isStatic,
                 emitTypes = function.resolvedEmitTypes,
                 hasEmitClause = function.hasEmitClause,
+                handlerType = if (function.hasEmitClause) {
+                    scratchHandlerTypeFor(function.resolvedEmitTypes.size, function.nameSpan)
+                } else {
+                    null
+                },
                 isAbstract = function.isAbstract,
             )
             overloads += symbol
@@ -703,6 +698,43 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         if (declaration.isMeow) declareDerivedFunctions(declaration, classSymbol)
         if (declaration.isMiao) declareEnumFunctions(declaration, classSymbol)
     }
+
+    /**
+     * The standard library's handler interface for an `emit` clause of [arity] values.
+     *
+     * `emit [int, int]` needs `ScratchHandler2`, because the interface is what the JVM knows how to
+     * pass: it declares `scratching(Object, Object): Object`, so the values travel boxed and the
+     * answer comes back boxed. Which interface a clause needs is therefore decided by its arity
+     * alone, and the argument types are checked by the analyzer rather than by the interface — the
+     * library's interfaces are all `Object` so that one family serves every program.
+     *
+     * `null` when the library provides no such interface, which is either a clause longer than the
+     * family covers or a program compiled without the library. Both are reported here rather than
+     * left for the code generator, which knows no better.
+     */
+    private fun scratchHandlerTypeFor(arity: Int, span: Span): NekoType? {
+        val symbol = classes["ScratchHandler$arity"]
+        if (symbol != null) return ClassType(symbol.jvmInternalName, symbol.name)
+
+        if (arity > maxEmitValues) {
+            diagnostics.error(
+                "an 'emit' clause may declare at most ${maxEmitValues + 1} values, but this one " +
+                    "declares $arity: the standard library provides ScratchHandler0 to " +
+                    "ScratchHandler$maxEmitValues, one per arity",
+                span,
+            )
+        } else {
+            diagnostics.error(
+                "the standard library declares no 'ScratchHandler$arity', which this 'emit' clause " +
+                    "needs to carry its values to a 'scratch'",
+                span,
+            )
+        }
+        return null
+    }
+
+    /** The highest `ScratchHandlerN` the standard library provides, so `emit` may hold one more. */
+    private val maxEmitValues = 7
 
     /**
      * Declares the `equals`, `hashCode` and `toString` a `meow class` gets for free.
@@ -1563,11 +1595,13 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             }
         }
 
-        scratchSites += ScratchSite(expression, raised, expectedType?.takeIf { it !== ErrorType })
-
-        // The handler is linked later, once every `try` has been seen. Until then the site is assumed
-        // to answer what its position asked for, which is what keeps one mistake from cascading.
-        return expectedType ?: VoidType
+        // What this site is worth is decided by the place it is written in, not by the handler.
+        // A `scratch` compiles to `handler.scratching(...)`, whose answer is an `Object`; where a
+        // value is wanted the site converts that `Object` to the expected type, and where nothing is
+        // wanted there is nothing to convert. That is why one handler can serve sites wanting
+        // different types: the handler is untyped at the boundary and every site does its own
+        // conversion.
+        return expectedType ?: ObjectType
     }
 
     /**
@@ -1612,9 +1646,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // exception, which any call can throw.
         val callType = analyzeExpression(construct.call)
 
-        // The `scratch` is analysed where it stands, which is what enforces the `emit` requirement and
-        // records the site so the handler's return type is decided with everything else.
-        val answered = analyzeScratch(construct.scratch, wantedType)
+        // The `scratch` is analysed where it stands, which is what enforces the `emit` requirement.
+        // It goes through `analyzeExpression` rather than calling `analyzeScratch` directly, because
+        // only that path records the site's own type on the node — and the code generator needs it
+        // to know whether calling the handler leaves a value on the stack to pop.
+        val answered = analyzeExpression(construct.scratch, wantedType)
 
         val wanted = wantedType?.takeIf { it !== ErrorType }
         if (wanted == null) {
@@ -1697,58 +1733,34 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     }
 
     /**
-     * Records [statement] as the handler answering [signature], refusing a duplicate.
+     * Records [statement] as a `try` handler and gives it the facts code generation needs.
      *
-     * A `scratch` finds its handler by signature alone, so two handlers with the same one are
-     * indistinguishable from a site's point of view. The second is reported rather than left to win
-     * silently, which would make the program's behaviour depend on declaration order.
+     * No two handlers can clash any more, and that is the point of the change this belongs to: a
+     * handler is no longer found by matching an `emit` signature across the whole program. Each
+     * `try` builds a handler object and hands it to the one call it wraps, so ten `try` blocks may
+     * answer the same clause and each satisfies its own call.
+     *
+     * What is recorded is the clause's value types — what the body's parameters are declared as, and
+     * therefore what the interface's `Object`s are converted to on entry. The class name is chosen by
+     * the code generator when it emits, because it numbers classes per emitted method rather than per
+     * source function.
      */
     private fun registerHandler(statement: ExtractorTry, signature: List<NekoType>) {
-        val clash = handlers.firstOrNull { it.signatureMatches(signature) }
-        if (clash != null) {
-            diagnostics.error(
-                "another 'try' already declares a handler for this emit signature, so a 'scratch' " +
-                    "site could not tell the two apart",
-                statement.keywordSpan,
-                notes = listOf(diagnostics.note("the earlier handler is here", clash.keywordSpan)),
-            )
-            return
-        }
         statement.handler.signature = signature
-        // Where the method lands is fixed here, while the walk still knows which class the `try` was
-        // written in: a `scratch` elsewhere in the program needs the answer before its own class is
-        // reached, so it cannot be left to the code generator to discover in emission order.
-        statement.handler.ownerClass = currentClass?.jvmInternalName
-        // The name too, for the same reason: the `scratch` may be emitted before the `try` is, so it
-        // cannot wait for the method to be registered. Numbered per enclosing function, in the order
-        // the handlers were linked, which is deterministic because the walk is.
-        val enclosingFunction = currentFunction?.name ?: "top"
-        val ordinal = handlerCounter.merge(enclosingFunction, 1, Int::plus)!! - 1
-        statement.handler.methodName = "$enclosingFunction\$scratch\$$ordinal"
         handlers += statement
     }
 
-    /** How many handlers each enclosing function has produced, used to number their method names. */
-    private val handlerCounter = mutableMapOf<String, Int>()
-
-    /** Whether [this] handler answers the same `emit` clause as [signature]. */
-    private fun ExtractorTry.signatureMatches(signature: List<NekoType>): Boolean =
-        handler.signature.size == signature.size &&
-            handler.signature.zip(signature).all { (mine, theirs) -> mine == theirs }
-
-    /**
-     * `nyan value` — leaves the enclosing `try` handler, answering [value].
-     *
-     * Only legal directly inside a `try`'s `{ ... }` block: that block is compiled into a method, and
-     * a `nyan` is the `return` from it. Its type must match what the `scratch` sites reaching that
-     * handler take, which [linkScratchHandlers] settles once all of them have been seen.
-     */
     /**
      * `nyan` or `nyan value` — leaves the handler, optionally answering a value.
      *
-     * A bare `nyan` answers nothing, which is what a handler should write when every `scratch` site
-     * reaching it discards the answer: the generated method is then `void` and the `nyan` is a plain
-     * `return`. A valued one answers the type the sites asked for.
+     * A `nyan` is the handler's ordinary `return`: the generated `scratching` method answers an
+     * `Object`, so a valued `nyan` boxes its value on the way out and a bare `nyan` answers `null`.
+     *
+     * Nothing constrains the type any more. It used to be fixed by the `scratch` sites that reached
+     * the handler — the first site decided, and a disagreement was an error — which is no longer
+     * meaningful: a site converts whatever comes back to the type *it* wants, and a site that wants
+     * nothing discards it. So one handler can answer `int` to one call and `string` to another,
+     * because the two calls are different `try` blocks with different handler objects.
      */
     private fun analyzeNyan(statement: NyanStatement) {
         val value = statement.value
@@ -1763,162 +1775,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             return
         }
 
-        // The sites that fix this handler's return type have not been linked yet — they may not even
-        // have been analyzed — so the answer is only checked for well-formedness here and compared in
-        // `linkScratchHandlers`.
-        //
-        // A bare `nyan` is recorded as `null` rather than `VoidType`, because the two are different
-        // mistakes: `null` means the author asked for nothing, while `VoidType` is a valued `nyan` of
-        // a `void` expression, which is separately refused.
-        pendingNyanAnswers += handler to value?.let { analyzeExpression(it) }
-    }
-
-    /** Every `nyan`, with what it answered, held until its handler's return type is known. */
-    private val pendingNyanAnswers = mutableListOf<Pair<ExtractorTry, NekoType?>>()
-
-    /**
-     * Reports a function whose `emit` clause does no work.
-     *
-     * An `emit` clause earns its keep in one of three ways, and a clause that does none of them states
-     * a departure that cannot happen:
-     *
-     *  * its body reaches a handler — through `scratch`, through `yield`, or by calling a function
-     *    that declares the same clause;
-     *  * some `try` names it as the callee, so the clause is what a `scratch` matches on;
-     *  * it forwards a caller's clause unchanged, by declaring the identical `emit` types.
-     *
-     * Only the first was checkable during the walk; the second needs every `try` in the program, which
-     * is why this runs at the end with the rest of the linking.
-     *
-     * **This check is switched off, deliberately.** It used to report "declares an 'emit' clause but
-     * can never reach a 'try' handler", and the rule it enforced was the wrong one: whether a function
-     * *can* leave by scratching is a property of its declared signature, and the signature alone is
-     * what a caller matches on. A body that never scratches is not an error — it is a function that
-     * always answers normally, which is a perfectly good implementation of a clause some other
-     * function, or a later version of this one, may need. Reporting it forced an author to invent a
-     * `scratch` they did not want, purely to satisfy the checker.
-     *
-     * The signature is still the whole story on the other side: a `scratch` site has to find a handler,
-     * and that is reported by [linkScratchHandlers] because code generation genuinely cannot proceed
-     * without knowing which method to call.
-     */
-    @Suppress("unused")
-    private fun reportUselessEmitClauses() {
-        val wrapped = handlers.mapNotNull { tryCalleeName(it) }.toSet()
-
-        for ((_, symbol) in functionsByName) {
-            if (!symbol.canRaise) continue
-            if (symbol.inheritedFrom != null) continue
-            val body = symbol.declaration?.body ?: continue
-            if (body.statements.any { it.reachesHandler() }) continue
-            if (symbol.name in wrapped) continue
-            if (forwardsItsOwnClause(symbol)) continue
-            if (forwardedCallees.any { it === symbol }) continue
-
-            diagnostics.error(
-                "function '${symbol.name}' declares an 'emit' clause but can never reach a 'try' " +
-                    "handler, so its results cannot be received",
-                symbol.span,
-            )
-        }
-    }
-
-    /** The simple name of the function a `try` wraps, which is the one its clause describes. */
-    private fun tryCalleeName(handler: ExtractorTry): String? = when (val callee = handler.call.callee) {
-        is NameExpression -> callee.name
-        is MemberAccessExpression -> callee.memberName
-        else -> null
-    }
-
-    /**
-     * Whether [symbol] is a pass-through: it declares the same `emit` clause as whatever it calls.
-     *
-     * Such a wrapper is legal with no `scratch` of its own, because the departure belongs to the
-     * function it forwards; `forwardsRaise` already establishes this during the walk, and this is the
-     * same question asked from the outside.
-     */
-    private fun forwardsItsOwnClause(symbol: FunctionSymbol): Boolean =
-        forwardsRaiseSymbols.any { it === symbol }
-
-
-    /**
-     * Pairs each `scratch` site with the handler its emit signature names, and fixes that handler's
-     * return type from the first site that reaches it.
-     *
-     * Runs once the whole program has been walked, because neither side is knowable earlier: a
-     * handler's `try` may be written after the function holding the sites, and the sites are what
-     * decide what the handler answers. "The first site" means the first in *source* order — a handler
-     * reached by `v: int = scratch 1, 2` and later by a bare `scratch 3, 4` answers `int`, and the
-     * later site is the one reported if it disagrees.
-     */
-    private fun linkScratchHandlers() {
-        // `reportUselessEmitClauses()` is deliberately not called: an `emit` clause is worth what its
-        // signature says, and a body that never scratches simply always returns normally. See that
-        // function's KDoc for why the check was retired.
-        for (site in scratchSites.sortedBy { it.expression.span.start }) {
-            val expression = site.expression
-            val handler = handlers.firstOrNull { it.signatureMatches(site.signature) }
-
-            if (handler == null) {
-                diagnostics.error(
-                    "no 'try' declares a handler for this emit signature, so this 'scratch' has " +
-                        "nowhere to go; write 'try call(...) { ... }' somewhere in the program whose " +
-                        "callee declares the same 'emit [...]' clause",
-                    expression.keywordSpan,
-                )
-                continue
-            }
-
-            expression.handler = handler
-            handler.handler.sites += site
-
-            val wanted = site.wantedType
-            val decided = handler.handler.returnType
-            if (decided == null) {
-                handler.handler.returnType = wanted
-            } else if (wanted != decided) {
-                diagnostics.error(
-                    "the first 'scratch' reaching this handler takes ${decided.displayName}, so " +
-                        "this one cannot take ${wanted?.displayName ?: "no value"}",
-                    expression.keywordSpan,
-                    notes = listOf(
-                        diagnostics.note(
-                            "the first site is here",
-                            handler.handler.sites.first().expression.keywordSpan,
-                        ),
-                    ),
-                )
-            }
-        }
-
-        // Now that each handler's return type is fixed, the `nyan`s written before it was known can
-        // be compared against it. A bare `nyan` answers nothing, so it only fits a handler nothing
-        // reads — anything else would be a `void` return from a method declared to answer a value.
-        for ((handler, answer) in pendingNyanAnswers) {
-            val wanted = handler.handler.returnType ?: continue
-            if (answer == null) {
-                diagnostics.error(
-                    "this 'nyan' leaves no value, but the 'scratch' sites reaching this handler take " +
-                        wanted.displayName,
-                    handler.extractorBody.span,
-                )
-            } else if (!isAssignable(answer, wanted)) {
-                diagnostics.error(
-                    "this 'nyan' answers ${answer.displayName} but the 'scratch' sites reaching this " +
-                        "handler take ${wanted.displayName}",
-                    handler.extractorBody.span,
-                )
-            }
-        }
-
-        // A handler that `nyan`s a value while no `scratch` site asks for one still has to be emitted
-        // answering that value — otherwise the `nyan` would be a `return` of an `int` from a `void`
-        // method, which the verifier rejects. The type comes from the `nyan` itself, and comes second
-        // in precedence: a site that *does* ask decides, and a disagreement was already reported above.
-        // A bare `nyan` fixes nothing: it answers nothing, so the handler stays `void`.
-        for ((handler, answer) in pendingNyanAnswers) {
-            if (handler.handler.returnType == null && answer != null) handler.handler.returnType = answer
-        }
+        value?.let { analyzeExpression(it) }
     }
 
 

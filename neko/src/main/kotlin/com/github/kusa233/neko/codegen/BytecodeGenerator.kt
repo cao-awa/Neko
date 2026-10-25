@@ -102,48 +102,10 @@ class BytecodeGenerator(
     }
 
     /**
-     * The `try` handlers whose methods have to be written into class [owner], in source order.
-     *
-     * A handler is not inlined where its `try` is written: it becomes a method of the class that
-     * holds the `try`, and any `scratch` site anywhere in the program calls it. So the real work
-     * happens *after* the owning class' functions have been emitted, while the writer is still open,
-     * which is what this queue is for.
+     * Numbers the handler classes one method produces, so a program with several `try` blocks in
+     * the same function gets one class per `try` rather than two classes with the same name.
      */
-    private val handlerRegistrations = LinkedHashMap<String, MutableList<PendingHandler>>()
-
-    /**
-     * A `try` handler waiting to be emitted as a method.
-     */
-    private class PendingHandler(
-        val construct: ExtractorTry,
-        val name: String,
-    )
-
-    /** Registers [construct] as a handler method of [owner] and returns the name it was given. */
-    private fun registerHandler(construct: ExtractorTry, owner: String): String {
-        // The analyzer already named it, for the same reason it fixed the owner: a `scratch` in a
-        // function emitted earlier needs the name before this registration could happen.
-        val name = construct.handler.methodName ?: run {
-            val ownerName = currentFunctionName
-            val index = handlerCounters.getOrDefault(ownerName, 0)
-            handlerCounters[ownerName] = index + 1
-            "$ownerName\$scratch\$$index".also { construct.handler.methodName = it }
-        }
-        handlerRegistrations.getOrPut(owner) { mutableListOf() } += PendingHandler(construct, name)
-        return name
-    }
-
-    /** Emits and clears every handler registered for [owner], before its writer is finished. */
-    private fun drainHandlers(writer: ClassWriter, owner: String) {
-        val pending = handlerRegistrations.remove(owner) ?: return
-        for (handler in pending) emitHandlerMethod(writer, handler)
-    }
-
-    /** Numbers the handlers within one function, so their names are stable and unique. */
-    private val handlerCounters = LinkedHashMap<String, Int>()
-
-    /** The function currently being emitted, whose name prefixes its handler methods. */
-    private var currentFunctionName = "handler"
+    private var scratchHandlerCounter = 0
 
 
     /**
@@ -296,10 +258,6 @@ class BytecodeGenerator(
         if (declaration.isMeow) emitDerivedObjectMethods(writer, declaration, symbol)
 
         emitMainBridge(writer, declaration, symbol)
-
-        // A handler method lives in whichever class its `try` was written in, so any this class owns
-        // are written now, while the writer is still open.
-        drainHandlers(writer, internalName)
 
         writer.visitEnd()
         output[internalName] = writer.toByteArray()
@@ -1341,7 +1299,10 @@ class BytecodeGenerator(
         internalName: String,
     ) {
         val returnType = symbol.returnType
-        val descriptor = descriptorOf(symbol.parameterTypes, returnType)
+        // The written parameters plus, for a function with an `emit` clause, the hidden
+        // `ScratchHandlerN` at the end. The source never mentions it, but the JVM must see it, so the
+        // descriptor is built from the wider list.
+        val descriptor = descriptorOf(symbol.descriptorParameterTypes, returnType)
         // `main` is a JVM entry point only when the source says `static`; nothing is added on the
         // author's behalf, so a program without a static `main` simply has no entry point.
         var access = ACC_PUBLIC or if (symbol.isStatic) ACC_STATIC else 0
@@ -1377,13 +1338,16 @@ class BytecodeGenerator(
             static = symbol.isStatic,
             returnType = returnType,
         )
-        // Handler methods are named after the function their `try` was written in, so the name has to
-        // be current before any statement is emitted — a nested `try` inherits it.
-        val enclosingFunction = currentFunctionName
-        currentFunctionName = function.name
 
         for (parameter in parametersByFunction[function].orEmpty()) {
             scope.allocate(parameter)
+        }
+
+        // The handler follows the written parameters in the frame. Nothing in the source names it, so
+        // it is not a `LocalSymbol`: the slot is recorded on the scope and `scratch` reads it there.
+        symbol.handlerType?.let { handlerType ->
+            scope.handlerSlot = scope.allocateTemp(handlerType)
+            scope.handlerInterface = (handlerType as? ClassType)?.internalName
         }
 
         for (statement in function.body?.statements.orEmpty()) {
@@ -1397,7 +1361,6 @@ class BytecodeGenerator(
 
         mv.visitMaxs(0, 0)
         mv.visitEnd()
-        currentFunctionName = enclosingFunction
     }
 
     // ------------------------------------------------------------ statements
@@ -1602,19 +1565,32 @@ class BytecodeGenerator(
         val value = statement.value
         val returnType = scope.returnType
         if (value == null) {
-            // A bare `nyan` answers nothing, so the handler is `void` there and this is its plain
-            // `return`. Analysis refuses a bare `nyan` in a handler whose sites want a value, so the
-            // method really is `void` whenever this arm runs.
-            emitPurrReleaseOnExit(scope)
-            scope.mv.visitInsn(RETURN)
+            // A bare `nyan` answers nothing. In a handler that is an `Object` method, so "nothing" is
+            // the null answer — which a `scratch` site wanting a primitive turns into that type's
+            // default rather than an exception. See [emitScratchAnswer].
+            if (returnType === VoidType || returnType === ErrorType) {
+                emitPurrReleaseOnExit(scope)
+                scope.mv.visitInsn(RETURN)
+            } else {
+                emitPurrReleaseOnExit(scope)
+                scope.mv.visitInsn(ACONST_NULL)
+                scope.mv.visitInsn(ARETURN)
+            }
             return
         }
         emitExpression(value, scope)
+        // A handler's `scratching` answers `Object`, so the value is boxed on the way out; every other
+        // method it is narrowed to its own return type as before.
+        if (returnType === VoidType || returnType === ErrorType) {
+            emitPurrReleaseOnExit(scope)
+            scope.mv.visitInsn(returnOpcode(value.type))
+            return
+        }
         emitStoreValue(value.type, returnType, scope.mv)
         // A `nyan` leaves the handler, and the handler runs inside the `try`'s protected region, so
         // any `purr` block entered inside it has to be released before the method returns.
         emitPurrReleaseOnExit(scope)
-        scope.mv.visitInsn(returnOpcode(if (returnType === VoidType || returnType === ErrorType) value.type else returnType))
+        scope.mv.visitInsn(returnOpcode(returnType))
     }
 
     /**
@@ -2345,62 +2321,110 @@ class BytecodeGenerator(
         if (element != null) emitStoreValue(statement.value.type, element, mv)
         mv.visitInsn(arrayStoreOpcode(element ?: ErrorType))
     }
-
     /**
-     * `scratch 1 * multiplier, multiplier` — enters the `try` handler those values match.
+     * `scratch 1 * multiplier, multiplier` — calls the handler this function was given.
      *
-     * Unlike the `raise` it replaces, this does **not** throw. The handler is a generated `static`
-     * method, so a `scratch` is an `INVOKESTATIC` and the program carries on with whatever it
-     * answers — which is what makes `v: int = scratch 1, 2` an ordinary initialisation rather than a
-     * transfer of control. Nothing is boxed and no array is assembled: the parameters have their own
-     * descriptors on the call, which is the whole reason the old `Object[]` carrier is gone.
+     * A `scratch` is an ordinary call through a *value*. The function's `emit` clause makes it take a
+     * hidden `ScratchHandlerN` as its last parameter, so this loads that local and invokes
+     * `scratching` on it with the clause's values. Three things follow, and each was impossible when
+     * a handler was a `static` method found by signature:
+     *
+     *  * **The caller decides what runs.** The same callee serves every `try` that calls it, each
+     *    supplying its own handler object, so two `try` blocks can no longer collide.
+     *  * **The values are boxed.** `scratching` takes `Object`s, so each value is boxed here; that is
+     *    what lets one interface serve every `emit` clause of the same arity.
+     *  * **The answer is unboxed.** `scratching` returns an `Object`, and the type this site wants is
+     *    whatever its position asked for, so the conversion happens here — which is why one handler
+     *    can answer an `int` to one site and a `string` to another.
+     *
+     * A handler that never `nyan`s, or `nyan`s nothing, answers `null`. Where this site wants a
+     * primitive that would otherwise be an unboxing `NullPointerException`, so the null is turned
+     * into the type's Java default instead: a `scratch` whose handler says nothing is a zero, not a
+     * crash.
      */
     private fun emitScratch(expression: ScratchExpression, scope: MethodScope) {
         val mv = scope.mv
-        val handler = expression.handler
-        val methodName = handler?.handler?.methodName
-        val owner = scratchHandlerOwner(expression)
+        val owner = scope.handlerInterface
+        val slot = scope.handlerSlot
 
-        if (handler == null || methodName == null || owner == null) {
-            // Analysis already reported the unmatched site. Something of the right shape still has
-            // to be pushed so the rest of the expression verifies.
+        if (owner == null || slot == null) {
+            // No handler to call: the site is outside any `emit` function, which analysis has already
+            // reported. A default of the right shape keeps the rest of the expression verifiable.
             pushDefault(expression.type, mv)
             return
         }
 
-        for (value in expression.values) emitExpression(value, scope)
-        emitScratchCall(owner, methodName, expression, scope)
+        mv.visitVarInsn(ALOAD, slot)
+        for (value in expression.values) {
+            emitExpression(value, scope)
+            emitBox(value.type, mv)
+        }
+        mv.visitMethodInsn(
+            INVOKEINTERFACE,
+            owner,
+            SCRATCHING_METHOD_NAME,
+            descriptorOf(List(expression.values.size) { ObjectType }, ObjectType),
+            true,
+        )
+        emitScratchAnswer(expression.type, scope)
     }
-
-    /** The class that declares the handler method [expression] calls. */
-    private fun scratchHandlerOwner(expression: ScratchExpression): String? =
-        expression.handler?.handler?.ownerClass
-            ?: expression.handler?.let { handlerOwners[it] }
 
     /**
-     * `invokestatic owner.name(values)`, with the arguments already on the stack.
+     * Converts `scratching`'s `Object` answer into the type the `scratch` site wants.
      *
-     * The descriptor comes from the handler itself — the types it takes are the `emit` clause's, and
-     * what it answers is the handler's return type — so the call site and the declaration cannot
-     * disagree.
+     * Three shapes, and the middle one is the reason this is not one instruction:
+     *
+     *  * **a reference type** is a `checkcast`, which is what makes the answer usable at all. A `null`
+     *    answer casts happily, so a site that wants an object simply gets nothing.
+     *  * **a primitive** cannot be `null` in the JVM, so the answer is tested first and the type's
+     *    default is substituted when the handler said nothing. A handler that `nyan`s no value is then
+     *    a zero rather than an unboxing `NullPointerException` — which is what "use the Java default
+     *    when there is no value" means in practice.
+     *  * **a discarded site** pops, because nothing reads it.
      */
-    private fun emitScratchCall(
-        owner: String,
-        methodName: String,
-        expression: ScratchExpression,
-        scope: MethodScope,
-    ) {
-        val handler = expression.handler!!
-        val arguments = handler.handler.signature
-        val returns = handler.handler.returnType ?: VoidType
-        scope.mv.visitMethodInsn(
-            INVOKESTATIC,
-            owner,
-            methodName,
-            descriptorOf(arguments, returns),
-            false,
-        )
+    private fun emitScratchAnswer(type: NekoType, scope: MethodScope) {
+        val mv = scope.mv
+        if (type == VoidType || type === ErrorType) {
+            mv.visitInsn(POP)
+            if (type === ErrorType) mv.visitInsn(ACONST_NULL)
+            return
+        }
+
+        if (BuiltinTypes.isPrimitive(type)) {
+            // The answer is needed twice, so it goes into a local of its own. `Object` is its type
+            // here: the unboxing happens only after the null test has said it is safe.
+            val slot = scope.allocateTemp(ObjectType)
+            val answered = Label()
+            val done = Label()
+            mv.visitVarInsn(ASTORE, slot)
+            mv.visitVarInsn(ALOAD, slot)
+            mv.visitJumpInsn(IFNONNULL, answered)
+            pushDefault(type, mv)
+            mv.visitJumpInsn(GOTO, done)
+            mv.visitLabel(answered)
+            mv.visitVarInsn(ALOAD, slot)
+            emitUnbox(type, mv)
+            mv.visitLabel(done)
+            return
+        }
+
+        when (type) {
+            // `string` is its own type here, and `emitUnbox` already casts it.
+            StringType -> emitUnbox(type, mv)
+            is ArrayType -> mv.visitTypeInsn(CHECKCAST, descriptorOf(type))
+            is ClassType -> if (type.internalName != "java/lang/Object") {
+                mv.visitTypeInsn(CHECKCAST, type.internalName)
+            }
+            // `int?` and friends: the erased form is the wrapper, so the cast is to that.
+            is NullableType -> when (val inner = type.unwrapNullable()) {
+                is ClassType -> mv.visitTypeInsn(CHECKCAST, inner.internalName)
+                else -> BuiltinTypes.boxedInternalNameOf(inner)?.let { mv.visitTypeInsn(CHECKCAST, it) }
+            }
+            else -> Unit
+        }
     }
+
+
 
     /**
      * Whether this body can let an `EmitYieldException` out, so the method should declare it.
@@ -2481,26 +2505,8 @@ class BytecodeGenerator(
      * `yield`s that come back out of it.
      */
     private fun emitTry(statement: TryStatement, scope: MethodScope) {
-        emitHandlerRegistration(statement)
         emitExtractorTry(statement, scope, resultSlot = null)
     }
-
-    /**
-     * Registers this `try`'s `{ ... }` block as a method of the class being emitted.
-     *
-     * The method takes only the `emit` clause's values as parameters and nothing else, because the
-     * `scratch` sites that call it run in *other* call frames: there is no enclosing local for them
-     * to pass, and a `static` method cannot read one through `this` either. The analyzer enforces
-     * that the body consequently reads nothing but its parameters and static state.
-     */
-    private fun emitHandlerRegistration(construct: ExtractorTry) {
-        handlerOwners[construct] = currentOwner
-        registerHandler(construct, currentOwner)
-    }
-
-    /** The internal name of the class each handler method was emitted into. */
-    private val handlerOwners = mutableMapOf<ExtractorTry, String>()
-
 
     // ------------------------------------------------------------------- purr
 
@@ -2727,13 +2733,12 @@ class BytecodeGenerator(
         // the `scratch` values are what the handler receives, so `try f() scratch 1, 2` sends exactly
         // the two values the author wrote.
         //
-        // What `emitScratch` leaves on the stack is the *handler's* return type, not
-        // `scratch.type`: a `ScratchExpression` written as a statement has no expected type of its
-        // own, while the handler it reaches may well answer something. Reading the type off the
-        // scratch here would `POP` nothing while an `int` sits on the stack — which is precisely the
-        // stack-shape disagreement that makes ASM's frame merge fail.
+        // What `emitScratch` leaves on the stack is already converted to the type the site wanted, so
+        // `scratch.type` — not a handler's return type — is what decides whether there is anything to
+        // store. A `ScratchExpression` written as a statement has no type of its own and pushes
+        // nothing here, which is why the pop and the store are chosen from the same value.
         emitScratch(construct.scratch, scope)
-        val answered = construct.scratch.handler?.handler?.returnType ?: VoidType
+        val answered = construct.scratch.type
         if (resultSlot == null) {
             popIfValue(answered, mv)
         } else {
@@ -2762,7 +2767,6 @@ class BytecodeGenerator(
      */
     private fun emitTryExpression(expression: TryExpression, scope: MethodScope) {
         val mv = scope.mv
-        emitHandlerRegistration(expression)
         // The slot holds a boxed value from either path, so it is one `Object` wide whatever the
         // `try` is worth.
         val resultSlot = scope.allocateTemp(ObjectType)
@@ -2795,6 +2799,17 @@ class BytecodeGenerator(
         val mv = scope.mv
         val exceptionClass = emitYieldExceptionClass()
 
+        // The handler is a *value* now, so this `try` builds one before it calls: a fresh object of a
+        // class generated for this `try` alone. That is the whole difference from the old design —
+        // the handler travels with the call instead of being found by signature, which is what lets
+        // several `try` blocks answer the same `emit` clause.
+        val handlerClass = emitScratchHandlerClass(construct)
+        val handlerSlot = scope.allocateTemp(ObjectType)
+        mv.visitTypeInsn(NEW, handlerClass)
+        mv.visitInsn(DUP)
+        mv.visitMethodInsn(INVOKESPECIAL, handlerClass, "<init>", "()V", false)
+        mv.visitVarInsn(ASTORE, handlerSlot)
+
         val start = Label()
         val end = Label()
         val handler = Label()
@@ -2806,7 +2821,10 @@ class BytecodeGenerator(
         mv.visitTryCatchBlock(start, end, handler, exceptionClass)
 
         mv.visitLabel(start)
+        // Registered against this exact call, so a nested call among its arguments cannot take it.
+        tryHandlers[construct.call] = handlerSlot
         emitExpression(construct.call, scope)
+        tryHandlers.remove(construct.call)
         if (resultSlot == null) {
             popIfValue(construct.call.type, mv)
         } else {
@@ -2844,100 +2862,104 @@ class BytecodeGenerator(
     }
 
     /**
-     * Emits a `try` handler as a `static` method of the class its `try` was written in.
+     * Emits the class that implements one `try`'s handler, and returns its internal name.
      *
-     * This is the heart of the design. The `{ ... }` block is not inlined into the method holding the
-     * `try`: it becomes a method of its own, and every `scratch` site that matches its `emit` clause
-     * calls it with `invokestatic`. Three consequences are worth spelling out, because each one
-     * explains a piece of the code below.
+     * The `{ ... }` block becomes `scratching` on a class of its own, which implements the
+     * `ScratchHandlerN` the wrapped call's `emit` clause calls for. That is the shape the old design
+     * gave it too — a method of its own, with the body compiled exactly as written — so a handler
+     * body keeps meaning what it meant. What changed is how a `scratch` reaches it: through the value
+     * the caller passed, not through a `static` name.
      *
-     *  - **It takes only the `emit` values.** A `scratch` runs in a different call frame, so there is
-     *    no enclosing local to hand over; `static` means there is no `this` to read one through
-     *    either. That is why the method is `private static` like the sample's `nyanTest$scratch$0`,
-     *    and why the analyzer refuses a handler body that reads anything except its own parameters
-     *    and static state.
-     *  - **Its return type comes from the sites.** `v: int = scratch 1, 2` needs an `int` back, and a
-     *    bare `scratch 1, 2` needs nothing, so the analyzer fixes the type from the first site and
-     *    this method is declared to answer exactly it. A handler with no reaching site at all is still
-     *    emitted, answering `void`, because the analyzer has already reported it.
-     *  - **`yield` and `nyan` mean opposite things.** A `nyan` is an ordinary `return`. A `yield`
-     *    leaves through the `try` instead — it throws `EmitYieldException` carrying the value — which
-     *    is how a handler answers the construct rather than its caller.
+     * Three details are load-bearing:
+     *
+     *  * **The interface's parameters are `Object`s.** So each one is converted to the type the
+     *    clause declared, into a local of its own, before the body runs. That is what lets a body
+     *    keep writing `emit1 * emit2` against `int` while the JVM sees `Object`.
+     *  * **The method answers `Object`.** A `nyan` boxes its value on the way out and a bare one (or
+     *    no `nyan` at all) answers `null`; each `scratch` site converts that to the type it wants, so
+     *    one handler can serve sites wanting different types.
+     *  * **`yield` still throws.** It leaves through the `try`, which catches `EmitYieldException`,
+     *    rather than returning from this method — the two exits mean different things and both are
+     *    needed.
      */
-    private fun emitHandlerMethod(writer: ClassWriter, handler: PendingHandler) {
-        val construct = handler.construct
+    private fun emitScratchHandlerClass(construct: ExtractorTry): String {
+        val name = "${currentOwner}\$ScratchHandler\$${scratchHandlerCounter++}"
         val parameters = construct.extractorParameters
         val signature = construct.handler.signature
-        val returnType = construct.handler.returnType ?: VoidType
+        val interfaceName = standardLibraryClass("ScratchHandler${signature.size}")
 
         val enclosingOwner = currentOwner
-        currentOwner = handlerOwners[construct] ?: enclosingOwner
+        currentOwner = name
+
+        val writer = NekoClassWriter(ClassWriter.COMPUTE_FRAMES or ClassWriter.COMPUTE_MAXS)
+        writer.visit(
+            V1_8,
+            ACC_FINAL or ACC_SUPER,
+            name,
+            null,
+            "java/lang/Object",
+            arrayOf(interfaceName),
+        )
+        writer.visitSource(currentFile.sourceName(), null)
+
+        // No captures and no constructor arguments: a handler body reads its own parameters and
+        // static state, exactly as it did when this was a `static` method.
+        emitLambdaConstructor(writer, name, emptyList())
 
         val mv = writer.visitMethod(
-            // `public static`: the sample's method is `private`, and it can be, because there its
-            // only caller sits in the same class. Here a `scratch` may live in any class of the
-            // program, and a `private` method is not callable across classes — so the widest access
-            // is the one that works. It is still `static`, which is what a `scratch` needs.
-            ACC_PUBLIC or ACC_STATIC,
-            handler.name,
-            descriptorOf(signature, returnType),
+            ACC_PUBLIC,
+            SCRATCHING_METHOD_NAME,
+            descriptorOf(List(signature.size) { ObjectType }, ObjectType),
             null,
+            // The body may `yield`, which throws — the JVM does not verify checked exceptions, and
+            // listing one would only make the class noisier than the source it came from.
             null,
-            // No `Exceptions` attribute: `EmitYieldException` is checked, so it *could* be listed, but
-            // a Neko program never catches one by name — the `try` does that structurally — and
-            // listing it would only make the generated class noisier than the source.
         )
         mv.visitCode()
 
         val scope = MethodScope(
-            owner = currentOwner,
+            owner = name,
             mv = mv,
             lambdaIdentity = construct,
-            firstSlot = 0,
-            static = true,
-            returnType = returnType,
-            // Whether a `yield` here leaves through the `try` rather than returning from this method.
-            // It used to be decided by `yieldedType != null`, which is now wrong: a bare `yield` in a
-            // statement-position `try` carries no value, so `yieldedType` stays null while the `yield`
-            // must still throw. What matters is that this method *is* a `try` handler, not whether
-            // anything ends up being carried out of it.
+            // `this` occupies slot 0 and the interface's `Object` parameters follow.
+            firstSlot = 1,
+            static = false,
+            // What a `nyan` returns from, and what the trailing return has to agree with.
+            returnType = ObjectType,
             extractorResult = true,
         )
+        // The `Object`s the interface handed over occupy the first slots; the locals the body reads
+        // start after them.
+        scope.advancePast(1 + signature.size)
 
-        // The parameters arrive typed — no `Object[]` to unpack — so each is simply reserved in
-        // place. A `long` or `double` among them takes two slots, which is why the total is walked
-        // rather than counted.
-        var slot = 0
         parameters.forEachIndexed { index, parameter ->
-            val symbol = parameter.symbol
-            if (symbol != null) {
-                scope.reserve(symbol, slot)
-            }
-            slot += BuiltinTypes.slotCountOf(signature.getOrElse(index) { ErrorType })
+            val symbol = parameter.symbol ?: return@forEachIndexed
+            val type = signature.getOrElse(index) { symbol.type }
+            val slot = scope.allocateTemp(type)
+            scope.reserve(symbol, slot)
+            // `argN` was an `Object`; the body expects a value of the clause's type.
+            mv.visitVarInsn(ALOAD, 1 + index)
+            emitUnbox(type, mv)
+            mv.visitVarInsn(storeOpcode(type), slot)
         }
-        scope.advancePast(slot)
 
         for (inner in construct.extractorBody.statements) {
             emitStatement(inner, scope)
         }
 
-        // A handler that answers nothing, or a value-answering one whose `nyan` is inside a branch,
-        // can reach here. The statement list may already have `return`ed, so the trailing return is
-        // only needed when control can still arrive — but emitting it is always verifiable and always
-        // correct, so it is not conditional.
-        if (returnType == VoidType || returnType === ErrorType) {
-            mv.visitInsn(RETURN)
-        } else {
-            pushDefault(returnType, mv)
-            mv.visitInsn(returnOpcode(returnType))
-        }
+        // A body that says nothing, or whose `nyan` is inside a branch, reaches here. Answering
+        // `null` is the documented behaviour for "no value", and a `scratch` wanting a primitive
+        // turns it into that type's default.
+        mv.visitInsn(ACONST_NULL)
+        mv.visitInsn(ARETURN)
 
         mv.visitMaxs(0, 0)
         mv.visitEnd()
+        writer.visitEnd()
 
-        // A `try` written inside the handler body has its own handler, compiled into this class too.
-        drainHandlers(writer, currentOwner)
+        output[name] = writer.toByteArray()
         currentOwner = enclosingOwner
+        return name
     }
 
     /**
@@ -3865,6 +3887,7 @@ class BytecodeGenerator(
             if (receiver != null) {
                 val call = {
                     emitArguments(expression.arguments, instanceMethod.parameterTypes, scope)
+                    emitHandlerArgument(expression, instanceMethod, scope)
                     // A method declared in an interface must be dispatched with `invokeinterface`; the
                     // JVM treats using `invokevirtual` on one as a verification error.
                     val opcode = if (instanceMethod.ownerIsInterface) INVOKEINTERFACE else INVOKEVIRTUAL
@@ -3872,7 +3895,7 @@ class BytecodeGenerator(
                         opcode,
                         instanceMethod.jvmOwner,
                         instanceMethod.name,
-                        descriptorOf(instanceMethod.parameterTypes, instanceMethod.returnType),
+                        descriptorOf(instanceMethod.descriptorParameterTypes, instanceMethod.returnType),
                         instanceMethod.ownerIsInterface,
                     )
                     // A safe call's own type is the return type made nullable, so a function answering
@@ -3896,12 +3919,13 @@ class BytecodeGenerator(
                 }
             } else {
                 emitArguments(expression.arguments, instanceMethod.parameterTypes, scope)
+                emitHandlerArgument(expression, instanceMethod, scope)
                 // A JDK method's descriptor comes from reflection rather than from the symbol: the
                 // analyzer recorded the exact descriptor, and rebuilding it from Neko types could
                 // differ in a way the JVM would reject at run time (`Object` versus a parameter's real
                 // class, say). A Neko declaration has no such field and is described as before.
                 val descriptor = instanceMethod.builtin?.jvmDescriptor
-                    ?: descriptorOf(instanceMethod.parameterTypes, instanceMethod.returnType)
+                    ?: descriptorOf(instanceMethod.descriptorParameterTypes, instanceMethod.returnType)
                 mv.visitMethodInsn(
                     INVOKESTATIC,
                     instanceMethod.jvmOwner,
@@ -4050,11 +4074,12 @@ class BytecodeGenerator(
         // slot 0, so `this` goes on the stack first; a static one is an ordinary `invokestatic`.
         if (symbol.isStatic) {
             emitArguments(expression.arguments, symbol.parameterTypes, scope)
+            emitHandlerArgument(expression, symbol, scope)
             mv.visitMethodInsn(
                 INVOKESTATIC,
                 symbol.jvmOwner,
                 symbol.name,
-                descriptorOf(symbol.parameterTypes, symbol.returnType),
+                descriptorOf(symbol.descriptorParameterTypes, symbol.returnType),
                 false,
             )
             return
@@ -4062,14 +4087,60 @@ class BytecodeGenerator(
 
         mv.visitVarInsn(ALOAD, 0)
         emitArguments(expression.arguments, symbol.parameterTypes, scope)
+        emitHandlerArgument(expression, symbol, scope)
         mv.visitMethodInsn(
             INVOKEVIRTUAL,
             symbol.jvmOwner,
             symbol.name,
-            descriptorOf(symbol.parameterTypes, symbol.returnType),
+            descriptorOf(symbol.descriptorParameterTypes, symbol.returnType),
             false,
         )
     }
+
+    /**
+     * Pushes the handler value a call to [symbol] must carry as its last argument.
+     *
+     * A function with an `emit` clause takes a `ScratchHandlerN` the source never writes, so every
+     * call has to supply one. There are exactly two sources, and the map distinguishes them by the
+     * call itself rather than by position — which is what keeps `try f(g())` from giving `g` the
+     * handler that belongs to `f`:
+     *
+     *  * **A `try` that wraps this very call** registered the handler object it built. Take it, and
+     *    forget it: it belongs to this one call.
+     *  * **A function that forwards its clause** has a handler of its own, in [MethodScope.handlerSlot],
+     *    and passing that on is exactly what forwarding means.
+     *
+     * Anything else is a call analysis already refused, so a `null` is pushed to keep the frame
+     * verifiable rather than to pretend the call makes sense.
+     */
+    private fun emitHandlerArgument(
+        expression: CallExpression,
+        symbol: FunctionSymbol,
+        scope: MethodScope,
+    ) {
+        if (symbol.handlerType == null) return
+        val mv = scope.mv
+        val established = tryHandlers.remove(expression)
+        if (established != null) {
+            mv.visitVarInsn(ALOAD, established)
+            return
+        }
+        val forwarded = scope.handlerSlot
+        if (forwarded != null) {
+            mv.visitVarInsn(ALOAD, forwarded)
+            return
+        }
+        mv.visitInsn(ACONST_NULL)
+    }
+
+    /**
+     * The handler objects `try` expressions have built, keyed by the call they belong to.
+     *
+     * A call cannot be recognised by "is a `try` being emitted" because the call's own arguments may
+     * contain further calls; keying by the exact [CallExpression] answers the question for the one
+     * call that asked.
+     */
+    private val tryHandlers = mutableMapOf<CallExpression, Int>()
 
     // ---------------------------------------------------------------- lambdas
 
@@ -4763,6 +4834,20 @@ class BytecodeGenerator(
          */
         var nyaResult: NyaResult? = null,
         /**
+         * The local holding this method's `ScratchHandlerN` parameter, when it takes one.
+         *
+         * A function with an `emit` clause receives its handler as a hidden last parameter, so its
+         * body can reach it by slot. A `scratch` loads this local and calls through it, which is what
+         * makes one function's `scratch` reach whichever `try` supplied the value — no name, no
+         * static method, and no way for two `try` blocks to be confused with each other.
+         *
+         * `null` in a method that takes no handler: a plain function, a lambda, or the synthesized
+         * `scratching` method itself.
+         */
+        var handlerSlot: Int? = null,
+        /** The internal name of the interface [handlerSlot] holds, e.g. `.../ScratchHandler2`. */
+        var handlerInterface: String? = null,
+        /**
          * The `purr` blocks currently open in this method, innermost last.
          *
          * A `return` or a `yield` has to release every lock it is leaving, not just the innermost: a
@@ -4864,6 +4949,15 @@ class BytecodeGenerator(
 
         /** Prefix of the generated function-type interfaces, e.g. `Neko$Function$0`. */
         const val INTERFACE_PREFIX = "Neko\$Function\$"
+
+        /**
+         * The single method on every `ScratchHandlerN` interface.
+         *
+         * The interfaces are standard library source — `com.github.kusa233.neko.stdlib.emitter.handler`
+         * — so their names are looked up in the program like any other library class; only this method
+         * name is fixed here, because it is the contract the code generator calls against.
+         */
+        const val SCRATCHING_METHOD_NAME = "scratching"
 
         /**
          * The field of the `yield` carrier holding the value the `yield` carried.

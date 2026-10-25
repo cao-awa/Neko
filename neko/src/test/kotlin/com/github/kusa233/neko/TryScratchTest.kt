@@ -346,14 +346,18 @@ class TryScratchTest {
     }
 
     /**
-     * The construct needs a handler to enter, like any other `scratch` site.
+     * The construct uses the handler its own function was given, so no `try` elsewhere is needed.
      *
-     * `try f() scratch 1` names a destination; if no `try` in the program declares a handler with
-     * that `emit` signature, the site has nowhere to go and is reported as such.
+     * `try f() scratch 1` means "if `f` throws, enter *my* handler with 1". Nothing in the program
+     * has to declare a matching handler — the function's own `emit` clause means it already holds
+     * one — which is why the old "no 'try' declares a handler for this emit signature" error is gone.
+     *
+     * The shipped program does not call `guarded`, so this pins the fact that compiling it needs no
+     * `try` anywhere else.
      */
     @Test
-    fun `a try scratch with no matching handler is refused`() {
-        val reported = errors(
+    fun `a try scratch needs no try elsewhere in the program`() {
+        val result = TestSupport.compile(
             program(
                 "class Test {",
                 "    static {",
@@ -374,8 +378,9 @@ class TryScratchTest {
             ),
         )
         assertTrue(
-            reported.any { "no 'try' declares a handler for this emit signature" in it },
-            "expected the missing-handler error, but got:\n${reported.joinToString("\n")}",
+            !result.hasErrors,
+            "the function's own emit clause supplies the handler, so nothing else is needed:\n" +
+                TestSupport.messages(result).joinToString("\n"),
         )
     }
 

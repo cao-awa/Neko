@@ -83,24 +83,24 @@ class BareYieldNyanTest {
     }
 
     /**
-     * A bare `nyan` is refused when the reaching sites want a value.
+     * A bare `nyan` where a value is wanted answers that type's Java default.
      *
-     * `v: int = try risky() scratch 5` asks the handler for an `int`, so a `nyan` that answers nothing
-     * would `return` from a method declared to answer one. The diagnostic names both sides of the
-     * disagreement rather than silently coercing.
+     * This used to be an error — "this 'nyan' leaves no value, but the 'scratch' sites reaching this
+     * handler take int" — because the handler was a method whose return type the sites fixed, so
+     * answering nothing there would have been a `void` return from an `int` method.
+     *
+     * A handler now answers an `Object`, and a bare `nyan` is a `null` answer. The site asking for an
+     * `int` converts it to the Java default rather than throwing, which is what makes "no value" a
+     * usable answer instead of a hole in the type system.
      */
     @Test
-    fun `a bare nyan is refused when a value is wanted`() {
-        val reported = errors(
+    fun `a bare nyan answers the type's default when a value is wanted`() {
+        val output = run(
             program(
                 "class Test {",
                 "    static {",
-                "        fun risky(): int {",
-                "            return 1 / 0",
-                "        }",
-                "",
                 "        fun guard(): int {",
-                "            v: int = try risky() scratch 5",
+                "            v: int = scratch 5",
                 "            return v",
                 "        } emit [int]",
                 "",
@@ -112,10 +112,7 @@ class BareYieldNyanTest {
                 "}",
             ),
         )
-        assertTrue(
-            reported.any { "leaves no value" in it && "take int" in it },
-            "expected the missing-value error, but got:\n${reported.joinToString("\n")}",
-        )
+        assertEquals("0", output, "a null answer becomes the int default at the site that wanted one")
     }
 
     /**
@@ -297,40 +294,33 @@ class BareYieldNyanTest {
     }
 
     /**
-     * Omitting the value where it *is* read is reported against the handler, not against the call.
+     * A handler that says nothing at all is the same as a bare `nyan`: the site gets the default.
      *
-     * The position matters: the whole handler is what answers the sites, so the diagnostic points at
-     * the `{ ... }` block rather than at the keyword — the fix may be in any branch of it, and naming
-     * one statement would be arbitrary.
+     * The `{ ... }` block may simply end without `nyan` or `yield`. That is no longer a diagnostic
+     * against the handler — the generated `scratching` answers `null` after the body — and the site
+     * converts it exactly as it would a bare `nyan`.
      */
     @Test
-    fun `the missing value is reported against the handler`() {
-        val source = program(
-            "class Test {",
-            "    static {",
-            "        fun risky(): int {",
-            "            return 1 / 0",
-            "        }",
-            "",
-            "        fun guard(): int {",
-            "            v: int = try risky() scratch 5",
-            "            return v",
-            "        } emit [int]",
-            "",
-            "        fun main() {",
-            "            r: int = try guard() { x -> nyan }",
-            "            println(r)",
-            "        }",
-            "    }",
-            "}",
+    fun `a handler with no nyan answers the default too`() {
+        val output = run(
+            program(
+                "class Test {",
+                "    static {",
+                "        fun guard(): int {",
+                "            v: int = scratch 5",
+                "            return v",
+                "        } emit [int]",
+                "",
+                "        fun main() {",
+                "            r: int = try guard() { x ->",
+                "                println(\"handler ran\")",
+                "            }",
+                "            println(r)",
+                "        }",
+                "    }",
+                "}",
+            ),
         )
-        // The diagnostic points at the handler's `{ ... }` body, which is the line holding `nyan`
-        // here — the whole block is what answers the sites, so naming one statement would be arbitrary.
-        val handlerLine = TestSupport.locationOf(source, "x -> nyan }").substringBefore(':')
-        val reported = TestSupport.errorLocations(TestSupport.compile(source))
-        assertTrue(
-            reported.any { it.startsWith("Test.neko:$handlerLine:") },
-            "expected the error on the handler line $handlerLine, but got:\n${reported.joinToString("\n")}",
-        )
+        assertEquals("handler ran\n0", output, "the body ran and answered nothing, so the site got 0")
     }
 }

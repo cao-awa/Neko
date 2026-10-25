@@ -36,7 +36,7 @@ Tasks are module-qualified now that there is more than one module.
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # Tests.
-./gradlew :neko:test                     # the compiler: 535 tests
+./gradlew :neko:test                     # the compiler: 540 tests
 ./gradlew :plugin:idea:test              # the plugin: 56 tests, in a real IDE instance
 
 # The compiler as one self-contained jar.
@@ -165,8 +165,10 @@ The library holds only what the language cannot borrow from the JVM:
   *different* class, so `private` would compile cleanly and fail with `IllegalAccessError` the first
   time a `yield` fired.
 
-Everything else the effect mechanism needs is generated: a `try`'s `{ ... }` block becomes a `static`
-method of the class holding the `try`, and `scratch` compiles to an ordinary `invokestatic` against it.
+Everything else the effect mechanism needs is generated: a `try`'s `{ ... }` block becomes a class
+that implements the `ScratchHandlerN` for its arity, and a `scratch` compiles to an
+`invokeinterface` asking that object for an answer. The `ScratchHandler0` … `ScratchHandler7`
+interfaces are library source too, one per arity.
 
 There is exactly one built-in that is not Neko source: `println`, in one overload per built-in type —
 the seven numeric ones, `string`, `bool` and `Object`. It mirrors `System.out.println` and is modelled
@@ -1039,7 +1041,9 @@ declared function.
 
 A function that declares an `emit` clause says it may hand control to a `try`'s `{ ... }` block.
 **`scratch` enters that block and comes back with an answer** —it is an ordinary call, not a
-departure. The block is compiled into a `static` method, so `scratch` is an `invokestatic`:
+departure. The mechanism is a value passed alongside the arguments: a function with an `emit` clause
+takes a hidden `ScratchHandlerN` as its last parameter, and `scratch` calls
+`handler.scratching(...)` on it.
 
 ```neko
 class Neko() {
@@ -1162,56 +1166,60 @@ The three keywords are not interchangeable, and the difference is the whole desi
 
 | written | reaches | carries a value to |
 | --- | --- | --- |
-| `scratch v1, v2` | the handler whose `emit` clause matches | the site itself, as its own result |
+| `scratch v1, v2` | the handler this function was given | the site itself, as its own result |
 | `nyan v` | leaves the handler | the `scratch` site that entered it |
 | `yield v` | leaves by throwing | the `try` that declared the handler |
 
-A `scratch` is matched to a handler by its `emit` signature alone, so **each signature may have only
-one handler in the program** —two would be indistinguishable from a site's point of view, and that is
-reported rather than resolved by declaration order.
+A `scratch` reaches **the handler its own function was passed**, not one found by matching a
+signature. That is why several `try` blocks may answer the same `emit` clause: each builds its own
+handler object and hands it to the call it wraps, so a callee serves every caller independently. It
+also means a `scratch` needs no `try` anywhere in the program — the function's `emit` clause means it
+already holds one.
 
 #### Leaving the value out
 
-The `v` in `nyan v` and `yield v` is optional, and **which form is right depends on where it is
-written**: a handler answers the `scratch` sites that reach it, so whether a value travels out is
-decided by those sites, not by the handler's own preference.
+The `v` in `nyan v` and `yield v` is optional, and **the two vacuous forms mean different things**.
+
+A handler always answers an `Object` — the interface says so — so a `nyan` with no value answers
+`null`. A `scratch` site that wants a primitive turns that `null` into the type's Java default rather
+than throwing, which is what makes "I have nothing to say" a usable answer:
 
 ```neko
 class Neko() {
-  fun risky(): int {
-    return 1 / 0
-  }
-
-  fun guard() {
-    // Nothing here reads an answer, so the handler below is `void`.
-    try risky() scratch 5
-    println("after")
+  fun guard(): int {
+    v: int = scratch 5
+    return v
   } emit [int]
 
   fun invoker() {
-    try guard() { x ->
-      // A bare `nyan`: answers nothing, which is right — no site wants anything.
+    // The handler answers null, and the `int` site reads 0.
+    r: int = try guard() { x ->
       nyan
     }
+    println(r)   // 0
   }
 }
 ```
 
-* **A bare `nyan`** is the `return` of a `void` handler. It is accepted exactly when no reaching
-  `scratch` site wants a value, and refused with "this 'nyan' leaves no value, but the 'scratch' sites
-  reaching this handler take `int`" when one does.
+A handler that ends without `nyan` at all is the same thing: the generated `scratching` answers
+`null` after the body, so the site sees the default too.
+
+* **A bare `nyan`** answers `null`. There is no longer a rule against it — the site's own conversion
+  is what decides what that becomes, so nothing is refused here.
 * **A bare `yield`** abandons the call without producing anything. It is accepted in a `try`
   statement, which is worth nothing, and refused where the construct is worth a value — the other path
   would produce one and this path would not.
 
-Writing the value anyway is still allowed where nothing reads it (`nyan 0` in a `void` handler is a
-plain `return` of `0`), so the relaxation never invalidates a program that already compiles.
+Because the handler's answer is untyped at the boundary, a `nyan` may also produce a type no site
+asked for. That is not a compile error; the site that cannot use it fails on its own `checkcast` at
+run time, which points at the mismatch instead of the whole program.
 
 #### Catching a thrown exception with `try ... scratch`
 
 The `try` spellings above all **declare** a handler. The other question you can ask is what should
-happen when the call **fails**, and that is written by naming an existing handler after the call
-instead of writing a block:
+happen when the call **fails**, and that is written by naming the values after the call instead of
+writing a block. The handler it enters is the one the enclosing function was given — the same one its
+own `scratch` sites reach — so nothing has to be declared elsewhere:
 
 ```neko
 class Neko() {

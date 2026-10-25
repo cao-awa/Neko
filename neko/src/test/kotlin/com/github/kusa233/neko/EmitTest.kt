@@ -2,6 +2,7 @@ package com.github.kusa233.neko
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /**
@@ -100,18 +101,44 @@ class EmitTest {
         assertEquals("30\n", run(load(recoveryProgram())))
     }
 
+    /**
+     * A `try`'s `{ ... }` block becomes `scratching` on a class of its own.
+     *
+     * It used to be a `static` method named after the function holding the `try`, found by matching
+     * the emit signature across the whole program. It is now a *value*: the `try` builds one and
+     * hands it to the call it wraps, which is what lets several `try` blocks answer the same clause.
+     *
+     * The descriptor is the interface's, not the body's: `ScratchHandlerN.scratching` takes `Object`s
+     * and answers one, so the box is where the types are erased and refilled per site.
+     */
     @Test
-    fun `the handler is a static method named after the function holding the try`() {
+    fun `a try's handler is a class implementing the clause's interface`() {
+        val result = TestSupport.compile(recoveryProgram(), name = "Emit.neko")
+        assertTrue(!result.hasErrors, "the program must compile first: ${TestSupport.messages(result)}")
+
+        val handlerClass = result.classes.keys.firstOrNull { it.contains("\$ScratchHandler\$") }
+            ?: error("no handler class was generated: ${result.classes.keys}")
+
+        val methods = methodDescriptors(result.classes.getValue(handlerClass))
+        assertEquals(
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            methods["scratching"],
+            "the handler implements the two-value interface it was given",
+        )
+    }
+
+    @Test
+    fun `an emit function takes its handler as a hidden last parameter`() {
+        // The source never mentions it, but the JVM must see it: `b` declares `emit [int, int]`, so
+        // its class-file signature ends in `ScratchHandler2`.
         val result = TestSupport.compile(recoveryProgram(), name = "Emit.neko")
         assertTrue(!result.hasErrors, "the program must compile first: ${TestSupport.messages(result)}")
 
         val methods = methodDescriptors(result.classes.getValue("com/github/kusa233/neko/sample/Emitter"))
-        // The sample's own naming: `nyanTest$scratch$0`, taking the two `int`s of the `emit` clause
-        // and answering the `int` the scratch site declared.
         assertEquals(
-            "(II)I",
-            methods["nyanTest\$scratch\$0"],
-            "the handler should take its emit values and answer what the site declared",
+            "(Lcom/github/kusa233/neko/stdlib/emitter/handler/ScratchHandler2;)I",
+            methods["b"],
+            "the emit clause's arity decides which handler interface the function takes",
         )
     }
 
@@ -159,9 +186,10 @@ class EmitTest {
     }
 
     @Test
-    fun `a handler that answers nothing is declared to return void`() {
-        // A `scratch` written as an expression statement of its own: nothing takes the value, so the
-        // handler has no reason to answer one and is emitted as `void`.
+    fun `a handler always answers Object, whatever its body does`() {
+        // A handler reached only by a discarded `scratch` has nothing to answer, and it still answers
+        // `Object` — `null`, in fact. The interface fixes the shape, so the body cannot change it;
+        // each site converts the answer to whatever it wanted. See `emitScratchAnswer`.
         val result = TestSupport.compile(
             samplePackage(
                 "class Emitter {",
@@ -182,11 +210,12 @@ class EmitTest {
         )
         assertTrue(!result.hasErrors, "the program must compile first: ${TestSupport.messages(result)}")
 
-        val methods = methodDescriptors(result.classes.getValue("com/github/kusa233/neko/sample/Emitter"))
+        val handlerClass = result.classes.keys.firstOrNull { it.contains("\$ScratchHandler\$") }
+            ?: error("no handler class was generated: ${result.classes.keys}")
         assertEquals(
-            "(II)V",
-            methods["run\$scratch\$0"],
-            "a handler reached only by a discarded scratch should answer nothing",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            methodDescriptors(result.classes.getValue(handlerClass))["scratching"],
+            "an interface method has one signature however the body is written",
         )
     }
 
@@ -247,9 +276,14 @@ class EmitTest {
         assertEquals("7\n", run(program), "the [int, int] scratch should reach the [int, int] handler")
     }
 
+    /**
+     * A `scratch` needs no `try` anywhere in the program: it calls the handler its own function was
+     * given. This used to be the error "no 'try' declares a handler for this emit signature", which
+     * is now impossible to have — a function with an `emit` clause always receives one.
+     */
     @Test
-    fun `a scratch with no matching handler says so`() {
-        val result = TestSupport.compile(
+    fun `a scratch needs no try anywhere in the program`() {
+        val program = load(
             samplePackage(
                 "class Emitter {",
                 "    static {",
@@ -259,90 +293,97 @@ class EmitTest {
                 "        } emit [int]",
                 "    }",
                 "}",
-            ),
-            name = "Emit.neko",
-        )
-        assertTrue(
-            TestSupport.errors(result).any { it.message.contains("no 'try' declares a handler") },
-            "unexpected messages: ${TestSupport.messages(result)}",
-        )
-    }
-
-    @Test
-    fun `two handlers with the same emit signature are ambiguous`() {
-        val result = TestSupport.compile(
-            samplePackage(
-                "class Emitter {",
+                "",
+                "class Main {",
                 "    static {",
-                "        fun first(): int {",
-                "            return 1",
-                "        } emit [int]",
-                "",
-                "        fun second(): int {",
-                "            return 2",
-                "        } emit [int]",
-                "",
-                "        fun a(): int {",
-                "            v: int = try first() { a ->",
-                "                nyan a",
-                "            }",
-                "            return v",
-                "        }",
-                "",
-                "        fun b(): int {",
-                "            v: int = try second() { a ->",
-                "                nyan a",
-                "            }",
-                "            return v",
+                "        fun main() {",
+                "            println(\"compiled\")",
                 "        }",
                 "    }",
                 "}",
             ),
-            name = "Emit.neko",
         )
-        assertTrue(
-            TestSupport.errors(result).any { it.message.contains("could not tell the two apart") },
-            "unexpected messages: ${TestSupport.messages(result)}",
-        )
+        assertEquals("compiled\n", run(program))
     }
 
+    /**
+     * Two `try` blocks may answer the same `emit` clause, and each gets its own handler.
+     *
+     * This is the whole point of the handler being a value: the same callee is called twice with
+     * different handlers, and the answers differ. The old design refused the second `try` outright
+     * with "another 'try' already declares a handler for this emit signature".
+     */
     @Test
-    fun `a later scratch that disagrees about the handler's type is an error`() {
-        // The first site takes an `int`, so the handler answers `int`; the second takes nothing, which
-        // would need a `void` handler. One method cannot be both.
-        val result = TestSupport.compile(
+    fun `two tries for the same emit signature each get their own handler`() {
+        val program = load(
             samplePackage(
                 "class Emitter {",
                 "    static {",
                 "        fun source(): int {",
-                "            v: int = scratch 1",
+                "            v: int = scratch 2, 3",
                 "            return v",
-                "        } emit [int]",
+                "        } emit [int, int]",
+                "    }",
+                "}",
                 "",
-                "        fun first(): int {",
-                "            v: int = scratch 1",
-                "            return v",
-                "        } emit [int]",
-                "",
-                "        fun second() {",
-                "            scratch 2",
-                "        } emit [int]",
-                "",
-                "        fun holder(): int {",
-                "            v: int = try source() { a ->",
-                "                nyan a",
-                "            }",
-                "            return v",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            sum: int = try Emitter.source() { a, b -> nyan a + b }",
+                "            product: int = try Emitter.source() { a, b -> nyan a * b }",
+                "            println(sum)",
+                "            println(product)",
                 "        }",
                 "    }",
                 "}",
             ),
-            name = "Emit.neko",
         )
-        assertTrue(
-            TestSupport.errors(result).any { it.message.contains("so this one cannot take") },
-            "unexpected messages: ${TestSupport.messages(result)}",
+        assertEquals("5\n6\n", run(program), "each try supplied its own handler to the same callee")
+    }
+
+    /**
+     * Several `scratch` sites in one function all reach the same handler, each converting its answer
+     * to what its own position wanted.
+     *
+     * The old design fixed one return type per handler and refused any site that disagreed, because
+     * the handler was a method with one signature. Now the answer is an `Object` and every site
+     * converts it, so an `int` site and a `string` site can share one handler.
+     */
+    @Test
+    fun `scratch sites may take different types from one handler`() {
+        val program = load(
+            samplePackage(
+                "class Emitter {",
+                "    static {",
+                "        fun source(): int {",
+                "            n: int = scratch 1",
+                "            s: string = scratch 2",
+                "            println(n)",
+                "            println(s)",
+                "            return n",
+                "        } emit [int]",
+                "    }",
+                "}",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            v: int = try Emitter.source() { a ->",
+                "                if (a == 1) {",
+                "                    nyan a",
+                "                } else {",
+                "                    nyan \"text\"",
+                "                }",
+                "            }",
+                "            println(v)",
+                "        }",
+                "    }",
+                "}",
+            ),
         )
+        // The handler answers `1` to the `int` site and `"text"` to the `string` one, and the third
+        // line is the value `source` itself returned.
+        assertEquals("1\ntext\n1\n", run(program))
     }
 
     // ------------------------------------------------------------------------------ nyan and yield
@@ -368,9 +409,18 @@ class EmitTest {
         )
     }
 
+    /**
+     * A `nyan`'s type is not constrained: the answer is an `Object`, and the site converts it.
+     *
+     * This used to be an error — "this 'nyan' answers string but the 'scratch' sites reaching this
+     * handler take int" — because the handler was a method whose return type the first site fixed.
+     * Now the handler answers an `Object` and each site casts it, so a `string` here reaches one site
+     * and a different answer reaches another. What a mismatch does now is fail at the site that
+     * cannot use it, which is where the reader can see it.
+     */
     @Test
-    fun `nyan that disagrees with what the sites take is an error`() {
-        val result = TestSupport.compile(
+    fun `a nyan may answer a type the site did not ask for`() {
+        val program = load(
             samplePackage(
                 "class Emitter {",
                 "    static {",
@@ -378,27 +428,26 @@ class EmitTest {
                 "            v: int = scratch 1",
                 "            return v",
                 "        } emit [int]",
+                "    }",
+                "}",
                 "",
-                "        fun consumer(): int {",
-                "            v: int = scratch 1",
-                "            return v",
-                "        } emit [int]",
-                "",
-                "        fun holder(): int {",
-                "            v: int = try source() { a ->",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            v: int = try Emitter.source() { a ->",
                 "                nyan \"not an int\"",
                 "            }",
-                "            return v",
+                "            println(v)",
                 "        }",
                 "    }",
                 "}",
             ),
-            name = "Emit.neko",
         )
-        assertTrue(
-            TestSupport.errors(result).any { it.message.contains("this 'nyan' answers") },
-            "unexpected messages: ${TestSupport.messages(result)}",
-        )
+        // The compiler no longer refuses this — the answer is an `Object` and the site casts it — so
+        // the mismatch surfaces where it can be seen: the `int` site's `checkcast`, at run time.
+        assertFailsWith<ClassCastException> {
+            run(program)
+        }
     }
 
     @Test
@@ -687,42 +736,41 @@ class EmitTest {
     // ---------------------------------------------------------------------------- wide values
 
     @Test
-    fun `an emit clause carries wide values without boxing them`() {
-        // The old mechanism boxed every value into an `Object[]`; a `scratch` passes them as ordinary
-        // parameters, so a `long` keeps its own descriptor and reaches the handler intact. This pins
-        // the descriptor down, which is the part a reader would otherwise have to take on trust.
+    fun `an emit clause boxes its values at the handler boundary`() {
+        // The handler interface is `scratching(Object, Object): Object`, so a `long` and a `double`
+        // are boxed on the way in and unboxed into the body's own locals. That is the price of one
+        // interface family serving every clause of the same arity, and it is worth pinning: a body
+        // still writes `a + b` against the declared types, and the box never reaches the source.
         val source = samplePackage(
             "class Emitter {",
             "    static {",
-            "        fun source(): int {",
-            "            return 1",
-            "        } emit [long, double]",
-            "",
             "        fun consumer(): int {",
             "            v: int = scratch 9000000000L, 2.5",
             "            return v",
             "        } emit [long, double]",
             "",
             "        fun run(): int {",
-            "            v: int = try source() { a, b ->",
-            "                nyan 7",
+            "            w: int = try consumer() { a, b ->",
+            "                println(a)",
+            "                println(b)",
+            "                nyan 3",
             "            }",
-            "            return v",
+            "            return w",
+            "        }",
+            "    }",
+            "}",
+            "",
+            "class Main {",
+            "    static {",
+            "        fun main() {",
+            "            println(Emitter.run())",
             "        }",
             "    }",
             "}",
         )
-        val result = TestSupport.compile(source, name = "Emit.neko")
-        assertTrue(!result.hasErrors, "the program must compile first: ${TestSupport.messages(result)}")
-
-        val methods = methodDescriptors(
-            result.classes.getValue("com/github/kusa233/neko/sample/Emitter"),
-        )
-        assertEquals(
-            "(JD)I",
-            methods["run\$scratch\$0"],
-            "a wide value should keep its own slot width as a parameter",
-        )
+        val program = load(source)
+        // `a` and `b` arrive as a `long` and a `double` inside the body, whatever the box said.
+        assertEquals("9000000000\n2.5\n3\n", run(program))
     }
 
     // ------------------------------------------------------------------------ the handler's class
@@ -842,7 +890,12 @@ class EmitTest {
             "a 'try' catches the exception, so the catching method declares nothing",
         )
         // And the method that really throws does declare it, which is what makes the pair meaningful.
-        assertEquals("()I", methods["inner"], "the fixture should still contain 'inner'")
+        // `inner` takes the hidden handler for its `emit [int]`, so its descriptor says so.
+        assertEquals(
+            "(Lcom/github/kusa233/neko/stdlib/emitter/handler/ScratchHandler1;)I",
+            methods["inner"],
+            "the fixture should still contain 'inner', taking its handler",
+        )
     }
 
     @Test

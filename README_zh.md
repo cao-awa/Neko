@@ -35,7 +35,7 @@ Neko 是一门用来做编译器实验的玩具 JVM 语言：它有类、接口�
 ./gradlew :neko:runNeko -Pneko.program=ExceptionSample
 
 # 测试。
-./gradlew :neko:test                     # 编译器：535 个测试
+./gradlew :neko:test                     # 编译器：540 个测试
 ./gradlew :plugin:idea:test              # 插件：56 个测试，跑在真实 IDE 实例里
 
 # 把编译器打成单个自包含 jar。
@@ -151,8 +151,9 @@ neko.outputDirectory=neko-compile/classes
   handler，位于**另一个类**里，写成 `private` 会编译通过，却在第一次真正 `yield` 时抛
   `IllegalAccessError`。
 
-效应机制的其余部分都是生成的：`try` 的 `{ ... }` 块会变成持有该 `try` 的类的一个 `static` 方法，
-`scratch` 则编译成对它的一次普通 `invokestatic`。
+效应机制的其余部分都是生成的：`try` 的 `{ ... }` 块变成一个实现对应参数个数 `ScratchHandlerN` 的
+类，`scratch` 则编译成向那个对象要答案的一次 `invokeinterface`。`ScratchHandler0` 到
+`ScratchHandler7` 这几个接口同样是库源码，每个参数个数一个。
 
 只有一个内置项不是 Neko 源码：`println`，每种内置类型一个重载——七个数值类型、`string`、`bool`
 和 `Object`。它对应 `System.out.println`，并被建模成普通函数，好让分析器和生成器共用同一条解析路径。
@@ -946,8 +947,9 @@ class Main {
 ### 错误控制
 
 声明了 `emit` 子句的函数，等于说自己可能把控制权交给某个 `try` 的 `{ ... }` 块。**`scratch` 进入
-那个块，并带着一个答案回来**——它是一次普通调用，不是离开。该块被编译成一个 `static` 方法，所以
-`scratch` 就是一次 `invokestatic`：
+那个块，并带着一个答案回来**——它是一次普通调用，不是离开。机制是一个随参数一起传下去的值：声明了
+`emit` 子句的函数会在参数列表末尾多一个隐藏的 `ScratchHandlerN` 参数，而 `scratch` 就是调用它的
+`handler.scratching(...)`。
 
 ```neko
 class Neko() {
@@ -1066,52 +1068,54 @@ class Neko() {
 
 | 写法 | 到达 | 把值带到 |
 | --- | --- | --- |
-| `scratch v1, v2` | `emit` 子句匹配的那个 handler | 它自己的位置，作为它自己的结果 |
+| `scratch v1, v2` | 本函数被传入的那个 handler | 它自己的位置，作为它自己的结果 |
 | `nyan v` | 离开 handler | 进入它的那个 `scratch` 点 |
 | `yield v` | 通过抛出离开 | 声明该 handler 的那个 `try` |
 
-`scratch` 仅凭它的 `emit` 签名匹配 handler，所以**每个签名在整个程序里只能有一个 handler**——
-两个从调用点的角度看是无法区分的，这一点会被报出来，而不是按声明顺序解决。
+`scratch` 到达的是**它所在函数被传入的那个 handler**，而不是靠匹配签名找出来的某一个。这正是多个
+`try` 可以应答同一个 `emit` 子句的原因：每个 `try` 自己造一个 handler 对象交给它包住的那次调用，
+于是同一个被调函数对每个调用方都是独立的。它也意味着 `scratch` 不要求程序里存在任何 `try`——函数的
+`emit` 子句说明它已经拿到了一个。
 
 #### 省略值
 
-`nyan v` 和 `yield v` 里的 `v` 可以省略，而**哪种形式正确取决于写在哪里**：handler 应答的是到达它
-的那些 `scratch` 点，所以值能不能带出去由那些点决定，而不是由 handler 自己的偏好决定。
+`nyan v` 和 `yield v` 里的 `v` 可以省略，而**两种空形式的含义不同**。
+
+handler 总是应答一个 `Object`——接口就是这么写的——所以不带值的 `nyan` 应答 `null`。需要基本类型的
+`scratch` 点会把 `null` 变成该类型的 Java 默认值而不是抛异常，这才让「我没什么可说的」成为一个可用的
+答案：
 
 ```neko
 class Neko() {
-  fun risky(): int {
-    return 1 / 0
-  }
-
-  fun guard() {
-    // 这里没有任何东西读取答案，所以下面那个 handler 是 `void` 的。
-    try risky() scratch 5
-    println("after")
+  fun guard(): int {
+    v: int = scratch 5
+    return v
   } emit [int]
 
   fun invoker() {
-    try guard() { x ->
-      // 裸 `nyan`：什么都不应答，这是对的——没有调用点需要任何值。
+    // handler 应答 null，而 `int` 点读到的是 0。
+    r: int = try guard() { x ->
       nyan
     }
+    println(r)   // 0
   }
 }
 ```
 
-* **裸 `nyan`** 是 `void` handler 的 `return`。只有在没有任何到达的 `scratch` 点需要值时才被接受；
-  如果有，就会报 “this 'nyan' leaves no value, but the 'scratch' sites reaching this handler take
-  `int`”。
+handler 末尾根本没有 `nyan` 也是一回事：生成的 `scratching` 在主体之后应答 `null`，调用点同样拿到默认值。
+
+* **裸 `nyan`** 应答 `null`。它不再有任何限制——由调用点自己的转换决定它变成什么，所以这里不报错。
 * **裸 `yield`** 放弃这次调用，什么也不产生。它在语句形式的 `try` 里被接受（那种 `try` worth
   nothing），在结构本身有值的地方被拒绝——另一条路径会产生一个值，而这条路径不会。
 
-在没人读取的地方仍然可以照旧写值（`void` handler 里的 `nyan 0` 就是返回 `0` 的普通 `return`），
-所以这次放宽不会让任何已经能编译的程序失效。
+因为 handler 的应答在边界上是无类型的，`nyan` 也可以给出一个没有调用点要的类型。那不是编译错误；用不了
+它的调用点会在自己的 `checkcast` 处于运行时失败，把问题指向不匹配处而不是整个程序。
 
 #### 用 `try ... scratch` 捕获抛出的异常
 
 上面的 `try` 写法都是**声明**一个 handler。另一个可以问的问题是调用**失败**时该怎么办，写法的
-方式是在调用后面写一个已有 handler 的名字，而不是写一个块：
+方式是在调用后面写上要传的值，而不是写一个块。它进入的 handler 是本函数被传入的那一个——也就是它自己
+那些 `scratch` 点到达的同一个——所以不需要在别处声明什么：
 
 ```neko
 class Neko() {

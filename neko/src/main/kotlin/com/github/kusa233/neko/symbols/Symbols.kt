@@ -256,6 +256,18 @@ class FunctionSymbol(
     /** `true` when the declaration carried an `emit` clause, even an empty one such as `emit []`. */
     val hasEmitClause: Boolean = false,
     /**
+     * The `ScratchHandlerN` interface this function takes as a hidden last parameter.
+     *
+     * `null` when the function declares no `emit` clause. Otherwise it is the standard library's
+     * interface for the clause's arity — `ScratchHandler2` for `emit [int, int]` — and the code
+     * generator appends it to the descriptor and passes a value for it at every call.
+     *
+     * This is what makes a `scratch` a *call through a value* rather than a jump to a statically
+     * located method: the handler travels with the call, so several `try` blocks can coexist for the
+     * same `emit` signature, and one callee can be reached from all of them.
+     */
+    val handlerType: NekoType? = null,
+    /**
      * The constructor this symbol describes, or `null` when it is an ordinary function.
      *
      * A constructor is not a callable member — nothing names it — so it is modelled separately from
@@ -286,6 +298,17 @@ class FunctionSymbol(
 
     /** `true` when calling this function may reach a `try` handler through `scratch`. */
     val canRaise: Boolean get() = hasEmitClause
+
+    /**
+     * The parameters as they appear in the class file: the written ones plus the hidden handler.
+     *
+     * Kept apart from [parameterTypes] rather than added to it, because the two answer different
+     * questions and would break different things if merged. [parameterTypes] is what a *call site*
+     * writes and what overload resolution compares, so it must stay exactly as declared. This is what
+     * the JVM sees, so it is what descriptors are built from and what a call must push values for.
+     */
+    val descriptorParameterTypes: List<NekoType>
+        get() = if (handlerType == null) parameterTypes else parameterTypes + handlerType
 
     /** `true` when this symbol describes a constructor rather than a callable function. */
     val isConstructor: Boolean get() = constructor != null

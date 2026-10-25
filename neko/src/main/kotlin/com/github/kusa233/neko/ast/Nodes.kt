@@ -799,13 +799,7 @@ class ScratchExpression(
     val keywordSpan: Span,
     val values: List<Expression>,
     override val span: Span,
-) : Expression() {
-    /** Filled in by the analyzer: the `try` handler this site reaches, once one is found. */
-    var handler: ExtractorTry? = null
-
-    /** Filled in by the code generator: the generated method this site calls. */
-    var handlerMethod: String? = null
-}
+) : Expression()
 
 /**
  * `nyan value` — leaves the enclosing `try` handler, answering [value].
@@ -877,44 +871,13 @@ interface ExtractorTry : Node {
  */
 class HandlerInfo {
     /**
-     * The emit signature this handler answers, recorded by the analyzer.
+     * The emit signature this handler's body is written against, recorded by the analyzer.
      *
-     * Taken from the wrapped call's `emit [...]` clause. A `scratch` site is matched to a handler by
-     * comparing this, which is why two handlers with the same one are ambiguous.
+     * Taken from the wrapped call's `emit [...]` clause. Nothing is matched against it any more — a
+     * handler is a value a call carries — but it is what the interface's `Object`s are converted to
+     * on entry, so the body can keep using the declared types.
      */
     var signature: List<NekoType> = emptyList()
-
-    /**
-     * What the handler answers, fixed by the first `scratch` site that reaches it.
-     *
-     * A `scratch` written where a value is wanted — `v: int = scratch 1, 2` — makes the handler
-     * answer that type; one written as a statement of its own makes it answer nothing. The first
-     * site decides, and a later site that disagrees is an error, because the method can only have
-     * one return type.
-     */
-    var returnType: NekoType? = null
-
-    /**
-     * Every `scratch` site that reaches this handler, in source order.
-     *
-     * Collected during analysis and read back once [returnType] is settled, so that "the first one
-     * decides" means the first *written*, not whichever happened to be analyzed first — a handler may
-     * be reached from a function declared before the one holding the `try`.
-     */
-    val sites: MutableList<ScratchSite> = mutableListOf()
-
-    /** The generated method this handler was compiled into; filled in by the code generator. */
-    var methodName: String? = null
-
-    /**
-     * The internal name of the class this handler's method is written into.
-     *
-     * A `scratch` almost never sits in the class holding its `try` — the whole point is that it runs
-     * in another call frame — so the call site needs to know which class to `invokestatic` before that
-     * class has been reached. The analyzer knows, because it walked where the `try` was written, so it
-     * records it here and the code generator reads it rather than rediscovering it.
-     */
-    var ownerClass: String? = null
 }
 
 /**
