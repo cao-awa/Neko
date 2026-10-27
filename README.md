@@ -36,7 +36,7 @@ Tasks are module-qualified now that there is more than one module.
 ./gradlew :neko:runNeko -Pneko.program=ExceptionMapping
 
 # Tests.
-./gradlew :neko:test                     # the compiler: 552 tests
+./gradlew :neko:test                     # the compiler: 566 tests
 ./gradlew :plugin:idea:test              # the plugin: 57 tests, in a real IDE instance
 
 # The compiler as one self-contained jar.
@@ -1254,6 +1254,46 @@ the enclosing function was called on.
 A `scratch` written inside a handler body scratches the effect further out, so the handler the
 enclosing function holds is captured too. That is what lets a handler delegate: the inner site calls
 the outer handler, and the answer travels back through both.
+
+#### Naming the handler's result: `emit [int, int] -> int`
+
+An `emit` clause may say what the handler answers by writing `-> R` after the brackets:
+
+```neko
+class Neko() {
+  fun source(): int {
+    // Worth `int`, because the clause below declares that result.
+    v: int = scratch 1, 2
+    return v
+  } emit [int, int] -> int
+
+  fun invoker() {
+    // A valued `nyan` must produce the declared `int`; a `string` here is an error.
+    r: int = try source() { a, b -> nyan a + b }
+    println(r)   // 3
+  }
+}
+```
+
+Writing the result does two things. A `scratch` inside a function declaring the clause is worth `R`,
+so the site does not have to work the type out from its surroundings — and a position that wants
+something else is reported as one disagreement rather than two. And the promise is **checked**: a
+valued `nyan` in the matching `try` must produce an `R`.
+
+Leaving the value out stays legal, and that is the point of naming the result rather than requiring
+it:
+
+```neko
+r: int = try source() { a, b -> nyan }   // r is 0: `R`'s Java default
+```
+
+A bare `nyan`, or a handler body that never `nyan`s at all, answers `null`; the site reads that as
+`R`'s default. So `-> R` says what a *valued* `nyan` must produce, not that every handler must
+produce one.
+
+Without `-> R` nothing is promised and the older agreement holds — the handler answers an `Object`
+and each site converts it, which is what lets one handler serve sites wanting different types. See
+[leaving the value out](#leaving-the-value-out).
 
 #### Leaving the value out
 

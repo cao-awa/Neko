@@ -35,7 +35,7 @@ Neko 是一门用来做编译器实验的玩具 JVM 语言：它有类、接口�
 ./gradlew :neko:runNeko -Pneko.program=ExceptionMapping
 
 # 测试。
-./gradlew :neko:test                     # 编译器：552 个测试
+./gradlew :neko:test                     # 编译器：566 个测试
 ./gradlew :plugin:idea:test              # 插件：57 个测试，跑在真实 IDE 实例里
 
 # 把编译器打成单个自包含 jar。
@@ -1148,6 +1148,42 @@ class Neko() {
 
 写在 handler 体内部的 `scratch` 会把这个效应再往外传一层，所以外层函数持有的 handler 也会被捕获。
 这才让 handler 可以转交：内层调用外层 handler，答案再一路传回来。
+
+#### 给 handler 的结果命名：`emit [int, int] -> int`
+
+`emit` 子句可以在方括号之后用 `-> R` 声明 handler 应答什么：
+
+```neko
+class Neko() {
+  fun source(): int {
+    // 就是 `int`，因为下面那个子句声明了这个结果。
+    v: int = scratch 1, 2
+    return v
+  } emit [int, int] -> int
+
+  fun invoker() {
+    // 带值的 `nyan` 必须产出声明的 `int`；这里写 `string` 是错误。
+    r: int = try source() { a, b -> nyan a + b }
+    println(r)   // 3
+  }
+}
+```
+
+写出结果有两层作用。声明了该子句的函数里，`scratch` 的值就是 `R`，调用点不必再从上下文猜类型——
+而想要别的类型的位置只报**一条**冲突，不是两条。同时这个承诺会被**检查**：配对 `try` 里带值的
+`nyan` 必须产出 `R`。
+
+不带值仍然合法，这也正是「声明结果」而不是「强制结果」的意义：
+
+```neko
+r: int = try source() { a, b -> nyan }   // r 是 0，即 `R` 的 Java 默认值
+```
+
+裸 `nyan`，或者 handler 体里根本没有 `nyan`，都应答 `null`，调用点把它读成 `R` 的默认值。所以
+`-> R` 说的是**带值**的 `nyan` 必须产出什么，而不是每个 handler 都必须产出。
+
+不写 `-> R` 就没有任何承诺，按老规矩来——handler 应答 `Object`，每个调用点自己转换，这才让一个
+handler 可以同时服务想要不同类型的调用点。见[省略值](#省略值)。
 
 #### 省略值
 

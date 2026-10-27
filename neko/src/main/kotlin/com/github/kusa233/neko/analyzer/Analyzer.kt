@@ -662,6 +662,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             function.resolvedParameterTypes = parameterTypes
             function.resolvedReturnType = returnType
             function.resolvedEmitTypes = function.emitTypes.map { resolveType(it) }
+            function.resolvedEmitResultType = function.emitResultType?.let { resolveType(it) }
 
             val overloads = classSymbol.functions.getOrPut(function.name) { mutableListOf() }
             val clash = overloads.firstOrNull { it.parameterTypes == parameterTypes }
@@ -714,6 +715,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 declaration = function,
                 isStatic = function.isStatic,
                 emitTypes = function.resolvedEmitTypes,
+                emitResultType = function.resolvedEmitResultType,
                 hasEmitClause = function.hasEmitClause,
                 handlerType = if (function.hasEmitClause) {
                     scratchHandlerTypeFor(function.resolvedEmitTypes.size, function.nameSpan)
@@ -1638,12 +1640,34 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             }
         }
 
-        // What this site is worth is decided by the place it is written in, not by the handler.
-        // A `scratch` compiles to `handler.scratching(...)`, whose answer is an `Object`; where a
-        // value is wanted the site converts that `Object` to the expected type, and where nothing is
-        // wanted there is nothing to convert. That is why one handler can serve sites wanting
-        // different types: the handler is untyped at the boundary and every site does its own
-        // conversion.
+        // A clause that named a result fixes what the site is worth, so the handler's promise is what
+        // the reader sees here — `emit [int, int] -> int` makes `v: int = scratch a, b` an ordinary
+        // `int` initialisation without the site having to repeat the type.
+        function.emitResultType?.let { declared ->
+            if (expectedType != null && !isAssignable(declared, expectedType)) {
+                diagnostics.error(
+                    "this 'scratch' answers ${declared.displayName}, as its 'emit' clause declares, " +
+                        "but this position wants ${expectedType.displayName}",
+                    expression.keywordSpan,
+                    notes = listOf(
+                        diagnostics.note(
+                            "'${function.name}' declares its result here",
+                            function.span,
+                        ),
+                    ),
+                )
+                // One mistake, one diagnostic: answering `ErrorType` stops the position's own check
+                // from reporting the same disagreement a second time.
+                return ErrorType
+            }
+            return declared
+        }
+
+        // With no result named, what this site is worth is decided by the place it is written in. A
+        // `scratch` compiles to `handler.scratching(...)`, whose answer is an `Object`; where a value
+        // is wanted the site converts that `Object` to the expected type, and where nothing is wanted
+        // there is nothing to convert. That is why one handler can serve sites wanting different
+        // types: the handler is untyped at the boundary and every site does its own conversion.
         return expectedType ?: ObjectType
     }
 
@@ -1788,8 +1812,13 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * the code generator when it emits, because it numbers classes per emitted method rather than per
      * source function.
      */
-    private fun registerHandler(statement: ExtractorTry, signature: List<NekoType>) {
+    private fun registerHandler(
+        statement: ExtractorTry,
+        signature: List<NekoType>,
+        resultType: NekoType? = null,
+    ) {
         statement.handler.signature = signature
+        statement.handler.emitResultType = resultType
         handlers += statement
     }
 
@@ -1799,11 +1828,14 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * A `nyan` is the handler's ordinary `return`: the generated `scratching` method answers an
      * `Object`, so a valued `nyan` boxes its value on the way out and a bare `nyan` answers `null`.
      *
-     * Nothing constrains the type any more. It used to be fixed by the `scratch` sites that reached
-     * the handler — the first site decided, and a disagreement was an error — which is no longer
-     * meaningful: a site converts whatever comes back to the type *it* wants, and a site that wants
-     * nothing discards it. So one handler can answer `int` to one call and `string` to another,
-     * because the two calls are different `try` blocks with different handler objects.
+     * The type is constrained in exactly one case, and it is the one the callee wrote down: an
+     * `emit [...] -> R` clause promises its handler answers an `R`, so a valued `nyan` here must
+     * produce one. A bare `nyan` stays legal in that case too — it answers `null`, which the site
+     * reads as `R`'s default — because "I have nothing to say" is a real answer, not a hole.
+     *
+     * With no `-> R` the type is unconstrained, as it has been since the handler became a value: the
+     * answer is converted by whichever site asked for one, so one handler can answer `int` to one
+     * call and `string` to another.
      */
     private fun analyzeNyan(statement: NyanStatement) {
         val value = statement.value
@@ -1818,7 +1850,25 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             return
         }
 
-        value?.let { analyzeExpression(it) }
+        val promised = handler.handler.emitResultType
+        if (value == null) {
+            // A bare `nyan` answers the type's default; nothing to check against the promise.
+            return
+        }
+        if (promised == null) {
+            analyzeExpression(value)
+            return
+        }
+
+        val answered = analyzeExpression(value, promised)
+        if (!isAssignable(answered, promised)) {
+            diagnostics.error(
+                "this 'nyan' answers ${answered.displayName}, but the 'emit' clause promises " +
+                    "${promised.displayName}; write ${promised.displayName}, or a bare 'nyan' to " +
+                    "let each 'scratch' site take its default",
+                value.span,
+            )
+        }
     }
 
 
@@ -1844,7 +1894,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // matching its signature still needs somewhere to point. A handler whose own `try` is already
         // reported as broken then produces one error rather than a second, unrelated one.
         if (symbol != null) {
-            registerHandler(statement, expected)
+            registerHandler(statement, expected, symbol.emitResultType)
         }
         // The call is resolved here rather than through `analyzeExpression`, so its type has to be
         // recorded by hand: code generation reads it to know what the call returns on the path where

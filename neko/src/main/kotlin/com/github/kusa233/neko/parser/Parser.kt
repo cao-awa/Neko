@@ -1057,19 +1057,30 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             body = body,
             modifiers = modifiers,
             emitTypes = emitClause?.types.orEmpty(),
+            emitResultType = emitClause?.resultType,
             hasEmitClause = emitClause != null,
             span = Span(source, start.span.start, end),
         )
     }
 
-    /** A parsed `emit [T, U]` clause: its value types, and where the clause ends. */
-    private class EmitClause(val types: List<TypeReference>, val endOffset: Int)
+    /**
+     * A parsed `emit [T, U]` clause: its value types, the result it may name, and where it ends.
+     *
+     * [resultType] is the `-> R` half, absent when the clause declares only its values.
+     */
+    private class EmitClause(
+        val types: List<TypeReference>,
+        val resultType: TypeReference?,
+        val endOffset: Int,
+    )
 
     /**
-     * Parses an optional `emit [T, U]` clause written after a function body.
+     * Parses an optional `emit [T, U] -> R` clause written after a function body.
      *
      * The brackets are required and may be empty, so `emit []` is a clause that names no values — a
-     * function that can only signal failure. Returns `null` when no clause is present.
+     * function that can only signal failure. The `-> R` half is optional and, when written, says what
+     * the handler must answer: a `nyan` inside it has to produce an `R`, and a handler that says
+     * nothing gives the `scratch` site `R`'s default. Returns `null` when no clause is present.
      */
     private fun parseEmitClause(): EmitClause? {
         val mark = index
@@ -1081,7 +1092,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         val keyword = advance()
 
         if (!expectLeftBracket("'emit' clause")) {
-            return EmitClause(emptyList(), keyword.span.end)
+            return EmitClause(emptyList(), null, keyword.span.end)
         }
         newlineInsensitiveDepth++
 
@@ -1106,7 +1117,18 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         skipNestedNewlines()
         val close = expectRightBracket("'emit' clause")
         newlineInsensitiveDepth--
-        return EmitClause(types, close?.span?.end ?: keyword.span.end)
+        val valuesEnd = close?.span?.end ?: keyword.span.end
+
+        // `-> R`, when written, says what the handler answers. Newlines are significant again by now:
+        // the clause ended at `]`, so a `->` on the next line belongs to whatever follows instead.
+        val resultType = if (at(TokenType.ARROW)) {
+            advance()
+            parseType()
+        } else {
+            null
+        }
+
+        return EmitClause(types, resultType, resultType?.span?.end ?: valuesEnd)
     }
 
     /**

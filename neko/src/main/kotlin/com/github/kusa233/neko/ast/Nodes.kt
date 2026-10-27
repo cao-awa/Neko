@@ -366,6 +366,16 @@ class FunctionDeclaration(
      */
     val emitTypes: List<TypeReference> = emptyList(),
     /**
+     * The `R` of `emit [int, int] -> R`, or `null` when the clause names no result.
+     *
+     * The clause's values are what a `scratch` hands to the handler; this is what the handler answers
+     * back. Writing it is a promise: a `nyan` inside that handler must produce an `R`, and a handler
+     * that answers nothing (a bare `nyan`, or no `nyan` at all) gives the `scratch` site `R`'s Java
+     * default. Leaving it out keeps the older, untyped agreement, where the answer is converted to
+     * whatever the site asked for.
+     */
+    val emitResultType: TypeReference? = null,
+    /**
      * `true` when an `emit` clause was written at all.
      *
      * Distinct from `emitTypes.isNotEmpty()`, because `emit []` is a legal clause naming zero
@@ -382,6 +392,9 @@ class FunctionDeclaration(
 
     /** Filled in by the analyzer: the types named by the `emit` clause, in declaration order. */
     var resolvedEmitTypes: List<NekoType> = emptyList()
+
+    /** Filled in by the analyzer: what `emit [...] -> R` promises to answer, or `null`. */
+    var resolvedEmitResultType: NekoType? = null
 
     /** Filled in by the analyzer: the symbol code generation needs to emit a call to this function. */
     var symbol: FunctionSymbol? = null
@@ -885,6 +898,16 @@ class HandlerInfo {
      * on entry, so the body can keep using the declared types.
      */
     var signature: List<NekoType> = emptyList()
+
+    /**
+     * What the wrapped callee's `emit [...] -> R` promised the handler answers, or `null` when the
+     * clause named no result.
+     *
+     * Recorded so a `nyan` in this handler can be checked against it: the promise is the whole point
+     * of writing `-> R`, and a `nyan` that answers something else would break it at the site rather
+     * than here.
+     */
+    var emitResultType: NekoType? = null
 }
 
 /**

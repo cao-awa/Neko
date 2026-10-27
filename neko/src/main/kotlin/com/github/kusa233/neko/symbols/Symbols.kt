@@ -253,6 +253,14 @@ class FunctionSymbol(
      * `scratch` is matched on, so it is what decides which handler a site belongs to.
      */
     val emitTypes: List<NekoType> = emptyList(),
+    /**
+     * What `emit [...] -> R` promises its handlers answer, or `null` when the clause names no result.
+     *
+     * A `try` handler for this function checks every `nyan` against this type, and a `scratch` inside
+     * a function declaring the same clause is worth exactly it. `null` keeps the untyped agreement:
+     * the handler answers an `Object` and each site converts it to what it wanted.
+     */
+    val emitResultType: NekoType? = null,
     /** `true` when the declaration carried an `emit` clause, even an empty one such as `emit []`. */
     val hasEmitClause: Boolean = false,
     /**
