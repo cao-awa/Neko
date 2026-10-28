@@ -115,6 +115,78 @@ class PlatformStaticTest {
         )
     }
 
+    @Test
+    fun `a static member of a class from an imported package is reached by simple name`() {
+        // `java.lang` is searched without an import, but everything else has to be named through one —
+        // and that path went through a different branch, which only asked `java.lang`. `Objects` is not
+        // there, so `Objects.requireNonNull(...)` was reported as an unresolved *name* even though the
+        // file said `import java.util`. The class is what the reader meant, and the import is what made
+        // it reachable, so the two together have to resolve.
+        val program = TestSupport.file(
+            "import java.util",
+            "",
+            "class Uses {",
+            "    static {",
+            "        fun main() {",
+            "            println(Objects.equals(\"a\", \"a\"))",
+            "            println(Objects.toString(\"b\"))",
+            "        }",
+            "    }",
+            "}",
+        )
+
+        assertEquals(
+            emptyList(),
+            TestSupport.errors(TestSupport.compile(program)).map { it.message },
+            "an imported JDK class should resolve as a static-call receiver",
+        )
+    }
+
+    @Test
+    fun `a static field of a class from an imported package is read by simple name`() {
+        val program = TestSupport.file(
+            "import java.util",
+            "",
+            "class Uses {",
+            "    static {",
+            "        fun f(): Object {",
+            "            empty: Object = Collections.EMPTY_LIST",
+            "            return empty",
+            "        }",
+            "    }",
+            "}",
+        )
+
+        assertEquals(
+            emptyList(),
+            TestSupport.errors(TestSupport.compile(program)).map { it.message },
+            "an imported JDK class should resolve as a static-field receiver",
+        )
+    }
+
+    @Test
+    fun `an imported class is also nameable in a type position`() {
+        // The same lookup backs type positions, so the two readings of `Objects` cannot disagree:
+        // naming it in a signature has to work wherever calling its members does.
+        val program = TestSupport.file(
+            "import java.util",
+            "",
+            "class Uses {",
+            "    static {",
+            "        fun f(a: Objects) {",
+            "            println(a)",
+            "        }",
+            "    }",
+            "}",
+        )
+
+        assertEquals(
+            emptyList(),
+            TestSupport.errors(TestSupport.compile(program)).map { it.message },
+            "an imported JDK class should resolve in a type position",
+        )
+    }
+
     /** Compiles [program], runs its `main()`, and returns what it printed, one line per entry. */
     private fun run(program: String): List<String> {
         val directory = Files.createTempDirectory("neko-platform")

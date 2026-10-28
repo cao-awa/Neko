@@ -1,5 +1,6 @@
 package com.github.kusa233.nekoj
 
+import com.github.kusa233.neko.ast.ArrayTypeReference
 import com.github.kusa233.neko.ast.BlockStatement
 import com.github.kusa233.neko.ast.ClassDeclaration
 import com.github.kusa233.neko.ast.ConstructorDeclaration
@@ -7,15 +8,19 @@ import com.github.kusa233.neko.ast.ExpressionStatement
 import com.github.kusa233.neko.ast.ForEachStatement
 import com.github.kusa233.neko.ast.ForStatement
 import com.github.kusa233.neko.ast.FunctionDeclaration
+import com.github.kusa233.neko.ast.FunctionTypeReference
 import com.github.kusa233.neko.ast.IfStatement
 import com.github.kusa233.neko.ast.LambdaExpression
+import com.github.kusa233.neko.ast.NamedTypeReference
 import com.github.kusa233.neko.ast.NekoFile
+import com.github.kusa233.neko.ast.NullableTypeReference
 import com.github.kusa233.neko.ast.NyaExpression
+import com.github.kusa233.neko.ast.PurrStatement
 import com.github.kusa233.neko.ast.Statement
 import com.github.kusa233.neko.ast.TryStatement
+import com.github.kusa233.neko.ast.TypeReference
 import com.github.kusa233.neko.ast.VariableDeclarationStatement
 import com.github.kusa233.neko.ast.WhenStatement
-import com.github.kusa233.neko.ast.PurrStatement
 import com.github.kusa233.neko.ast.WhileStatement
 import com.github.kusa233.neko.source.Span
 import com.github.kusa233.neko.types.NekoType
@@ -28,7 +33,16 @@ class LocalName(
     /** `true` for a parameter — of a function, a lambda or an extractor — rather than a variable the
      * reader declared in the body. */
     val isParameter: Boolean,
+    val declaredTypeName: String? = null,
 )
+
+private fun formatTypeReference(ref: TypeReference?): String? = when (ref) {
+    null -> null
+    is NamedTypeReference -> ref.name
+    is ArrayTypeReference -> formatTypeReference(ref.element)?.let { "$it[]" }
+    is NullableTypeReference -> formatTypeReference(ref.inner)?.let { "$it?" }
+    is FunctionTypeReference -> "[${ref.parameters.mapNotNull { formatTypeReference(it) }.joinToString(", ")}] -> ${formatTypeReference(ref.returnType).orEmpty()}"
+}
 
 /**
  * The locals in scope at [offset], outermost first.
@@ -87,8 +101,15 @@ private fun collectFromFunction(
     // A parameter is in scope for the whole body, so it goes in before anything the body declares.
     // The types are absent when analysis did not run or failed, which leaves the name showing
     // without a type rather than not showing at all.
-    for ((parameter, type) in function.parameters.zip(function.resolvedParameterTypes.orEmpty())) {
-        into[parameter.name] = LocalName(parameter.name, type, isParameter = true)
+    val resolvedTypes = function.resolvedParameterTypes.orEmpty()
+    for ((index, parameter) in function.parameters.withIndex()) {
+        val type = resolvedTypes.getOrNull(index)
+        into[parameter.name] = LocalName(
+            parameter.name,
+            type,
+            isParameter = true,
+            declaredTypeName = formatTypeReference(parameter.declaredType),
+        )
     }
     function.body?.let { collectStatements(it.statements, offset, into) }
 }
@@ -101,7 +122,12 @@ private fun collectFromConstructor(
     if (!constructor.span.holds(offset)) return
 
     for (symbol in constructor.parameterSymbols) {
-        into[symbol.name] = LocalName(symbol.name, symbol.type, isParameter = true)
+        into[symbol.name] = LocalName(
+            symbol.name,
+            symbol.type,
+            isParameter = true,
+            declaredTypeName = symbol.type.displayName,
+        )
     }
     collectStatements(constructor.body.statements, offset, into)
 }
@@ -123,7 +149,12 @@ private fun collectStatements(
 
         when (statement) {
             is VariableDeclarationStatement -> {
-                into[statement.name] = LocalName(statement.name, statement.resolvedType, false)
+                into[statement.name] = LocalName(
+                    statement.name,
+                    statement.resolvedType,
+                    false,
+                    formatTypeReference(statement.declaredType),
+                )
                 // A lambda initializer introduces its own parameters for its own body.
                 val initializer = statement.initializer
                 if (initializer is LambdaExpression) collectFromLambda(initializer, offset, into)

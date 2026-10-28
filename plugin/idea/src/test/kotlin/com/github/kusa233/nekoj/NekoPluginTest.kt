@@ -1438,6 +1438,205 @@ class NekoPluginTest : BasePlatformTestCase() {
         assertTrue("no import should be offered, but got: $fixes", fixes.none { "Helper" in it })
     }
 
+    // ---------------------------------------------------------------------- method index & symbol
+
+    fun testMethodIndexFindsJavaStandardLibraryMethods() {
+        // Methods declared in java.base should be indexed by name and class
+        val toStringMethods = NekoMethodIndex.findMethodsByName("toString", project)
+        assertTrue("expected java.base toString methods", toStringMethods.isNotEmpty())
+        assertTrue("expected Arrays or Object in toString owners", toStringMethods.any { it.ownerSimpleName == "Arrays" || it.ownerSimpleName == "Object" })
+
+        val arrayMethods = NekoMethodIndex.findStaticMethodsByClass("Arrays", project)
+        assertTrue("expected static methods on Arrays", arrayMethods.isNotEmpty())
+        val names = arrayMethods.map { it.name }.toSet()
+        assertTrue("expected Arrays.toString in index", "toString" in names)
+        assertTrue("expected Arrays.sort in index", "sort" in names)
+        assertTrue("expected Arrays.binarySearch in index", "binarySearch" in names)
+
+        val mathMethods = NekoMethodIndex.findStaticMethodsByClass("Math", project)
+        val mathNames = mathMethods.map { it.name }.toSet()
+        assertTrue("expected Math.abs in index", "abs" in mathNames)
+        assertTrue("expected Math.max in index", "max" in mathNames)
+    }
+
+    fun testMethodIndexFindsNekoClassMethods() {
+        myFixture.configureByText(
+            "Service.neko",
+            """
+            locate com.example.demo
+
+            class Service {
+                static {
+                    fun serve(port: int): string {
+                        return "ok"
+                    }
+                }
+
+                fun handle() {
+                }
+            }
+            """.trimIndent(),
+        )
+
+        val serveMethods = NekoMethodIndex.findMethodsByName("serve", project)
+        assertTrue("expected 'serve' method in index", serveMethods.isNotEmpty())
+        val serve = serveMethods.first { it.ownerSimpleName == "Service" }
+        assertEquals("Service", serve.ownerSimpleName)
+        assertEquals("com.example.demo.Service", serve.ownerQualifiedName)
+        assertTrue("serve should be static", serve.isStatic)
+        assertEquals(listOf("int"), serve.parameterTypes)
+        assertEquals("string", serve.returnType)
+        assertTrue("should be Neko method", serve.isNekoMethod)
+
+        val handleMethods = NekoMethodIndex.findMethodsByName("handle", project)
+        assertTrue("expected 'handle' method in index", handleMethods.isNotEmpty())
+        val handle = handleMethods.first { it.ownerSimpleName == "Service" }
+        assertFalse("handle should be an instance method", handle.isStatic)
+
+        val serviceMethods = NekoMethodIndex.findMethodsByClass("Service", project)
+        val serviceNames = serviceMethods.map { it.name }.toSet()
+        assertTrue("serve should be in Service methods", "serve" in serviceNames)
+        assertTrue("handle should be in Service methods", "handle" in serviceNames)
+    }
+
+    fun testGotoSymbolContributorFindsNekoAndJavaMethods() {
+        myFixture.configureByText(
+            "Greeter.neko",
+            """
+            locate com.example.greet
+
+            class Greeter {
+                static {
+                    fun greet(name: string): string {
+                        return "hello"
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        val contributor = NekoGotoSymbolContributor()
+        val allNames = contributor.getNames(project, true).toSet()
+        assertTrue("expected 'greet' in symbol names", "greet" in allNames)
+        assertTrue("expected 'toString' in symbol names", "toString" in allNames)
+
+        val greetItems = contributor.getItemsByName("greet", "greet", project, true)
+        assertTrue("expected greet item in symbol search", greetItems.isNotEmpty())
+        val greetItem = greetItems.first { it.presentation?.locationString?.contains("Greeter") == true }
+        assertEquals("greet", greetItem.name)
+        val presentation = greetItem.presentation
+        assertNotNull("presentation must be present", presentation)
+        assertTrue(
+            "presentation text should have parameter info: ${presentation?.presentableText}",
+            presentation?.presentableText?.contains("greet(name: string): string") == true,
+        )
+        assertTrue(
+            "location should mention Greeter: ${presentation?.locationString}",
+            presentation?.locationString?.contains("Greeter") == true,
+        )
+        assertTrue("should be navigable", greetItem.canNavigate())
+        assertTrue("should be navigable to source", greetItem.canNavigateToSource())
+
+        val toStringItems = contributor.getItemsByName("toString", "toString", project, true)
+        assertTrue("expected toString items in symbol search", toStringItems.isNotEmpty())
+        val javaItem = toStringItems.first { it.presentation?.locationString?.contains("Java Platform") == true }
+        assertTrue(
+            "location should mention Java Platform",
+            javaItem.presentation?.locationString?.contains("Java Platform") == true,
+        )
+    }
+
+    fun testCompletionOffersStaticMethodsAfterDotOnJavaClass() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            import java.util
+
+            class Sample {
+                fun test() {
+                    Arrays.<caret>
+                }
+            }
+            """.trimIndent(),
+        )
+
+        val completions = completeAtCaret()
+        assertTrue("expected toString in Arrays completion: $completions", "toString" in completions)
+        assertTrue("expected sort in Arrays completion: $completions", "sort" in completions)
+        assertTrue("expected binarySearch in Arrays completion: $completions", "binarySearch" in completions)
+    }
+
+    fun testCompletionOffersStaticMethodsAfterDotOnNekoClass() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class MyMath {
+                static {
+                    fun add(a: int, b: int): int {
+                        return a + b
+                    }
+                }
+            }
+
+            class Sample {
+                fun test() {
+                    MyMath.<caret>
+                }
+            }
+            """.trimIndent(),
+        )
+
+        val completions = completeAtCaret()
+        assertTrue("expected add in MyMath completion: $completions", "add" in completions)
+    }
+
+    fun testCompletionOffersInstanceMethodsAfterDotOnLocalVariable() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Counter {
+                fun increment(): int {
+                    return 1
+                }
+            }
+
+            class Sample {
+                fun test() {
+                    val c: Counter = Counter()
+                    c.<caret>
+                }
+            }
+            """.trimIndent(),
+        )
+
+        val completions = completeAtCaret()
+        assertTrue("expected increment on Counter instance: $completions", "increment" in completions)
+    }
+
+    fun testImportedPackageDoesNotShowUnresolvedForPlatformClass() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            import java.util
+
+            class Sample {
+                static {
+                    fun main(args: string[]) {
+                        println(Arrays.toString(args))
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        val errors = myFixture.doHighlighting()
+            .filter { it.severity == com.intellij.lang.annotation.HighlightSeverity.ERROR }
+            .map { it.description }
+        assertTrue("expected no unresolved reference errors for Arrays, but got: $errors", errors.isEmpty())
+        val painted = paintedSpans()
+        assertFalse("Arrays should not be painted as unresolved, but painted was: $painted", "Arrays" in painted)
+    }
+
     // -------------------------------------------------------------------------------- helpers
 
     /** Every token the highlighting lexer produces for [text], as type/text pairs. */

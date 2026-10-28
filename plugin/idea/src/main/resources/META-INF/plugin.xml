@@ -41,6 +41,8 @@
         <completion.contributor language="Neko"
                                 implementationClass="com.github.kusa233.nekoj.NekoCompletionContributor"/>
 
+        <gotoSymbolContributor implementation="com.github.kusa233.nekoj.NekoGotoSymbolContributor"/>
+
         <colorSettingsPage implementation="com.github.kusa233.nekoj.NekoColorSettingsPage"/>
     </extensions>
 </idea-plugin>

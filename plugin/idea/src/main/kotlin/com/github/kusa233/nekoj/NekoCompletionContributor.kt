@@ -15,6 +15,7 @@ import com.intellij.codeInsight.completion.CompletionProvider
 import com.intellij.codeInsight.completion.CompletionResultSet
 import com.intellij.codeInsight.completion.CompletionType
 import com.intellij.codeInsight.lookup.LookupElementBuilder
+import com.intellij.icons.AllIcons
 import com.intellij.patterns.PlatformPatterns
 import com.intellij.util.ProcessingContext
 import java.nio.file.Path
@@ -54,6 +55,20 @@ private class NekoCompletionProvider : CompletionProvider<CompletionParameters>(
         context: ProcessingContext,
         result: CompletionResultSet,
     ) {
+        val file = parameters.originalFile as? NekoPsiFile ?: return
+        val model = NekoProgramModel.forProject(file.project)
+        val text = file.text
+        val offset = parameters.offset
+        val ast = file.parsedFile(model)
+
+        // If the caret sits after a receiver dot (e.g. `Arrays.` or `obj.`),
+        // offer member completions (methods and fields) indexed for that receiver.
+        val receiver = extractReceiver(text, offset)
+        if (receiver != null) {
+            addMemberCompletions(receiver, file, model, ast, offset, result)
+            return
+        }
+
         // Keywords first: a fixed, small set that sharpens quickly as the reader types.
         for (keyword in NekoTokens.keywords.keys) {
             result.addElement(LookupElementBuilder.create(keyword).withTypeText("keyword", true))
@@ -65,14 +80,8 @@ private class NekoCompletionProvider : CompletionProvider<CompletionParameters>(
             result.addElement(functionLookup(name, overloads, owner = null))
         }
 
-        // Completion runs against the file being edited; the mock file used while a completion list
-        // is being built is not ours, so the model is keyed off the real one.
-        val file = parameters.originalFile as? NekoPsiFile ?: return
-        val model = NekoProgramModel.forProject(file.project)
-
         // A type is a different vocabulary from a value, so a type position gets its own list: a
         // local variable or a method call is not something that can be written there.
-        val ast = file.parsedFile(model)
         // What the reader has typed so far, which is what decides whether the classes needing an
         // import are worth offering. The platform filters the list by it anyway; asking here too means
         // the 3373 classes of `java.base` are narrowed *before* they are added, rather than after.
@@ -105,6 +114,63 @@ private class NekoCompletionProvider : CompletionProvider<CompletionParameters>(
         }
         for (location in platformClasses(ast, prefix)) {
             result.addElement(platformClassLookup(location))
+        }
+    }
+
+    private fun addMemberCompletions(
+        receiver: ReceiverContext,
+        file: NekoPsiFile,
+        model: NekoProgramModel,
+        ast: NekoFile?,
+        offset: Int,
+        result: CompletionResultSet,
+    ) {
+        val receiverName = receiver.receiverName
+
+        // 1. Is receiver a local variable or parameter in scope?
+        val local = ast?.localsVisibleAt(offset)?.firstOrNull { it.name == receiverName }
+        if (local != null) {
+            val typeName = local.type?.displayName ?: local.declaredTypeName
+            if (typeName != null) {
+                for (method in NekoMethodIndex.findInstanceMethodsByClass(typeName, file.project)) {
+                    result.addElement(indexedMethodLookup(method))
+                }
+                val classSymbol = model.classes.values.firstOrNull {
+                    it.name == typeName || it.jvmInternalName.replace('/', '.') == typeName
+                }
+                if (classSymbol != null) {
+                    for ((name, field) in classSymbol.allFields()) {
+                        if (!field.isStatic) {
+                            result.addElement(fieldLookup(name, field, owner = classSymbol.name))
+                        }
+                    }
+                }
+            }
+            return
+        }
+
+        // 2. Is receiver a class name? Offer static methods from NekoMethodIndex
+        val staticMethods = NekoMethodIndex.findStaticMethodsByClass(receiverName, file.project)
+        if (staticMethods.isNotEmpty()) {
+            for (method in staticMethods) {
+                result.addElement(indexedMethodLookup(method))
+            }
+        } else {
+            for (method in NekoMethodIndex.findMethodsByClass(receiverName, file.project)) {
+                result.addElement(indexedMethodLookup(method))
+            }
+        }
+
+        // Offer static fields of the Neko class if known
+        val classSymbol = model.classes.values.firstOrNull {
+            it.name == receiverName || it.jvmInternalName.replace('/', '.') == receiverName
+        }
+        if (classSymbol != null) {
+            for ((name, field) in classSymbol.allFields()) {
+                if (field.isStatic) {
+                    result.addElement(fieldLookup(name, field, owner = classSymbol.name))
+                }
+            }
         }
     }
 
@@ -467,3 +533,46 @@ private fun returnTypeOf(function: FunctionSymbol): String = buildString {
  */
 private fun typeLabel(type: NekoType): String =
     if (type is ErrorType) "?" else type.displayName
+
+private data class ReceiverContext(
+    val receiverName: String,
+    val isSafeCall: Boolean,
+)
+
+private fun extractReceiver(text: String, offset: Int): ReceiverContext? {
+    val before = text.substring(0, offset.coerceIn(0, text.length))
+    val withoutPartialName = before.trimEnd().trimEnd { it.isLetterOrDigit() || it == '_' }
+    val isSafe = withoutPartialName.endsWith("?.")
+    val isDot = withoutPartialName.endsWith(".")
+    if (!isDot && !isSafe) return null
+
+    val beforeDot = withoutPartialName.dropLast(if (isSafe) 2 else 1).trimEnd()
+    val receiverName = beforeDot.takeLastWhile { it.isLetterOrDigit() || it == '_' || it == '.' }
+    if (receiverName.isEmpty() || (!receiverName.first().isLetter() && receiverName.first() != '_')) return null
+    return ReceiverContext(receiverName, isSafe)
+}
+
+private fun indexedMethodLookup(method: IndexedMethod): LookupElementBuilder {
+    val params = if (method.parameterNames.size == method.parameterTypes.size && method.parameterNames.isNotEmpty()) {
+        method.parameterNames.indices.joinToString(", ") { "${method.parameterNames[it]}: ${method.parameterTypes[it]}" }
+    } else {
+        method.parameterTypes.joinToString(", ")
+    }
+    val details = buildString {
+        append("(")
+        append(params)
+        append(")")
+        if (method.emitTypes.isNotEmpty()) {
+            append(" emit [")
+            append(method.emitTypes.joinToString(", "))
+            append("]")
+            method.emitResultType?.let { append(" -> ").append(it) }
+        }
+        append("  in ")
+        append(method.ownerSimpleName)
+    }
+    return LookupElementBuilder.create(method, method.name)
+        .withTypeText(method.returnType, true)
+        .withTailText(details, true)
+        .withIcon(AllIcons.Nodes.Method)
+}

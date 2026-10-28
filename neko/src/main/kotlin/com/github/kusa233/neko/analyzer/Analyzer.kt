@@ -3898,13 +3898,12 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             }
         }
 
-        // A JDK class named as the receiver — `System.currentTimeMillis()`, `Math.abs(x)`. The program
-        // does not declare it, so there is no symbol to check members against; the reflected class
-        // answers instead. Without this branch these calls were refused as an unresolved *name*, which
-        // is the one thing they are not: `System` is a class, and the reader meant it.
-        val platformType = className
-            ?.takeIf { it.first().isUpperCase() && isPlatformClass(it) }
-            ?.let { ClassType("java/lang/$it", it) }
+        // A JDK class named as the receiver — `System.currentTimeMillis()`, `Math.abs(x)`, or a class
+        // from an imported package like `Arrays.toString()`. The program does not declare it, so
+        // there is no symbol to check members against; the reflected class answers instead. Without
+        // this branch these calls were refused as an unresolved *name*, which is the one thing they are
+        // not: the reader named a class.
+        val platformType = platformClassType(className)
         if (platformType != null) {
             if (callee.isSafeCall) reportSafeCallOnClassName(callee.memberSpan, className!!)
             callee.receiverIsClass = true
@@ -4578,13 +4577,12 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             return staticMemberOf(namedClass, expression, namedClass.name)
         }
 
-        // A name the program does not declare, but the JVM does: `System`, `Math`, `Integer`. It has no
-        // symbol — the program never compiled the JDK — so its members cannot be checked one by one.
-        // The call form is handled by `analyzeMemberCall`; reaching here means the member was read
-        // rather than called, and the only thing that could be read this way is a static field.
-        val platformType = className
-            ?.takeIf { it.first().isUpperCase() && isPlatformClass(it) }
-            ?.let { ClassType("java/lang/$it", it) }
+        // A name the program does not declare, but the JVM does: `System`, `Math`, `Integer`, or a class
+        // from an imported package. It has no symbol — the program never compiled the JDK — so its
+        // members cannot be checked one by one. The call form is handled by `analyzeMemberCall`;
+        // reaching here means the member was read rather than called, and the only thing that could
+        // be read this way is a static field.
+        val platformType = platformClassType(className)
         if (platformType != null) {
             if (expression.isSafeCall) reportSafeCallOnClassName(expression.memberSpan, className!!)
             expression.receiverIsClass = true
@@ -5611,28 +5609,15 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         }
 
         // A class the program does not declare but the JVM provides — `RuntimeException`,
-        // `ArithmeticException` — is one a program has to be able to name in order to extend or
-        // catch it. Whether it exists is answered by the platform rather than by a list, so every
-        // `java.lang` class works, including ones added later.
+        // `ArithmeticException`, or a class from an imported package — is one a program has to be able
+        // to name in order to extend, catch or construct it. Whether it exists is answered by the
+        // platform rather than by a list, so every JDK class works, including ones added later.
         //
         // Every name in [BuiltinTypes.byName] is also a real JDK class — `Integer`, `Boolean`,
         // `Character`, `String` — and none of them is reached here: [resolveType] resolves them
         // before this point so that the two spellings are one type rather than a primitive and the
         // boxed class it happens to share a name with.
-        if (isPlatformClass(name)) return ClassType("java/lang/$name", name)
-
-        // A platform class outside `java.lang` — `HashMap`, `BufferedReader` — needs the package it
-        // lives in, and an `import` is the only way to name it: the language has no qualified type
-        // syntax, so `java.util.HashMap` cannot be written. Every imported package is therefore
-        // searched, and the first that the platform agrees has this class wins.
-        //
-        // Agreeing is what makes this safe. A package the JDK does not have cannot be checked at all,
-        // so it is kept as a candidate on the file's word — which is the rule that existed before
-        // this lookup, and it is what lets a program name a class compiled elsewhere whose package
-        // the compiler never sees. A *platform* package is checkable, though, so the class has to be
-        // in it; otherwise `import java.util` would silently turn every typo into
-        // `java/util/Strng`.
-        platformClassInImportedPackages(name)?.let { return ClassType(it, name) }
+        platformClassType(name)?.let { return it }
 
         if (!name.first().isUpperCase()) {
             diagnostics.error(
@@ -5885,12 +5870,14 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
 
     /**
-     * `java/[package]/[simpleName]` for a platform class the file's imports make reachable, or `null`.
+     * `java/[package]/[simpleName]` for a class the file's imports make reachable, or `null`.
      *
-     * Only a package the platform actually describes can be answered this way: the class has to be in
-     * it, which is what stops `import java.util` from making every typo resolve. A package the JDK
-     * does not have cannot be checked, so it is left to [importedPrefix]'s fallback, where the file's
-     * word is taken as given.
+     * A package the platform describes is answered from [PlatformLibrary], so the class has to be in
+     * it — which is what stops `import java.util` from making every typo resolve. A package outside
+     * that index — a third-party library, or a module other than `java.base` — cannot be enumerated,
+     * so the candidate is loaded by its full name instead: that is the same authority the JVM uses,
+     * and it is what lets `import org.example` reach a class that really exists while still refusing
+     * a name that does not.
      */
     private fun platformClassInImportedPackages(simpleName: String): String? {
         val owner = currentClass ?: return null
@@ -5907,9 +5894,25 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         for (prefix in importPrefixes[owner].orEmpty()) {
             // `importPrefixes` stores JVM form (`java/util/`), which is what a class file needs.
             val packageName = prefix.removeSuffix("/").replace('/', '.')
-            if (!PlatformLibrary.hasPackage(packageName)) continue
-            if (simpleName in PlatformLibrary.classesIn(packageName)) return prefix + simpleName
+            if (PlatformLibrary.hasPackage(packageName)) {
+                if (simpleName in PlatformLibrary.classesIn(packageName)) return prefix + simpleName
+            } else {
+                val candidate = "$packageName.$simpleName"
+                if (loadQualifiedClass(candidate) != null) return prefix + simpleName
+            }
         }
+        return null
+    }
+
+    /**
+     * Resolves an unqualified capitalized name as a platform class (`java.lang.*`, or a class from
+     * an imported package), or `null` when neither applies.
+     */
+    private fun platformClassType(className: String?): ClassType? {
+        if (className == null || className.isEmpty() || !className.first().isUpperCase()) return null
+        if (isPlatformClass(className)) return ClassType("java/lang/$className", className)
+        val imported = platformClassInImportedPackages(className)
+        if (imported != null) return ClassType(imported, className)
         return null
     }
 
