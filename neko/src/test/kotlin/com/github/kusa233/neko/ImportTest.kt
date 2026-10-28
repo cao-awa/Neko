@@ -156,7 +156,7 @@ class ImportTest {
             "        fun test(): int {",
             "            v: int = scratch 5",
             "            return v",
-            "        } emit [int]",
+            "        } emit [int] -> int",
             "    }",
             "}",
         )
@@ -192,7 +192,7 @@ class ImportTest {
             "        fun test(): int {",
             "            v: int = scratch 3",
             "            return v",
-            "        } emit [int]",
+            "        } emit [int] -> int",
             "    }",
             "}",
         )

@@ -712,6 +712,45 @@ class NekoPluginTest : BasePlatformTestCase() {
         assertContainsElements(completeAtCaret(), "int", "Object")
     }
 
+    fun testCompletionOffersTypesAfterAnEmitResultArrow() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun raiser() {
+                    } emit [int] -> <caret>
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // The half after the arrow is the handler's result, so it is a type position too.
+        assertContainsElements(completeAtCaret(), "int", "string")
+    }
+
+    fun testCompletionStillOffersLocalsAfterAWhenBranchArrow() {
+        myFixture.configureByText(
+            "Sample.neko",
+            """
+            class Sample {
+                static {
+                    fun main() {
+                        counter: int = 1
+                        when (counter) {
+                            1 -> <caret>
+                        }
+                    }
+                }
+            }
+            """.trimIndent(),
+        )
+
+        // A `when` branch's arrow introduces a statement, not a type, so the result-arrow rule must
+        // not turn it into a type position.
+        assertContainsElements(completeAtCaret(), "counter")
+    }
+
     fun testCompletionDoesNotTreatACallArgumentListAsATypePosition() {
         myFixture.configureByText(
             "Sample.neko",
@@ -744,7 +783,7 @@ class NekoPluginTest : BasePlatformTestCase() {
                     }
 
                     fun raiser() {
-                    } emit [int]
+                    } emit [int] -> int
                 }
             }
             """.trimIndent(),
@@ -839,7 +878,7 @@ class NekoPluginTest : BasePlatformTestCase() {
 
                     fun f(): int {
                         return scratch 1, 2
-                    } emit [int, int]
+                    } emit [int, int] -> int
                 }
             }
             """.trimIndent(),

@@ -984,6 +984,19 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private fun checkEmitDeclaration(function: FunctionDeclaration, returnType: NekoType) {
         if (!function.hasEmitClause) return
 
+        // The result is what a `nyan` promises and what every `scratch` site is worth, so a clause
+        // that leaves it out has written only half of the contract. The parser accepts the half so
+        // the function around it still parses; refusing it is this pass' job, and the message spells
+        // out the missing half rather than repeating the syntax.
+        if (function.emitResultType == null) {
+            diagnostics.error(
+                "an 'emit' clause must name the result its handler answers: write " +
+                    "'emit [...] -> R', where R is the type every valued 'nyan' must produce and " +
+                    "every 'scratch' site is worth",
+                function.emitClauseSpan ?: function.nameSpan,
+            )
+        }
+
         if (function.resolvedEmitTypes.size > MAX_EMIT_VALUES) {
             diagnostics.error(
                 "an 'emit' clause may name at most $MAX_EMIT_VALUES values but this one names " +
@@ -1663,11 +1676,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             return declared
         }
 
-        // With no result named, what this site is worth is decided by the place it is written in. A
-        // `scratch` compiles to `handler.scratching(...)`, whose answer is an `Object`; where a value
-        // is wanted the site converts that `Object` to the expected type, and where nothing is wanted
-        // there is nothing to convert. That is why one handler can serve sites wanting different
-        // types: the handler is untyped at the boundary and every site does its own conversion.
+        // Only reachable after the missing-result error has been reported for this function. The
+        // handler's answer is an `Object` at the boundary, so the site's expected type is still the
+        // least misleading thing to answer while the program is already known to be broken.
         return expectedType ?: ObjectType
     }
 
@@ -1828,14 +1839,13 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * A `nyan` is the handler's ordinary `return`: the generated `scratching` method answers an
      * `Object`, so a valued `nyan` boxes its value on the way out and a bare `nyan` answers `null`.
      *
-     * The type is constrained in exactly one case, and it is the one the callee wrote down: an
-     * `emit [...] -> R` clause promises its handler answers an `R`, so a valued `nyan` here must
-     * produce one. A bare `nyan` stays legal in that case too — it answers `null`, which the site
-     * reads as `R`'s default — because "I have nothing to say" is a real answer, not a hole.
+     * The type is constrained by the clause the callee wrote down: an `emit [...] -> R` clause
+     * promises its handler answers an `R`, so a valued `nyan` here must produce one. A bare `nyan`
+     * stays legal in that case too — it answers `null`, which the site reads as `R`'s default —
+     * because "I have nothing to say" is a real answer, not a hole.
      *
-     * With no `-> R` the type is unconstrained, as it has been since the handler became a value: the
-     * answer is converted by whichever site asked for one, so one handler can answer `int` to one
-     * call and `string` to another.
+     * A `null` promise is only reachable after the missing-result error has been reported against the
+     * callee's own declaration, so there is nothing useful left to check the value against.
      */
     private fun analyzeNyan(statement: NyanStatement) {
         val value = statement.value
@@ -2021,12 +2031,25 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      *
      * The clauses must match *exactly*, type for type. `emit [int]` forwarding into `emit [Object]`
      * would not be a pass-through — it would need a conversion, and a `try` is where that belongs.
+     * The same holds for the result: forwarding is what carries the caller's handler through
+     * unchanged, so a wrapper that names a different `R` would be promising the caller one answer
+     * and handing the callee's handler to a site expecting another. A `null` result is the
+     * already-reported missing-result shape, and matching it loosely keeps that mistake from
+     * producing a second, unrelated diagnostic.
      */
     private fun forwardsRaiseUnchanged(callee: FunctionSymbol): Boolean {
         val caller = currentFunction ?: return false
         if (!caller.canRaise) return false
         if (caller.emitTypes.size != callee.emitTypes.size) return false
         if (!caller.emitTypes.zip(callee.emitTypes).all { (mine, theirs) -> mine == theirs }) return false
+        val mine = caller.emitResultType
+        val theirs = callee.emitResultType
+        // `null` is the already-reported missing-result shape and `ErrorType` an unresolved one; in
+        // both cases the real problem has its own diagnostic, and adding "call it as a try" here
+        // would describe the same mistake twice.
+        if (mine != null && theirs != null && mine != theirs && mine != ErrorType && theirs != ErrorType) {
+            return false
+        }
         // Recorded so the body check knows this function does reach its caller's handler, even
         // though it never writes `scratch` itself.
         forwardsRaise = true

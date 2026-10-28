@@ -254,11 +254,11 @@ class FunctionSymbol(
      */
     val emitTypes: List<NekoType> = emptyList(),
     /**
-     * What `emit [...] -> R` promises its handlers answer, or `null` when the clause names no result.
+     * What `emit [...] -> R` promises its handlers answer.
      *
      * A `try` handler for this function checks every `nyan` against this type, and a `scratch` inside
-     * a function declaring the same clause is worth exactly it. `null` keeps the untyped agreement:
-     * the handler answers an `Object` and each site converts it to what it wanted.
+     * a function declaring the same clause is worth exactly it. `null` means the declaration wrote no
+     * result; analysis reports that as an error and this symbol is then only a recovery shape.
      */
     val emitResultType: NekoType? = null,
     /** `true` when the declaration carried an `emit` clause, even an empty one such as `emit []`. */

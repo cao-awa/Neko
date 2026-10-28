@@ -1045,7 +1045,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             return null
         }
 
-        // An `emit` clause follows the body: `fun f() { ... } emit [int, int]`.
+        // An `emit` clause follows the body: `fun f() { ... } emit [int, int] -> int`.
         val emitClause = parseEmitClause()
         val end = emitClause?.endOffset ?: body?.span?.end ?: returnType?.span?.end ?: nameToken.span.end
 
@@ -1059,18 +1059,22 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             emitTypes = emitClause?.types.orEmpty(),
             emitResultType = emitClause?.resultType,
             hasEmitClause = emitClause != null,
+            emitClauseSpan = emitClause?.span,
             span = Span(source, start.span.start, end),
         )
     }
 
     /**
-     * A parsed `emit [T, U]` clause: its value types, the result it may name, and where it ends.
+     * A parsed `emit [T, U] -> R` clause: its value types, the result it names, and its span.
      *
-     * [resultType] is the `-> R` half, absent when the clause declares only its values.
+     * [resultType] is the `-> R` half. The parser accepts its absence so that the analyzer can report
+     * it with a precise span and a message that names the fix, rather than failing to parse the
+     * function that carries it.
      */
     private class EmitClause(
         val types: List<TypeReference>,
         val resultType: TypeReference?,
+        val span: Span,
         val endOffset: Int,
     )
 
@@ -1078,9 +1082,11 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
      * Parses an optional `emit [T, U] -> R` clause written after a function body.
      *
      * The brackets are required and may be empty, so `emit []` is a clause that names no values — a
-     * function that can only signal failure. The `-> R` half is optional and, when written, says what
-     * the handler must answer: a `nyan` inside it has to produce an `R`, and a handler that says
-     * nothing gives the `scratch` site `R`'s default. Returns `null` when no clause is present.
+     * function that can only signal failure. The `-> R` half says what the handler must answer: a
+     * `nyan` inside it has to produce an `R`, and a handler that says nothing gives the `scratch`
+     * site `R`'s default. It is required, but the parser does not insist: a clause written without
+     * one is returned with a `null` result so the analyzer can report it as a semantic error and the
+     * rest of the function is still parsed. Returns `null` when no clause is present.
      */
     private fun parseEmitClause(): EmitClause? {
         val mark = index
@@ -1092,7 +1098,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         val keyword = advance()
 
         if (!expectLeftBracket("'emit' clause")) {
-            return EmitClause(emptyList(), null, keyword.span.end)
+            return EmitClause(emptyList(), null, keyword.span, keyword.span.end)
         }
         newlineInsensitiveDepth++
 
@@ -1128,7 +1134,12 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             null
         }
 
-        return EmitClause(types, resultType, resultType?.span?.end ?: valuesEnd)
+        return EmitClause(
+            types = types,
+            resultType = resultType,
+            span = Span(source, keyword.span.start, resultType?.span?.end ?: valuesEnd),
+            endOffset = resultType?.span?.end ?: valuesEnd,
+        )
     }
 
     /**

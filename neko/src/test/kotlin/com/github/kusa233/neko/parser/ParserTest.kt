@@ -185,7 +185,7 @@ class ParserTest {
             class Sample {
                 fun method() {
                     scratch 1, 2
-                } emit [int, string]
+                } emit [int, string] -> bool
             }
             """.trimIndent() + "\n",
             "method",
@@ -195,24 +195,55 @@ class ParserTest {
             listOf("int", "string"),
             function.emitTypes.map { (it as com.github.kusa233.neko.ast.NamedTypeReference).name },
         )
+        assertEquals(
+            "bool",
+            (function.emitResultType as com.github.kusa233.neko.ast.NamedTypeReference).name,
+            "the half after '->' is the handler's result",
+        )
+        assertTrue(
+            function.emitClauseSpan != null,
+            "the whole clause needs a span so the analyzer can report a half-written one",
+        )
+    }
+
+    @Test
+    fun `parses an emit clause without a result and leaves it for the analyzer`() {
+        // The parser accepts the half-written clause so the analyzer can refuse it at the clause,
+        // with a message that names the missing half, instead of losing the whole function.
+        val function = function(
+            """
+            class Sample {
+                fun method() {
+                    scratch 1, 2
+                } emit [int, string]
+            }
+            """.trimIndent() + "\n",
+            "method",
+        )
+        assertTrue(function.hasEmitClause, "the clause should still be recorded as present")
+        assertTrue(function.emitResultType == null, "no result was written, so none may be recorded")
     }
 
     @Test
     fun `an emit clause naming no values is still an emit clause`() {
-        // `emit []` is legal and distinct from having no clause at all: it says the function may
-        // leave early, matching a caller's `try f() { -> ... }`.
+        // `emit []` is distinct from having no clause at all: it says the function may leave early,
+        // matching a caller's `try f() { -> ... }`. The result is still required.
         val function = function(
             """
             class Sample {
                 fun method() {
                     scratch
-                } emit []
+                } emit [] -> int
             }
             """.trimIndent() + "\n",
             "method",
         )
         assertTrue(function.hasEmitClause, "'emit []' must count as a clause")
         assertTrue(function.emitTypes.isEmpty(), "the clause names no values")
+        assertEquals(
+            "int",
+            (function.emitResultType as com.github.kusa233.neko.ast.NamedTypeReference).name,
+        )
     }
 
     @Test
@@ -224,7 +255,7 @@ class ParserTest {
             class Sample {
                 fun first() {
                     scratch 1
-                } emit [int]
+                } emit [int] -> int
 
                 fun second() {
                 }
@@ -727,12 +758,21 @@ class ParserTest {
                     } emit [
                         int,
                         int,
-                    ]
+                    ] -> int
                 }
             }
             """.trimIndent() + "\n",
             "source",
         )
         assertEquals(2, declaration.emitTypes.size)
+        assertEquals(
+            "int",
+            (declaration.emitResultType as com.github.kusa233.neko.ast.NamedTypeReference).name,
+            "the result may follow the wrapping bracket",
+        )
+        assertTrue(
+            declaration.emitClauseSpan!!.text.startsWith("emit"),
+            "the clause span starts at the 'emit' keyword",
+        )
     }
 }

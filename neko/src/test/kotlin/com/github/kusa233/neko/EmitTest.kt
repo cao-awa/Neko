@@ -2,7 +2,6 @@ package com.github.kusa233.neko
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /**
@@ -66,12 +65,12 @@ class EmitTest {
         "",
         "        fun a(): int {",
         "            return b()",
-        "        } emit [int, int]",
+        "        } emit [int, int] -> int",
         "",
         "        fun b(): int {",
         "            v: int = scratch 1, 2",
         "            return v * 10",
-        "        } emit [int, int]",
+        "        } emit [int, int] -> int",
         "    }",
         "}",
         "",
@@ -164,12 +163,12 @@ class EmitTest {
                 "",
                 "        fun a(): int {",
                 "            return b()",
-                "        } emit [int, int]",
+                "        } emit [int, int] -> int",
                 "",
                 "        fun b(): int {",
                 "            v: int = scratch 4, 5",
                 "            return v * 10",
-                "        } emit [int, int]",
+                "        } emit [int, int] -> int",
                 "    }",
                 "}",
                 "",
@@ -196,7 +195,7 @@ class EmitTest {
                 "    static {",
                 "        fun fire(a: int, b: int) {",
                 "            scratch a, b",
-                "        } emit [int, int]",
+                "        } emit [int, int] -> int",
                 "",
                 "        fun run() {",
                 "            try fire(1, 2) { a, b ->",
@@ -239,17 +238,17 @@ class EmitTest {
                 "",
                 "        fun pair(): int {",
                 "            return produce()",
-                "        } emit [int, int]",
+                "        } emit [int, int] -> int",
                 "",
                 "        fun produce(): int {",
                 "            v: int = scratch 3, 4",
                 "            return v",
-                "        } emit [int, int]",
+                "        } emit [int, int] -> int",
                 "",
                 "        fun words(): int {",
                 "            w: int = scratch \"hi\"",
                 "            return w",
-                "        } emit [string]",
+                "        } emit [string] -> int",
                 "",
                 "        fun talk(): int {",
                 "            w: int = try say() { s ->",
@@ -260,7 +259,7 @@ class EmitTest {
                 "",
                 "        fun say(): int {",
                 "            return 0",
-                "        } emit [string]",
+                "        } emit [string] -> int",
                 "    }",
                 "}",
                 "",
@@ -290,7 +289,7 @@ class EmitTest {
                 "        fun lonely(): int {",
                 "            v: int = scratch 1",
                 "            return v",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "    }",
                 "}",
                 "",
@@ -322,7 +321,7 @@ class EmitTest {
                 "        fun source(): int {",
                 "            v: int = scratch 2, 3",
                 "            return v",
-                "        } emit [int, int]",
+                "        } emit [int, int] -> int",
                 "    }",
                 "}",
                 "",
@@ -342,48 +341,41 @@ class EmitTest {
     }
 
     /**
-     * Several `scratch` sites in one function all reach the same handler, each converting its answer
-     * to what its own position wanted.
+     * Several `scratch` sites in one function all reach the same handler and are all worth the
+     * declared result.
      *
-     * The old design fixed one return type per handler and refused any site that disagreed, because
-     * the handler was a method with one signature. Now the answer is an `Object` and every site
-     * converts it, so an `int` site and a `string` site can share one handler.
+     * `emit [int] -> int` fixes what every site is worth, so both sites here are `int`s and one
+     * handler answers both. A site wanting something else would be one disagreement reported at the
+     * site — see `EmitResultTypeTest` — rather than a second conversion left to the reader.
      */
     @Test
-    fun `scratch sites may take different types from one handler`() {
+    fun `scratch sites take the declared result from one handler`() {
         val program = load(
             samplePackage(
                 "class Emitter {",
                 "    static {",
                 "        fun source(): int {",
                 "            n: int = scratch 1",
-                "            s: string = scratch 2",
+                "            s: int = scratch 2",
                 "            println(n)",
                 "            println(s)",
-                "            return n",
-                "        } emit [int]",
+                "            return n + s",
+                "        } emit [int] -> int",
                 "    }",
                 "}",
                 "",
                 "class Main {",
                 "    static {",
                 "        fun main() {",
-                "            v: int = try Emitter.source() { a ->",
-                "                if (a == 1) {",
-                "                    nyan a",
-                "                } else {",
-                "                    nyan \"text\"",
-                "                }",
-                "            }",
+                "            v: int = try Emitter.source() { a -> nyan a }",
                 "            println(v)",
                 "        }",
                 "    }",
                 "}",
             ),
         )
-        // The handler answers `1` to the `int` site and `"text"` to the `string` one, and the third
-        // line is the value `source` itself returned.
-        assertEquals("1\ntext\n1\n", run(program))
+        // Both sites take the handler's answer, and the last line is the value `source` returned.
+        assertEquals("1\n2\n3\n", run(program))
     }
 
     // ------------------------------------------------------------------------------ nyan and yield
@@ -410,44 +402,42 @@ class EmitTest {
     }
 
     /**
-     * A `nyan`'s type is not constrained: the answer is an `Object`, and the site converts it.
+     * A valued `nyan` is checked against the clause even when no site reads the answer.
      *
-     * This used to be an error — "this 'nyan' answers string but the 'scratch' sites reaching this
-     * handler take int" — because the handler was a method whose return type the first site fixed.
-     * Now the handler answers an `Object` and each site casts it, so a `string` here reaches one site
-     * and a different answer reaches another. What a mismatch does now is fail at the site that
-     * cannot use it, which is where the reader can see it.
+     * The promise belongs to the handler, not to the position the answer happens to land in: here the
+     * `try` is a statement, so no variable asks for anything, and the `string` answer still contradicts
+     * `-> int`. Leaving the check to the sites would let this compile and then fail wherever the
+     * answer was later read.
      */
     @Test
-    fun `a nyan may answer a type the site did not ask for`() {
-        val program = load(
+    fun `a nyan is checked even when no site reads the answer`() {
+        val result = TestSupport.compile(
             samplePackage(
                 "class Emitter {",
                 "    static {",
                 "        fun source(): int {",
                 "            v: int = scratch 1",
                 "            return v",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "    }",
                 "}",
                 "",
                 "class Main {",
                 "    static {",
                 "        fun main() {",
-                "            v: int = try Emitter.source() { a ->",
-                "                nyan \"not an int\"",
-                "            }",
-                "            println(v)",
+                "            try Emitter.source() { a -> nyan \"not an int\" }",
                 "        }",
                 "    }",
                 "}",
             ),
+            name = "Emit.neko",
         )
-        // The compiler no longer refuses this — the answer is an `Object` and the site casts it — so
-        // the mismatch surfaces where it can be seen: the `int` site's `checkcast`, at run time.
-        assertFailsWith<ClassCastException> {
-            run(program)
-        }
+        assertTrue(
+            TestSupport.errors(result).any {
+                "this 'nyan' answers string, but the 'emit' clause promises int" in it.message
+            },
+            "expected the handler's promise to be enforced, but got: ${TestSupport.messages(result)}",
+        )
     }
 
     @Test
@@ -461,15 +451,15 @@ class EmitTest {
                 "    static {",
                 "        fun inner(): int {",
                 "            yield 42",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "",
                 "        fun middle(): int {",
                 "            return inner()",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "",
                 "        fun outer(): int {",
                 "            return middle()",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "",
                 "        fun run(): int {",
                 "            v: int = try outer() { a ->",
@@ -507,7 +497,7 @@ class EmitTest {
                 "            x: int = scratch v",
                 "            println(\"helper continues\")",
                 "            return x",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "",
                 "        fun run() {",
                 "            v: int = try helper(5) { a ->",
@@ -540,12 +530,12 @@ class EmitTest {
                 "        fun source(): int {",
                 "            v: int = scratch 1",
                 "            return v",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "",
                 "        fun consumer(): int {",
                 "            v: int = scratch 1",
                 "            return v",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "",
                 "        fun holder(): int {",
                 "            v: int = try source() { a ->",
@@ -585,7 +575,7 @@ class EmitTest {
                 "    static {",
                 "        fun test(): int {",
                 "            return 7",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "",
                 "        fun main() {",
                 "            v: int = try test() { x ->",
@@ -634,7 +624,7 @@ class EmitTest {
                 "        fun test(): int {",
                 "            v: int = scratch 1",
                 "            return v",
-                "        } emit [int, int]",
+                "        } emit [int, int] -> int",
                 "    }",
                 "}",
             ),
@@ -655,7 +645,7 @@ class EmitTest {
                 "        fun test(): int {",
                 "            v: int = scratch \"text\"",
                 "            return v",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "    }",
                 "}",
             ),
@@ -677,7 +667,7 @@ class EmitTest {
                 "    static {",
                 "        fun test() {",
                 "            scratch 1",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "",
                 "        fun call() {",
                 "            test()",
@@ -704,11 +694,11 @@ class EmitTest {
                 "        fun source(): int {",
                 "            v: int = scratch 1",
                 "            return v",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "",
                 "        fun wrapper(): int {",
                 "            return source()",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "",
                 "        fun run(): int {",
                 "            v: int = try wrapper() { a ->",
@@ -747,7 +737,7 @@ class EmitTest {
             "        fun consumer(): int {",
             "            v: int = scratch 9000000000L, 2.5",
             "            return v",
-            "        } emit [long, double]",
+            "        } emit [long, double] -> int",
             "",
             "        fun run(): int {",
             "            w: int = try consumer() { a, b ->",
@@ -798,7 +788,7 @@ class EmitTest {
                 "        fun consumer(): int {",
                 "            v: int = scratch 5",
                 "            return v",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "    }",
                 "}",
                 "",
@@ -827,7 +817,7 @@ class EmitTest {
                 "    static {",
                 "        fun inner(): int {",
                 "            yield 42",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "",
                 "        fun run(): int {",
                 "            v: int = try inner() { a ->",
@@ -863,7 +853,7 @@ class EmitTest {
                 "    static {",
                 "        fun inner(): int {",
                 "            yield 42",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "",
                 "        fun run(): int {",
                 "            v: int = try inner() { a ->",

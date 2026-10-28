@@ -233,8 +233,8 @@ IDE 会拒绝加载插件，而不是在运行时以某种更隐蔽的方式失�
   裸着列出，因为访问它需要一个接收者。
 - **类**——程序自己的类，以及 Java 平台的类。平台的类是从运行中的 JDK 读出来的，而不是硬编码
   列表，并且只给出这个文件真正能指名的那些：`java.lang`，以及该文件已导入的包。
-- **类型，在类型位置上**——`:` 之后，以及 `emit [ ... ]` 子句里面。类型位置有自己的一份列表，
-  因为变量不是类型。
+- **类型，在类型位置上**——`:` 之后、`emit [ ... ]` 子句里面，以及它的 `->` 之后。类型位置有
+  自己的一份列表，因为变量不是类型。
 - **内置类型**，每个都标出它对应的 Java 类型，这样 `Integer` 和 `int` 一眼就能看出是同一个类型，
   而不是两个。
 
@@ -994,7 +994,7 @@ class Main {
 声明了 `emit` 子句的函数，等于说自己可能把控制权交给某个 `try` 的 `{ ... }` 块。**`scratch` 进入
 那个块，并带着一个答案回来**——它是一次普通调用，不是离开。机制是一个随参数一起传下去的值：声明了
 `emit` 子句的函数会在参数列表末尾多一个隐藏的 `ScratchHandlerN` 参数，而 `scratch` 就是调用它的
-`handler.scratching(...)`。
+`handler.scratching(...)`。子句还会在 `->` 之后写明这个 handler 应答什么。
 
 ```neko
 class Neko() {
@@ -1012,12 +1012,12 @@ class Neko() {
   fun inheritEmit() {
     // 带*相同*子句的函数可以原样把这次离开传出去，所以它不需要 `try`。
     test()
-  } emit [int, int]
+  } emit [int, int] -> int
 
   fun test(): int {
     // 向上两层到达那个块，并值它给出的任何答案。
     return scratch 123, 456
-  } emit [int, int]
+  } emit [int, int] -> int
 }
 ```
 
@@ -1031,7 +1031,7 @@ class Neko() {
 class Neko() {
   fun test(): int {
     return 7          // 从不 scratch，这没问题：子句说的是调用方可以期待什么。
-  } emit [int]
+  } emit [int] -> int
 
   fun main() {
     // 调用仍然需要 `try`：万一真的走到了 handler，那才是声明它的地方。
@@ -1063,7 +1063,7 @@ class Neko() {
     } else {
       return 0
     }
-  } emit [int, int]
+  } emit [int, int] -> int
 }
 ```
 
@@ -1082,11 +1082,11 @@ class Neko() {
 
   fun outer(): int {
     return inner()
-  } emit [int, int]
+  } emit [int, int] -> int
 
   fun inner(): int {
     return scratch 1, 2
-  } emit [int, int]
+  } emit [int, int] -> int
 }
 ```
 
@@ -1105,7 +1105,7 @@ class Neko() {
 
   fun test(): int {
     return 0
-  } emit [int, int]
+  } emit [int, int] -> int
 }
 ```
 
@@ -1151,7 +1151,7 @@ class Neko() {
 
 #### 给 handler 的结果命名：`emit [int, int] -> int`
 
-`emit` 子句可以在方括号之后用 `-> R` 声明 handler 应答什么：
+`emit` 子句在方括号之后用 `-> R` 写明 handler 应答什么：
 
 ```neko
 class Neko() {
@@ -1173,7 +1173,10 @@ class Neko() {
 而想要别的类型的位置只报**一条**冲突，不是两条。同时这个承诺会被**检查**：配对 `try` 里带值的
 `nyan` 必须产出 `R`。
 
-不带值仍然合法，这也正是「声明结果」而不是「强制结果」的意义：
+结果是**必需的**，子句的两半本来就是同一个承诺的两半：每个 `scratch` 点值什么，以及带值的 `nyan`
+必须产出什么。写成 `emit [...]` 而不写 `-> R` 会报错，因为两半都没有可校验的对象。
+
+`nyan` 里的**值**仍然可以省略：
 
 ```neko
 r: int = try source() { a, b -> nyan }   // r 是 0，即 `R` 的 Java 默认值
@@ -1181,9 +1184,6 @@ r: int = try source() { a, b -> nyan }   // r 是 0，即 `R` 的 Java 默认值
 
 裸 `nyan`，或者 handler 体里根本没有 `nyan`，都应答 `null`，调用点把它读成 `R` 的默认值。所以
 `-> R` 说的是**带值**的 `nyan` 必须产出什么，而不是每个 handler 都必须产出。
-
-不写 `-> R` 就没有任何承诺，按老规矩来——handler 应答 `Object`，每个调用点自己转换，这才让一个
-handler 可以同时服务想要不同类型的调用点。见[省略值](#省略值)。
 
 #### 省略值
 
@@ -1198,7 +1198,7 @@ class Neko() {
   fun guard(): int {
     v: int = scratch 5
     return v
-  } emit [int]
+  } emit [int] -> int
 
   fun invoker() {
     // handler 应答 null，而 `int` 点读到的是 0。
@@ -1212,12 +1212,13 @@ class Neko() {
 
 handler 末尾根本没有 `nyan` 也是一回事：生成的 `scratching` 在主体之后应答 `null`，调用点同样拿到默认值。
 
-* **裸 `nyan`** 应答 `null`。它不再有任何限制——由调用点自己的转换决定它变成什么，所以这里不报错。
+* **裸 `nyan`** 应答 `null`，调用点把它读成 `R` 的默认值。无论 `R` 是什么都允许——只有**带值**的
+  `nyan` 才必须与子句一致。
 * **裸 `yield`** 放弃这次调用，什么也不产生。它在语句形式的 `try` 里被接受（那种 `try` worth
   nothing），在结构本身有值的地方被拒绝——另一条路径会产生一个值，而这条路径不会。
 
-因为 handler 的应答在边界上是无类型的，`nyan` 也可以给出一个没有调用点要的类型。那不是编译错误；用不了
-它的调用点会在自己的 `checkcast` 处于运行时失败，把问题指向不匹配处而不是整个程序。
+带值的 `nyan` 如果产出与声明的 `R` 不同的类型，会在该 `nyan` 处报编译错误——这才让子句真正可校验，
+而不只是装饰。
 
 #### 用 `try ... scratch` 捕获抛出的异常
 
@@ -1235,7 +1236,7 @@ class Neko() {
     // `risky(0)` 抛异常，所以由 handler 应答；调用自己的返回值不会被用到。
     v: int = try risky(0) scratch 1, 2
     return v
-  } emit [int, int]
+  } emit [int, int] -> int
 
   fun invoker() {
     // 抛出异常，于是进入 handler，它应答 `1 + 2`。
@@ -1257,7 +1258,7 @@ class Neko() {
     // `risky(2)` 返回 50，所以这个结构的值就是调用自己的值——`50`。
     v: int = try risky(2) scratch 9
     return v
-  } emit [int]
+  } emit [int] -> int
 
   fun invoker() {
     answer: int = try guarded() { a -> nyan a * 2 }
@@ -1294,14 +1295,14 @@ class Neko() {
 class Neko() {
   fun inner(): int {
     return scratch 21
-  } emit [int]
+  } emit [int] -> int
 
   fun outer(): int {
     // `inner` 抛出的 `yield` 穿过这个形式到达 `invoker` 的 handler，所以结果由 `nyan a + 1` 应答，
     // 而不是这里写的 `scratch 99`。
     w: int = try inner() scratch 99
     return w
-  } emit [int]
+  } emit [int] -> int
 
   fun invoker() {
     answer: int = try outer() { a -> nyan a + 1 }

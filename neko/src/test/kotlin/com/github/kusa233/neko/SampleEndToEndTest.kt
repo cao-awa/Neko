@@ -506,7 +506,7 @@ class SampleEndToEndTest {
             "            yield 1",
             "            println(\"unreachable\")",
             "            return 2",
-            "        } emit [int]",
+            "        } emit [int] -> int",
             "    }",
             "}",
         )

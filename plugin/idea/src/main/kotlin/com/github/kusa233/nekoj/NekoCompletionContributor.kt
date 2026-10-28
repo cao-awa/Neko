@@ -185,21 +185,39 @@ private class NekoCompletionProvider : CompletionProvider<CompletionParameters>(
  *
  *  * after a `:` — a local's or a field's type, a parameter's, a return type, and a supertype after
  *    `class X:`;
- *  * inside an `emit` clause's brackets, as in `} emit [int, <caret>]`.
+ *  * inside an `emit` clause's brackets, as in `} emit [int, <caret>]`;
+ *  * after an `emit` clause's `->`, as in `} emit [int] -> <caret>`.
  *
  * The name being typed is dropped first, since `x: in<caret>` is as much a type position as
  * `x: <caret>`; then the space after the punctuation that introduced it.
  *
- * A `->` is deliberately *not* treated as introducing a type, although a function type's return is
- * written after one. A `when` branch is written after one too and its body is a statement, so the
- * two cannot be told apart from the text alone — and offering types where a statement goes would be
- * worse than not offering them for a function type.
+ * A `->` on its own is deliberately *not* treated as introducing a type, although a function type's
+ * return is written after one. A `when` branch is written after one too and its body is a statement,
+ * so the two cannot be told apart from the text alone — and offering types where a statement goes
+ * would be worse than not offering them for a function type. The one arrow that does introduce a
+ * type is the `emit` clause's result, and that is recognisable because the closed bracket sits right
+ * before it.
  */
 private fun isTypePosition(text: String, offset: Int): Boolean {
     val before = text.substring(0, offset.coerceIn(0, text.length))
     val withoutPartialName = before.trimEnd().trimEnd { it.isLetterOrDigit() || it == '_' }
     val context = withoutPartialName.trimEnd()
-    return context.endsWith(":") || insideEmitClause(context)
+    return context.endsWith(":") || insideEmitClause(context) || insideEmitResult(context)
+}
+
+/** An `emit` clause whose `]` is the last thing before an arrow. */
+private val emitClauseBeforeArrow = Regex("emit\\s*\\[[^\\]]*\\]\\s*$")
+
+/**
+ * Whether the caret is in the result half of an `emit` clause, given the text up to it.
+ *
+ * The result is a type, unlike the statement a `when` branch's arrow introduces, so it is worth its
+ * own case. It is recognised by shape rather than by position: the text before the arrow has to end
+ * with a complete `emit [...]` clause, which no `when` subject does.
+ */
+private fun insideEmitResult(context: String): Boolean {
+    if (!context.endsWith("->")) return false
+    return emitClauseBeforeArrow.containsMatchIn(context.dropLast(2))
 }
 
 /**
@@ -437,6 +455,7 @@ private fun returnTypeOf(function: FunctionSymbol): String = buildString {
     if (function.hasEmitClause) {
         append(" emit ")
         append(function.emitTypes.joinToString(", ", "[", "]") { typeLabel(it) })
+        function.emitResultType?.let { append(" -> ").append(typeLabel(it)) }
     }
 }
 

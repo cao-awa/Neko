@@ -769,7 +769,7 @@ class PrimitiveTypeTest {
                 "    static {",
                 "        fun give() {",
                 "            scratch 4000000000L, 7, 'q', 2.5",
-                "        } emit [long, int, char, double]",
+                "        } emit [long, int, char, double] -> int",
                 "",
                 "        fun main() {",
                 "            try give() { w, i, c, d ->",

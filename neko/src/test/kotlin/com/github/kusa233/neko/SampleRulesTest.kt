@@ -338,7 +338,7 @@ class SampleRulesTest {
             "static {",
             "    fun sends() {",
             "        raise 1, 2",
-            "    } emit [int, int]",
+            "    } emit [int, int] -> int",
             "}",
         )
         val result = TestSupport.compile(source)
@@ -368,7 +368,7 @@ class SampleRulesTest {
                 "    static {",
                 "        fun value() {",
                 "            yield 1",
-                "        } emit [int]",
+                "        } emit [int] -> int",
                 "    }",
                 "}",
             ),

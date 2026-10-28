@@ -1,0 +1,5 @@
+locate com.github.kusa233.neko.sample.data
+
+meow class Data(val v: int) {
+
+}

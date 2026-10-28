@@ -12,6 +12,6 @@ class ScratchHandler {
     static {
         fun scratching() {
             scratch 1, 2
-        } emit [int, int]
+        } emit [int, int] -> int
     }
 }

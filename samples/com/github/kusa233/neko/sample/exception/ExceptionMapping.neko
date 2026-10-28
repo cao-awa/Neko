@@ -12,7 +12,7 @@ class ExceptionMapping {
             v: int = try err() scratch false
             println("Continues")
             println(v)
-        } emit [bool]
+        } emit [bool] -> int
 
         fun err(): int {
             return 1 / 0

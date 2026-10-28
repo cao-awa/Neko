@@ -266,8 +266,8 @@ when it exists:
 - **Classes** —the program's own, and the Java platform's. The platform's are read from the running
   JDK rather than listed, and only the ones this file can actually name are offered: `java.lang`,
   and the file's imported packages.
-- **Types, in a type position** —after a `:`, and inside an `emit [ ... ]` clause. A type position
-  gets its own list, since a variable is not a type.
+- **Types, in a type position** —after a `:`, inside an `emit [ ... ]` clause, and after its `->`. A
+  type position gets its own list, since a variable is not a type.
 - **The built-ins**, each shown with the Java type it is, so `Integer` and `int` are visibly the same
   type rather than two.
 
@@ -1093,7 +1093,7 @@ A function that declares an `emit` clause says it may hand control to a `try`'s 
 **`scratch` enters that block and comes back with an answer** —it is an ordinary call, not a
 departure. The mechanism is a value passed alongside the arguments: a function with an `emit` clause
 takes a hidden `ScratchHandlerN` as its last parameter, and `scratch` calls
-`handler.scratching(...)` on it.
+`handler.scratching(...)` on it. The clause also names, after `->`, what that handler answers.
 
 ```neko
 class Neko() {
@@ -1111,12 +1111,12 @@ class Neko() {
   fun inheritEmit() {
     // A function with the *same* clause may pass the departure on unchanged, so it needs no `try`.
     test()
-  } emit [int, int]
+  } emit [int, int] -> int
 
   fun test(): int {
     // Reaches the block two frames up and is worth whatever it answers.
     return scratch 123, 456
-  } emit [int, int]
+  } emit [int, int] -> int
 }
 ```
 
@@ -1131,7 +1131,7 @@ body that never does always answers normally:
 class Neko() {
   fun test(): int {
     return 7          // Never scratches, which is fine: the clause is about what callers may expect.
-  } emit [int]
+  } emit [int] -> int
 
   fun main() {
     // The call still needs a `try`: that is where a handler would be declared if one were reached.
@@ -1164,7 +1164,7 @@ class Neko() {
     } else {
       return 0
     }
-  } emit [int, int]
+  } emit [int, int] -> int
 }
 ```
 
@@ -1185,11 +1185,11 @@ class Neko() {
 
   fun outer(): int {
     return inner()
-  } emit [int, int]
+  } emit [int, int] -> int
 
   fun inner(): int {
     return scratch 1, 2
-  } emit [int, int]
+  } emit [int, int] -> int
 }
 ```
 
@@ -1208,7 +1208,7 @@ class Neko() {
 
   fun test(): int {
     return 0
-  } emit [int, int]
+  } emit [int, int] -> int
 }
 ```
 
@@ -1257,7 +1257,7 @@ the outer handler, and the answer travels back through both.
 
 #### Naming the handler's result: `emit [int, int] -> int`
 
-An `emit` clause may say what the handler answers by writing `-> R` after the brackets:
+An `emit` clause names what the handler answers by writing `-> R` after the brackets:
 
 ```neko
 class Neko() {
@@ -1275,13 +1275,14 @@ class Neko() {
 }
 ```
 
-Writing the result does two things. A `scratch` inside a function declaring the clause is worth `R`,
-so the site does not have to work the type out from its surroundings — and a position that wants
-something else is reported as one disagreement rather than two. And the promise is **checked**: a
-valued `nyan` in the matching `try` must produce an `R`.
+The result is **required**, and the two halves of the clause are the two halves of one promise. A
+`scratch` inside a function declaring the clause is worth `R`, so the site does not have to work the
+type out from its surroundings — and a position that wants something else is reported as one
+disagreement rather than two. A valued `nyan` in the matching `try` must produce an `R`. Writing
+`emit [...]` without `-> R` is an error, because there would be nothing to check either half
+against.
 
-Leaving the value out stays legal, and that is the point of naming the result rather than requiring
-it:
+Leaving the *value* out of a `nyan` stays legal:
 
 ```neko
 r: int = try source() { a, b -> nyan }   // r is 0: `R`'s Java default
@@ -1290,10 +1291,6 @@ r: int = try source() { a, b -> nyan }   // r is 0: `R`'s Java default
 A bare `nyan`, or a handler body that never `nyan`s at all, answers `null`; the site reads that as
 `R`'s default. So `-> R` says what a *valued* `nyan` must produce, not that every handler must
 produce one.
-
-Without `-> R` nothing is promised and the older agreement holds — the handler answers an `Object`
-and each site converts it, which is what lets one handler serve sites wanting different types. See
-[leaving the value out](#leaving-the-value-out).
 
 #### Leaving the value out
 
@@ -1308,7 +1305,7 @@ class Neko() {
   fun guard(): int {
     v: int = scratch 5
     return v
-  } emit [int]
+  } emit [int] -> int
 
   fun invoker() {
     // The handler answers null, and the `int` site reads 0.
@@ -1323,15 +1320,14 @@ class Neko() {
 A handler that ends without `nyan` at all is the same thing: the generated `scratching` answers
 `null` after the body, so the site sees the default too.
 
-* **A bare `nyan`** answers `null`. There is no longer a rule against it — the site's own conversion
-  is what decides what that becomes, so nothing is refused here.
+* **A bare `nyan`** answers `null`, which the site reads as `R`'s default. It is allowed whatever
+  `R` is; only a *valued* `nyan` has to match the clause.
 * **A bare `yield`** abandons the call without producing anything. It is accepted in a `try`
   statement, which is worth nothing, and refused where the construct is worth a value — the other path
   would produce one and this path would not.
 
-Because the handler's answer is untyped at the boundary, a `nyan` may also produce a type no site
-asked for. That is not a compile error; the site that cannot use it fails on its own `checkcast` at
-run time, which points at the mismatch instead of the whole program.
+A valued `nyan` that produces something other than the declared `R` is a compile error at the
+`nyan`, which is what makes the clause checkable rather than decorative.
 
 #### Catching a thrown exception with `try ... scratch`
 
@@ -1350,7 +1346,7 @@ class Neko() {
     // `risky(0)` throws, so the handler answers; the call's own return value is not used.
     v: int = try risky(0) scratch 1, 2
     return v
-  } emit [int, int]
+  } emit [int, int] -> int
 
   fun invoker() {
     // A thrown exception enters the handler, which answers `1 + 2`.
@@ -1372,7 +1368,7 @@ class Neko() {
     // `risky(2)` returns 50, so the construct is worth the call's value — `50`.
     v: int = try risky(2) scratch 9
     return v
-  } emit [int]
+  } emit [int] -> int
 
   fun invoker() {
     answer: int = try guarded() { a -> nyan a * 2 }
@@ -1413,14 +1409,14 @@ untouched, so wrapping a call in this form never diverts an effect travelling to
 class Neko() {
   fun inner(): int {
     return scratch 21
-  } emit [int]
+  } emit [int] -> int
 
   fun outer(): int {
     // The `yield` `inner` throws passes through this form and reaches `invoker`'s handler, so this
     // is answered by `nyan a + 1` and not by the `scratch 99` written here.
     w: int = try inner() scratch 99
     return w
-  } emit [int]
+  } emit [int] -> int
 
   fun invoker() {
     answer: int = try outer() { a -> nyan a + 1 }

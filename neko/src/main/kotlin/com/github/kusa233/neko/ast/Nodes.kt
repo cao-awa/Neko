@@ -354,8 +354,8 @@ class FunctionDeclaration(
     val body: BlockStatement?,
     val modifiers: List<Modifier>,
     /**
-     * The result types named by a trailing `emit [int, int]` clause, always empty when the clause is
-     * absent.
+     * The value types named by a trailing `emit [int, int] -> int` clause, always empty when the
+     * clause is absent.
      *
      * A function with an `emit` clause gains a second way out: a `scratch a, b` statement inside it
      * passes those values to the handler the caller's `try` declared, and carries on with whatever
@@ -366,22 +366,28 @@ class FunctionDeclaration(
      */
     val emitTypes: List<TypeReference> = emptyList(),
     /**
-     * The `R` of `emit [int, int] -> R`, or `null` when the clause names no result.
+     * The `R` of `emit [int, int] -> R`.
      *
      * The clause's values are what a `scratch` hands to the handler; this is what the handler answers
-     * back. Writing it is a promise: a `nyan` inside that handler must produce an `R`, and a handler
-     * that answers nothing (a bare `nyan`, or no `nyan` at all) gives the `scratch` site `R`'s Java
-     * default. Leaving it out keeps the older, untyped agreement, where the answer is converted to
-     * whatever the site asked for.
+     * back. It is **required**: a clause without `-> R` is reported by the analyzer, because a
+     * handler's answer is part of the clause's contract rather than something each `scratch` site
+     * guesses. A `nyan` inside that handler must produce an `R`, and a handler that answers nothing
+     * (a bare `nyan`, or no `nyan` at all) gives the `scratch` site `R`'s Java default.
+     *
+     * `null` only before the parser has seen the clause, or after a parse error; analysis reports it
+     * as missing for any clause that is really written without one.
      */
     val emitResultType: TypeReference? = null,
     /**
      * `true` when an `emit` clause was written at all.
      *
      * Distinct from `emitTypes.isNotEmpty()`, because `emit []` is a legal clause naming zero
-     * values: a `scratch` with nothing to carry, matched by the caller's `try f() { -> ... }`.
+     * values: a `scratch` with nothing to carry, matched by the caller's `try f() { -> ... }`. Such
+     * a clause still has to name its result: `emit [] -> int`.
      */
     val hasEmitClause: Boolean = false,
+    /** Span of the whole `emit [...] -> R` clause, or `null` when none was written. */
+    val emitClauseSpan: Span? = null,
     override val span: Span,
 ) : Node {
     /** Filled in by the analyzer: resolved parameter types, in declaration order. */
@@ -809,11 +815,11 @@ enum class PurrMode {
  *
  * This is an *expression*, not a statement: the handler is generated as an ordinary method, so a
  * `scratch` is a call. `v: int = scratch 1, 2` keeps the value it answers, and a bare `scratch 1, 2`
- * discards one — which is what decides whether the generated handler is declared to return a value or
- * `void`.
+ * discards one. The value is the `R` the enclosing function's clause declared, so a site does not
+ * have to work the type out from its position.
  *
- * Only valid inside a function that declares an `emit [...]` clause, and the number and types of the
- * values must match that clause.
+ * Only valid inside a function that declares an `emit [...] -> R` clause, and the number and types of
+ * the values must match that clause.
  */
 class ScratchExpression(
     val keywordSpan: Span,
@@ -824,10 +830,10 @@ class ScratchExpression(
 /**
  * `nyan value` — leaves the enclosing `try` handler, answering [value].
  *
- * A handler is generated as a method whose return type the reaching `scratch` sites fix, so a `nyan`
- * is a `return` from that method. [value] is **optional**: a bare `nyan` answers nothing, which is
- * exactly right for a handler whose `scratch` sites all discard the answer — the method is `void` and
- * a bare `nyan` is its plain `return`.
+ * A handler is generated as a method that answers an `Object` at the interface boundary, so a `nyan`
+ * is a `return` from that method. [value] is **optional**: a bare `nyan` answers `null`, which a
+ * `scratch` site reads as the Java default of the `R` its `emit` clause declared. A valued `nyan`
+ * must produce that `R`, and the analyzer says so at the value when it does not.
  *
  * A handler that writes no `nyan` at all had better `yield` on every path: `yield` throws, so it never
  * falls off the end.
@@ -900,12 +906,11 @@ class HandlerInfo {
     var signature: List<NekoType> = emptyList()
 
     /**
-     * What the wrapped callee's `emit [...] -> R` promised the handler answers, or `null` when the
-     * clause named no result.
+     * What the wrapped callee's `emit [...] -> R` promised the handler answers.
      *
      * Recorded so a `nyan` in this handler can be checked against it: the promise is the whole point
      * of writing `-> R`, and a `nyan` that answers something else would break it at the site rather
-     * than here.
+     * than here. `null` only when the callee's declaration was itself reported as missing its result.
      */
     var emitResultType: NekoType? = null
 }

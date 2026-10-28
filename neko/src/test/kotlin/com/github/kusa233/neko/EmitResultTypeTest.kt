@@ -15,9 +15,8 @@ import kotlin.test.assertTrue
  *  * a `nyan` in the matching `try` must produce an `R`. A *bare* `nyan` — or no `nyan` at all — stays
  *    legal and answers `null`, which the site reads as `R`'s Java default.
  *
- * Without `-> R` the older, untyped agreement holds: the handler answers an `Object` and each site
- * converts it to whatever it asked for. That is what makes one handler able to serve an `int` site
- * and a `string` site at once, and the last test here pins that it still can.
+ * The `-> R` half is not optional: leaving it out is refused, because it is the half that says what a
+ * `scratch` site is worth and what a valued `nyan` promises. One test here pins that refusal.
  */
 class EmitResultTypeTest {
 
@@ -240,44 +239,91 @@ class EmitResultTypeTest {
     }
 
     /**
-     * Without `-> R` nothing is promised, and one handler may still answer different types.
+     * A clause that leaves the result out is refused, and the message says what to write.
      *
-     * This is the shape the language had before the typed clause, and adding one must not take it
-     * away: the sites decide, and each converts the `Object` answer itself.
+     * The result is half of the clause's contract — what every `scratch` site is worth and what a
+     * valued `nyan` promises — so a clause without one is not the older "answer anything" agreement,
+     * it is a clause the language cannot check. The parser still accepts the half-written clause so
+     * this can be reported at the clause rather than as a parse failure.
      */
     @Test
-    fun `an untyped clause still lets one handler answer different types`() {
-        val loaded = TestSupport.load(
+    fun `an emit clause without a result is refused`() {
+        val source = program(
+            "class Emitter {",
+            "    static {",
+            "        fun source(): int {",
+            "            v: int = scratch 1",
+            "            return v",
+            "        } emit [int]",
+            "    }",
+            "}",
+        )
+        val reported = TestSupport.errors(TestSupport.compile(source, name = "Emit.neko"))
+        assertTrue(
+            reported.any {
+                "must name the result its handler answers" in it.message &&
+                    "emit [...] -> R" in it.message
+            },
+            "expected the missing result to be named, but got:\n" +
+                reported.joinToString("\n") { it.message },
+        )
+        // The diagnostic belongs on the half-written clause, which is where the fix goes.
+        assertEquals(
+            "emit [int]",
+            reported.single().span?.text,
+            "the error should point at the clause rather than at the function",
+        )
+    }
+
+    @Test
+    fun `a clause naming no values still has to name its result`() {
+        val source = program(
+            "class Emitter {",
+            "    static {",
+            "        fun ping(): int {",
+            "            v: int = scratch",
+            "            return v",
+            "        } emit []",
+            "    }",
+            "}",
+        )
+        val reported = TestSupport.errors(TestSupport.compile(source, name = "Emit.neko"))
+        assertTrue(
+            reported.any { "must name the result its handler answers" in it.message },
+            "an empty clause has a result too, but got:\n" +
+                reported.joinToString("\n") { it.message },
+        )
+    }
+
+    /**
+     * A wrapper may not forward a clause whose result differs from the one it declares.
+     *
+     * Forwarding passes the caller's handler straight into the callee, so a difference in `R` would
+     * promise the caller one answer and hand its handler to sites expecting another. Matching the
+     * value types is not enough: the result is part of the same contract.
+     */
+    @Test
+    fun `a wrapper may not forward a clause with a different result`() {
+        val messages = errorsOf(
             program(
                 "class Emitter {",
                 "    static {",
                 "        fun source(): int {",
-                "            n: int = scratch 1",
-                "            s: string = scratch 2",
-                "            println(n)",
-                "            println(s)",
-                "            return n",
-                "        } emit [int]",
-                "    }",
-                "}",
+                "            v: int = scratch 1",
+                "            return v",
+                "        } emit [int] -> int",
                 "",
-                "class Main {",
-                "    static {",
-                "        fun main() {",
-                "            v: int = try Emitter.source() { a ->",
-                "                if (a == 1) {",
-                "                    nyan a",
-                "                } else {",
-                "                    nyan \"text\"",
-                "                }",
-                "            }",
-                "            println(v)",
-                "        }",
+                "        fun wrapper(): int {",
+                "            return source()",
+                "        } emit [int] -> string",
                 "    }",
                 "}",
             ),
         )
-        assertEquals("1\ntext\n1\n", run(loaded))
+        assertTrue(
+            messages.any { "'source' declares an 'emit' clause" in it && "call it as" in it },
+            "expected the forwarding to be refused, but got:\n${messages.joinToString("\n")}",
+        )
     }
 
     /** The clause may still be wrapped across lines with a result written after the `]`. */

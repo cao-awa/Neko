@@ -210,7 +210,7 @@ class PackageVisibilityTest {
                 append("        fun guard(): int {\n")
                 append("            v: int = try risky() scratch 5\n")
                 append("            return v\n")
-                append("        } emit [int]\n")
+                append("        } emit [int] -> int\n")
                 append("        fun main() {\n")
                 append("            r: int = try guard() { x -> nyan x }\n")
                 append("            println(r)\n")
