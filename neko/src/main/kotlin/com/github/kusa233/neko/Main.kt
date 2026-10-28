@@ -16,16 +16,19 @@ import kotlin.io.path.isRegularFile
  * Command-line entry point of the Neko compiler.
  *
  * ```
- * neko <file-or-directory>... [--output <directory>]
+ * neko <file-or-directory>... [--output <directory>] [--run <class>]
  * ```
  *
  * Each argument may be a `.neko` file or a directory of them; a directory contributes every `.neko`
  * file directly inside it. Several may be given because an Neko program is compiled as a whole —
  * a program and the standard library it names have to see each other's declarations.
  *
- * On success the compiled class files are written and `0` is returned; when the program fails to
- * compile every diagnostic is printed and the exit status is `1`, so the compiler composes with
- * ordinary build tooling. `2` is reserved for an internal compiler error, which must never be
+ * On success the compiled class files are written (when an output directory was given) and `0` is
+ * returned; when the program fails to compile every diagnostic is printed and the exit status is `1`,
+ * so the compiler composes with ordinary build tooling. With `--run`, compilation is followed by
+ * running the named class' `main` instead of printing the compilation summary — the classes are
+ * defined from the compilation's own bytes, so no output directory is required and no older copy on
+ * disk can answer instead. `2` is reserved for an internal compiler error, which must never be
  * mistaken for a problem with the program being compiled.
  */
 fun main(args: Array<String>) {
@@ -123,6 +126,16 @@ fun main(args: Array<String>) {
     }
 
     val output = result.outputDirectory
+
+    // `--run` makes the program's own output the point of the invocation, so the compilation summary
+    // would only be a line between the reader and what they asked to see. Diagnostics above are still
+    // printed: a warning is part of the answer, even when the program runs.
+    options.runClass?.let { className ->
+        val status = runCompiled(result, className)
+        if (status != 0) kotlin.system.exitProcess(status)
+        return
+    }
+
     if (output == null) {
         println("neko: compiled $summary (no output directory requested)")
         return
@@ -135,6 +148,63 @@ fun main(args: Array<String>) {
     if (warningCount > 0) {
         println("neko: $warningCount warning${if (warningCount == 1) "" else "s"}")
     }
+}
+
+/**
+ * Runs [className]'s `main` and answers the process status, `0` when it returned normally.
+ *
+ * The program was compiled successfully by the time this is called, so every remaining problem is a
+ * problem with running it: the name may not have been compiled, the class may lack the JVM entry
+ * point, or `main` may have thrown. They all exit `1`, like `java` does for an uncaught exception.
+ */
+private fun runCompiled(result: CompilationResult, className: String): Int =
+    when (val outcome = ProgramRunner.run(result.classes, className)) {
+        ProgramRunner.Outcome.Returned -> 0
+
+        is ProgramRunner.Outcome.MissingClass -> {
+            System.err.println(
+                "neko: no class named '$className' was compiled; the name is fully qualified " +
+                    "and written in dot form, such as neko.sample.TestClass",
+            )
+            1
+        }
+
+        is ProgramRunner.Outcome.MissingMain -> {
+            System.err.println(
+                "neko: class '$className' has no 'static main(String[])' to run",
+            )
+            1
+        }
+
+        is ProgramRunner.Outcome.Failed -> {
+            System.err.println("neko: '$className' failed while running")
+            outcome.cause.printProgramStackTrace()
+            1
+        }
+    }
+
+/**
+ * Prints [this] the way an uncaught exception is printed, without the reflection frames the runner
+ * used to reach `main`.
+ *
+ * Those frames belong to the `--run` plumbing rather than to the program, and a reader debugging
+ * their own code should see the frames that start at `main`. Trimming is presentation only: the
+ * [Throwable] itself is unchanged, and its message and the program's own frames stay in order.
+ */
+private fun Throwable.printProgramStackTrace() {
+    val runnerFrames = stackTrace.filterNot { frame ->
+        frame.className == "com.github.kusa233.neko.ProgramRunner" ||
+            frame.className == "com.github.kusa233.neko.MainKt" ||
+            frame.className.startsWith("java.lang.reflect.") ||
+            frame.className.startsWith("jdk.internal.reflect.") ||
+            frame.className.startsWith("sun.reflect.")
+    }
+    if (runnerFrames.isEmpty()) {
+        printStackTrace()
+        return
+    }
+    stackTrace = runnerFrames.toTypedArray()
+    printStackTrace()
 }
 
 /** Reads one `.neko` file into a [SourceFile]. */
@@ -164,7 +234,13 @@ Arguments:
 Options:
   --output <directory>   Where to write the compiled class files. A relative path is
                          resolved against the current directory, so the classes can be
-                         kept inside the project. Defaults to the current directory.
+                         kept inside the project. When omitted, no class files are
+                         written; the compilation only lives long enough to report its
+                         diagnostics, or to be run with --run.
+  --run <class>          After compiling, run the static main(String[]) of <class>. The
+                         class name is fully qualified and written in dot form, such as
+                         neko.sample.TestClass. Its output goes straight to this terminal,
+                         and the compilation summary is not printed.
   --stdlib-path <dir>    Compile against the standard library in <dir> instead of the one
                          the compiler carries. The directory is searched recursively for
                          .neko files. Use it to work on the library itself, or to pin a
@@ -172,13 +248,20 @@ Options:
   --color, --no-color    Force or suppress coloured diagnostics.
                          By default colour is used only on an interactive terminal.
   -h, --help             Show this message.
+
+Exit status:
+  0  the program compiled and, with --run, its main returned.
+  1  the program failed to compile, or --run could not find or finish it.
+  2  an internal compiler error.
 """
 
 /** The parsed command line, or `null` when the user asked for help. */
-private class CommandLine(
+internal class CommandLine(
     val sources: List<Path>,
     val outputDirectory: Path?,
     val standardLibraryPath: Path?,
+    /** The fully-qualified class `--run` asked for, in dot form. */
+    val runClass: String?,
     val useColor: Boolean,
 ) {
     companion object {
@@ -186,6 +269,7 @@ private class CommandLine(
             val sources = mutableListOf<Path>()
             var output: String? = null
             var standardLibrary: String? = null
+            var runClass: String? = null
             var color: Boolean? = null
 
             var index = 0
@@ -199,6 +283,14 @@ private class CommandLine(
                             throw CommandLineException("'$argument' requires a directory argument")
                         }
                         output = args[index]
+                    }
+
+                    "--run" -> {
+                        index++
+                        if (index >= args.size) {
+                            throw CommandLineException("'$argument' requires a class name")
+                        }
+                        runClass = args[index]
                     }
 
                     "--stdlib-path" -> {
@@ -224,6 +316,9 @@ private class CommandLine(
                 index++
             }
 
+            if (runClass?.isBlank() == true) {
+                throw CommandLineException("'--run' requires a class name")
+            }
             if (sources.isEmpty()) {
                 throw CommandLineException("no source file or directory was given")
             }
@@ -231,6 +326,7 @@ private class CommandLine(
                 sources = sources,
                 outputDirectory = output?.let { toPath(it) },
                 standardLibraryPath = standardLibrary?.let { toPath(it) },
+                runClass = runClass,
                 useColor = color ?: RenderStyle.supportsColor(),
             )
         }
@@ -243,4 +339,4 @@ private class CommandLine(
     }
 }
 
-private class CommandLineException(message: String) : Exception(message)
+internal class CommandLineException(message: String) : Exception(message)

@@ -35,12 +35,16 @@ Neko 是一门用来做编译器实验的玩具 JVM 语言：它有类、接口�
 ./gradlew :neko:runNeko -Pneko.program=ExceptionMapping
 
 # 测试。
-./gradlew :neko:test                     # 编译器：566 个测试
-./gradlew :plugin:idea:test              # 插件：57 个测试，跑在真实 IDE 实例里
+./gradlew :neko:test                     # 编译器：579 个测试
+./gradlew :plugin:idea:test              # 插件：59 个测试，跑在真实 IDE 实例里
 
 # 把编译器打成单个自包含 jar。
 ./gradlew :neko:executableJar
 java -jar neko/build/executable/neko-1.0-SNAPSHOT-all.jar samples --output out
+
+# 编译并运行一个类。
+java -jar neko/build/executable/neko-1.0-SNAPSHOT-all.jar samples \
+    --run com.github.kusa233.neko.sample.effect.EffectRecovery
 ```
 
 ## 命令行
@@ -56,7 +60,10 @@ java -jar neko-1.0-SNAPSHOT-all.jar <文件或目录>... [选项]
 
 ```
 选项：
-  --output <目录>        编译出的 class 文件写到哪里，默认是当前目录。
+  --output <目录>        编译出的 class 文件写到哪里，相对路径按当前目录解析。省略时不写
+                         class 文件：这次编译只用于报告诊断，或者交给 --run 运行。
+  --run <类名>           编译完成后运行 <类名> 的 static main(String[])。类名是点分全限定名，
+                         例如 neko.sample.TestClass。程序的输出直接写到终端，不打印编译摘要。
   --stdlib-path <目录>   改用 <目录> 里的标准库，而不是编译器自带的那份。
                          该目录会被递归搜索 .neko 文件。
   --color, --no-color    强制或关闭彩色诊断输出。
@@ -65,6 +72,23 @@ java -jar neko-1.0-SNAPSHOT-all.jar <文件或目录>... [选项]
 
 退出码：成功是 `0`；程序编译失败是 `1`（所有诊断按源码顺序全部打印）；`2` 留给编译器内部错误——
 它绝不能被误认为是被编译程序的问题。
+
+### 运行一个类：`--run`
+
+`--run <类名>` 编译程序，然后执行指定类的 `main`：
+
+```bash
+java -jar neko-all.jar samples --run com.github.kusa233.neko.sample.effect.EffectRecovery
+```
+
+类名就是 JVM 看到的那个名字：文件的 `locate` 包加声明 `main` 的类，用点分隔。`locate neko.sample`
+加 `class TestClass` 就是 `neko.sample.TestClass`。`main` 写不写 `string[]` 参数都可以；编译器会为
+无参形式生成 JVM 需要的 `main(String[])` 桥接方法，所以两种写法都会到达运行器。
+
+运行时使用的是本次编译产出的字节，而不是从 `--output` 读回的 class 文件，因此不需要输出目录，磁盘上
+过期的 class 文件也不可能冒充新代码。带 `--run` 时不打印编译摘要——程序的输出本身就是结果——但诊断
+仍会先打印。退出码：`main` 正常返回是 `0`；类不存在、没有 `static main(String[])`、或 `main` 抛出
+异常是 `1`。抛出的异常会打印程序自己的栈帧，并去掉运行器用到的反射帧。
 
 ### 为什么可执行 jar 是单独的任务
 

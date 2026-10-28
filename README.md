@@ -36,12 +36,16 @@ Tasks are module-qualified now that there is more than one module.
 ./gradlew :neko:runNeko -Pneko.program=ExceptionMapping
 
 # Tests.
-./gradlew :neko:test                     # the compiler: 566 tests
-./gradlew :plugin:idea:test              # the plugin: 57 tests, in a real IDE instance
+./gradlew :neko:test                     # the compiler: 579 tests
+./gradlew :plugin:idea:test              # the plugin: 59 tests, in a real IDE instance
 
 # The compiler as one self-contained jar.
 ./gradlew :neko:executableJar
 java -jar neko/build/executable/neko-1.0-SNAPSHOT-all.jar samples --output out
+
+# Compile and run one class in the same command.
+java -jar neko/build/executable/neko-1.0-SNAPSHOT-all.jar samples \
+    --run com.github.kusa233.neko.sample.effect.EffectRecovery
 ```
 
 ## The command line
@@ -58,8 +62,14 @@ compiled as **one program**, which is what lets a class in one file name a class
 
 ```
 Options:
-  --output <directory>   Where to write the compiled class files. Defaults to the current
-                         directory.
+  --output <directory>   Where to write the compiled class files. A relative path is
+                         resolved against the current directory, so the classes can be
+                         kept inside the project. When omitted, no class files are
+                         written; the compilation is only reported, or run with --run.
+  --run <class>          After compiling, run the static main(String[]) of <class>. The class
+                         name is fully qualified and written in dot form, such as
+                         neko.sample.TestClass. Its output goes straight to the terminal, and
+                         the compilation summary is not printed.
   --stdlib-path <dir>    Compile against the standard library in <dir> instead of the one the
                          compiler carries. The directory is searched recursively for .neko files.
   --color, --no-color    Force or suppress coloured diagnostics.
@@ -69,6 +79,26 @@ Options:
 The exit status is `0` on success, `1` when the program failed to compile (every diagnostic is
 printed, in source order), and `2` for an internal compiler error —which must never be mistaken for
 a problem with the program being compiled.
+
+### Running a class: `--run`
+
+`--run <class>` compiles the program and then executes the named class' `main`:
+
+```bash
+java -jar neko-all.jar samples --run com.github.kusa233.neko.sample.effect.EffectRecovery
+```
+
+The name is the one the JVM sees: the package from the file's `locate` clause plus the class that
+declares `main`, in dot form. A class with `locate neko.sample` and `class TestClass` is
+`neko.sample.TestClass`. `main` may be written with or without a `string[]` parameter; the compiler
+emits the `main(String[])` bridge the JVM looks for, so both reach the runner.
+
+The run is fed the bytes this compilation produced rather than classes read back from `--output`, so
+no output directory is needed and a stale class file cannot answer instead. With `--run` the
+compilation summary is suppressed — the program's own output is the result — but diagnostics are
+still printed first. The exit status is then `0` when `main` returns and `1` when the class is
+missing, has no `static main(String[])`, or `main` throws; a thrown exception is printed with the
+program's frames, without the reflection plumbing the runner used to reach it.
 
 ### Why the jar is a separate task
 
