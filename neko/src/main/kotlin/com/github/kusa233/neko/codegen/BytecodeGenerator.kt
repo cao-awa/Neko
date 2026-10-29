@@ -425,6 +425,10 @@ class BytecodeGenerator(
                 collectPurrLocks(statement.call, used)
                 collectPurrLocks(statement.scratch, used)
             }
+            // A group opener declares nothing runnable, and a `blep` branch is only ever emitted as
+            // part of the `try` that installs the group, so neither contributes a lock of its own.
+            is PreGroupDeclaration -> Unit
+            is BlepDeclaration -> collectPurrLocks(statement.body, used)
         }
     }
 
@@ -1392,6 +1396,10 @@ class BytecodeGenerator(
             is TryStatement -> emitTry(statement, scope)
             is TryScratchStatement -> emitTryScratch(statement, scope, resultSlot = null)
             is PurrStatement -> emitPurr(statement, scope)
+            // A group opener is a declaration only: it installs nothing, and its branches reach the
+            // generated `dispatch` through the `try` that closes the group.
+            is PreGroupDeclaration -> Unit
+            is BlepDeclaration -> Unit
             is IndexAssignmentStatement -> emitIndexAssignment(statement, scope)
         }
     }
@@ -1581,7 +1589,7 @@ class BytecodeGenerator(
             return
         }
         emitExpression(value, scope)
-        // A handler's `scratching` answers `Object`, so the value is boxed on the way out; every other
+        // A handler's `dispatch` answers `Object`, so the value is boxed on the way out; every other
         // method it is narrowed to its own return type as before.
         if (returnType === VoidType || returnType === ErrorType) {
             emitPurrReleaseOnExit(scope)
@@ -2328,14 +2336,14 @@ class BytecodeGenerator(
      *
      * A `scratch` is an ordinary call through a *value*. The function's `emit` clause makes it take a
      * hidden `ScratchHandlerN` as its last parameter, so this loads that local and invokes
-     * `scratching` on it with the clause's values. Three things follow, and each was impossible when
+     * `dispatch` on it with the clause's values. Three things follow, and each was impossible when
      * a handler was a `static` method found by signature:
      *
      *  * **The caller decides what runs.** The same callee serves every `try` that calls it, each
      *    supplying its own handler object, so two `try` blocks can no longer collide.
-     *  * **The values are boxed.** `scratching` takes `Object`s, so each value is boxed here; that is
+     *  * **The values are boxed.** `dispatch` takes `Object`s, so each value is boxed here; that is
      *    what lets one interface serve every `emit` clause of the same arity.
-     *  * **The answer is unboxed.** `scratching` returns an `Object`, and the type this site wants is
+     *  * **The answer is unboxed.** `dispatch` returns an `Object`, and the type this site wants is
      *    whatever its position asked for, so the conversion happens here — which is why one handler
      *    can answer an `int` to one site and a `string` to another.
      *
@@ -2368,18 +2376,39 @@ class BytecodeGenerator(
             emitExpression(value, scope)
             emitBox(value.type, mv)
         }
+        emitSignalArgument(expression.signal, scope)
         mv.visitMethodInsn(
             INVOKEINTERFACE,
             owner,
-            SCRATCHING_METHOD_NAME,
-            descriptorOf(List(expression.values.size) { ObjectType }, ObjectType),
+            DISPATCH_METHOD_NAME,
+            descriptorOf(
+                List(expression.values.size) { ObjectType } + ClassType(ENUM_CLASS, "Enum"),
+                ObjectType,
+            ),
             true,
         )
         emitScratchAnswer(expression.type, scope)
     }
 
     /**
-     * Converts `scratching`'s `Object` answer into the type the `scratch` site wants.
+     * Pushes the `Enum` that says which `blep` branch a `scratch` is asking for.
+     *
+     * A `scratch` need not name a signal. With none, the value pushed is `null`, which no branch can
+     * match —`if (signal == NekoSignal.ADD)` is a comparison against a constant, and a `null` signal
+     * equals none of them —so the group answers with its default body. That is what makes `signal`
+     * purely additive: an existing `scratch` written without one keeps behaving exactly as it did,
+     * and a group whose body *is* the default answer serves both kinds of site.
+     */
+    private fun emitSignalArgument(signal: Expression?, scope: MethodScope) {
+        if (signal == null) {
+            scope.mv.visitInsn(ACONST_NULL)
+            return
+        }
+        emitExpression(signal, scope)
+    }
+
+    /**
+     * Converts `dispatch`'s `Object` answer into the type the `scratch` site wants.
      *
      * Three shapes, and the middle one is the reason this is not one instruction:
      *
@@ -2928,7 +2957,7 @@ class BytecodeGenerator(
     /**
      * Emits the class that implements one `try`'s handler, and returns its internal name.
      *
-     * The `{ ... }` block becomes `scratching` on a class of its own, which implements the
+     * The `{ ... }` block becomes `dispatch` on a class of its own, which implements the
      * `ScratchHandlerN` the wrapped call's `emit` clause calls for — the same shape a lambda takes,
      * for the same reason: the block is a method of a generated object.
      *
@@ -3005,8 +3034,11 @@ class BytecodeGenerator(
 
         val mv = writer.visitMethod(
             ACC_PUBLIC,
-            SCRATCHING_METHOD_NAME,
-            descriptorOf(List(signature.size) { ObjectType }, ObjectType),
+            DISPATCH_METHOD_NAME,
+            descriptorOf(
+                List(signature.size) { ObjectType } + ClassType(ENUM_CLASS, "Enum"),
+                ObjectType,
+            ),
             null,
             // The body may `yield`, which throws — the JVM does not verify checked exceptions, and
             // listing one would only make the class noisier than the source it came from.
@@ -3030,20 +3062,34 @@ class BytecodeGenerator(
             handlerInterface = outerHandlerInterface,
             handlerField = outerHandlerField,
         )
-        // The `Object`s the interface handed over occupy the first slots; the locals the body reads
-        // start after them.
-        scope.advancePast(1 + signature.size)
+        // The `Object`s the interface handed over occupy the first slots *and* the signal occupies the
+        // last of them, so the locals this method makes start after the signal —not after the values,
+        // which would put a converted `int` on top of the `Enum` the branches compare against.
+        scope.advancePast(1 + signature.size + 1)
 
-        parameters.forEachIndexed { index, parameter ->
-            val symbol = parameter.symbol ?: return@forEachIndexed
-            val type = signature.getOrElse(index) { symbol.type }
+        // The interface hands over `Object`s; the clause says what they are. They are converted once,
+        // into locals the branches and the `else` body share —every `blep` of a group answers the
+        // same clause, so they all read the same values, which is why one conversion serves them all.
+        val argumentSlots = IntArray(signature.size)
+        for (index in signature.indices) {
+            val type = signature[index]
             val slot = scope.allocateTemp(type)
-            scope.reserve(symbol, slot)
-            // `argN` was an `Object`; the body expects a value of the clause's type.
+            argumentSlots[index] = slot
             mv.visitVarInsn(ALOAD, 1 + index)
             emitUnbox(type, mv)
             mv.visitVarInsn(storeOpcode(type), slot)
         }
+
+        parameters.forEachIndexed { index, parameter ->
+            val symbol = parameter.symbol ?: return@forEachIndexed
+            val slot = argumentSlots.getOrNull(index) ?: return@forEachIndexed
+            scope.reserve(symbol, slot)
+        }
+
+        // The signal is the last parameter the interface declares, and every `blep` branch is a test
+        // on it. It is read from its slot at each test rather than kept on the stack, because the body
+        // that follows a match may itself scratch.
+        emitScratchHandlerBranches(construct, scope, signalSlot = 1 + signature.size, argumentSlots)
 
         for (inner in construct.extractorBody.statements) {
             emitStatement(inner, scope)
@@ -3062,6 +3108,58 @@ class BytecodeGenerator(
         output[name] = writer.toByteArray()
         currentOwner = enclosingOwner
         return name
+    }
+
+    /**
+     * Emits the `if (signal == CONST)` chain a handler group declared, one branch per `blep`.
+     *
+     * The shape is the point. A group answers several operations with one handler, so its `dispatch`
+     * compares the incoming signal against each branch's constant in turn and runs the matching body;
+     * whatever matched nothing —including the `null` a `scratch` that named no `signal` passes —falls
+     * through to the `else`, which is the installing `try`'s own body, emitted straight after this.
+     *
+     * Each test jumps past the bodies before it, so exactly one of them can run, and each body ends by
+     * answering —which is why no jump is needed after one: a `blep` body that could fall through
+     * into the next branch would answer the wrong operation.
+     *
+     * [argumentSlots] are the locals the interface's `Object`s were converted into, which every branch
+     * binds its parameters to. A branch shares them rather than converting again: the clause is the
+     * same for the whole group, so the values are too.
+     */
+    private fun emitScratchHandlerBranches(
+        construct: ExtractorTry,
+        scope: MethodScope,
+        signalSlot: Int,
+        argumentSlots: IntArray,
+    ) {
+        val mv = scope.mv
+        val branches = construct.handler.branches
+        if (branches.isEmpty()) return
+
+        // One label per branch for "not this signal"; each test jumps to its own, and the bodies are
+        // laid out in between, so reaching the end of a body never runs the next one.
+        val next = List(branches.size) { Label() }
+        for ((index, branch) in branches.withIndex()) {
+            mv.visitVarInsn(ALOAD, signalSlot)
+            emitExpression(branch.signal, scope)
+            // An enum constant is a single instance, so identity is what picks it out —the same
+            // reading `==` has for an enum-typed value everywhere else.
+            mv.visitJumpInsn(IF_ACMPNE, next[index])
+            for ((parameterIndex, parameter) in branch.parameters.withIndex()) {
+                val symbol = parameter.symbol ?: continue
+                val slot = argumentSlots.getOrNull(parameterIndex) ?: continue
+                scope.reserve(symbol, slot)
+            }
+            for (inner in branch.body.statements) {
+                emitStatement(inner, scope)
+            }
+            // A branch that ran to its end without `nyan` answers nothing, exactly as a handler body
+            // that ends without one does. It must still leave, or the next branch's test would run
+            // against a signal already known not to match.
+            mv.visitInsn(ACONST_NULL)
+            mv.visitInsn(ARETURN)
+            mv.visitLabel(next[index])
+        }
     }
 
     /**
@@ -4988,7 +5086,7 @@ class BytecodeGenerator(
          * static method, and no way for two `try` blocks to be confused with each other.
          *
          * `null` in a method that takes no handler: a plain function, a lambda, or the synthesized
-         * `scratching` method itself.
+         * `dispatch` method itself.
          */
         var handlerSlot: Int? = null,
         /** The internal name of the interface [handlerSlot] holds, e.g. `.../ScratchHandler2`. */
@@ -5113,7 +5211,16 @@ class BytecodeGenerator(
          * — so their names are looked up in the program like any other library class; only this method
          * name is fixed here, because it is the contract the code generator calls against.
          */
-        const val SCRATCHING_METHOD_NAME = "scratching"
+        const val DISPATCH_METHOD_NAME = "dispatch"
+
+        /**
+         * `java.lang.Enum`, the type of the signal that picks a branch of a handler group.
+         *
+         * Every `dispatch` takes one as its last parameter. A plain `scratch` passes `null`, which no
+         * `blep` branch matches, so the group falls through to its default body —which is what makes
+         * an ungated `scratch` behave exactly as it did before signals existed.
+         */
+        const val ENUM_CLASS = "java/lang/Enum"
 
         /**
          * The field of the `yield` carrier holding the value the `yield` carried.

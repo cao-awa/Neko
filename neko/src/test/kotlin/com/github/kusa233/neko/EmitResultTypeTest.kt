@@ -15,8 +15,9 @@ import kotlin.test.assertTrue
  *  * a `nyan` in the matching `try` must produce an `R`. A *bare* `nyan` — or no `nyan` at all — stays
  *    legal and answers `null`, which the site reads as `R`'s Java default.
  *
- * The `-> R` half is not optional: leaving it out is refused, because it is the half that says what a
- * `scratch` site is worth and what a valued `nyan` promises. One test here pins that refusal.
+ * The `-> R` half is optional. Written, it says what a *valued* `nyan` must produce and what every
+ * `scratch` site is worth; left out, it says the handler answers nothing at all — the same thing as
+ * writing `-> void`. Both spellings are covered here, along with the refusals each of them implies.
  */
 class EmitResultTypeTest {
 
@@ -239,60 +240,189 @@ class EmitResultTypeTest {
     }
 
     /**
-     * A clause that leaves the result out is refused, and the message says what to write.
+     * A clause may leave the result out, and then its handlers answer nothing.
      *
-     * The result is half of the clause's contract — what every `scratch` site is worth and what a
-     * valued `nyan` promises — so a clause without one is not the older "answer anything" agreement,
-     * it is a clause the language cannot check. The parser still accepts the half-written clause so
-     * this can be reported at the clause rather than as a parse failure.
+     * This is the `-> void` case spelled by omission: the clause still names the values a `scratch`
+     * hands over — that is what a `try` is matched on — but the handler has nothing to send back, so
+     * the `scratch` site is a statement rather than a value. Before this was allowed, a function used
+     * only for its failure path had to invent a result type it never produced.
      */
     @Test
-    fun `an emit clause without a result is refused`() {
-        val source = program(
-            "class Emitter {",
-            "    static {",
-            "        fun source(): int {",
-            "            v: int = scratch 1",
-            "            return v",
-            "        } emit [int]",
-            "    }",
-            "}",
+    fun `an emit clause may leave its result out`() {
+        val loaded = TestSupport.load(
+            program(
+                "class Emitter {",
+                "    static {",
+                "        fun ping() {",
+                "            scratch 7",
+                "            println(\"returned\")",
+                "        } emit [int]",
+                "    }",
+                "}",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            try Emitter.ping() { n ->",
+                "                println(\"handled \" + n)",
+                "            }",
+                "        }",
+                "    }",
+                "}",
+            ),
         )
-        val reported = TestSupport.errors(TestSupport.compile(source, name = "Emit.neko"))
+        // The handler `nyan`s nothing, so the `scratch` site carries on and `ping` prints its own
+        // line: the clause's values travel out, but no answer comes back in.
+        assertEquals("handled 7\nreturned\n", run(loaded))
+    }
+
+    /** `-> void` says the same thing as leaving the result out, and is accepted for saying it. */
+    @Test
+    fun `an emit clause may name void as its result`() {
+        val loaded = TestSupport.load(
+            program(
+                "class Emitter {",
+                "    static {",
+                "        fun ping() {",
+                "            scratch 7",
+                "            println(\"returned\")",
+                "        } emit [int] -> void",
+                "    }",
+                "}",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            try Emitter.ping() { n ->",
+                "                println(\"handled \" + n)",
+                "            }",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        assertEquals("handled 7\nreturned\n", run(loaded))
+    }
+
+    /** A clause naming no values may leave the result out too: `emit []`. */
+    @Test
+    fun `a clause naming no values may leave its result out`() {
+        val loaded = TestSupport.load(
+            program(
+                "class Emitter {",
+                "    static {",
+                "        fun ping() {",
+                "            scratch",
+                "            println(\"returned\")",
+                "        } emit []",
+                "    }",
+                "}",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            try Emitter.ping() { ->",
+                "                println(\"handled\")",
+                "            }",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        assertEquals("handled\nreturned\n", run(loaded))
+    }
+
+    /**
+     * A valued `nyan` is refused when the clause promises nothing, and the message says what to write.
+     *
+     * The advice is "a bare `nyan`" rather than "a `void` value", because `void` is not a type a
+     * program can produce a value of — telling the reader to write one would be advice they could not
+     * act on.
+     */
+    @Test
+    fun `a valued nyan is refused when the clause promises nothing`() {
+        val messages = errorsOf(
+            program(
+                "class Emitter {",
+                "    static {",
+                "        fun ping() {",
+                "            scratch 1",
+                "        } emit [int]",
+                "",
+                "        fun run() {",
+                "            try ping() { a -> nyan a }",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
         assertTrue(
-            reported.any {
-                "must name the result its handler answers" in it.message &&
-                    "emit [...] -> R" in it.message
-            },
-            "expected the missing result to be named, but got:\n" +
-                reported.joinToString("\n") { it.message },
-        )
-        // The diagnostic belongs on the half-written clause, which is where the fix goes.
-        assertEquals(
-            "emit [int]",
-            reported.single().span?.text,
-            "the error should point at the clause rather than at the function",
+            messages.any { "promises no value" in it && "bare 'nyan'" in it },
+            "expected the valued nyan to be refused, but got:\n${messages.joinToString("\n")}",
         )
     }
 
+    /** A `scratch` from a void clause is worth nothing, so assigning it is refused. */
     @Test
-    fun `a clause naming no values still has to name its result`() {
-        val source = program(
-            "class Emitter {",
-            "    static {",
-            "        fun ping(): int {",
-            "            v: int = scratch",
-            "            return v",
-            "        } emit []",
-            "    }",
-            "}",
+    fun `a scratch from a void clause cannot be assigned`() {
+        val messages = errorsOf(
+            program(
+                "class Emitter {",
+                "    static {",
+                "        fun ping() {",
+                "            v: int = scratch 1",
+                "            println(v)",
+                "        } emit [int]",
+                "    }",
+                "}",
+            ),
         )
-        val reported = TestSupport.errors(TestSupport.compile(source, name = "Emit.neko"))
         assertTrue(
-            reported.any { "must name the result its handler answers" in it.message },
-            "an empty clause has a result too, but got:\n" +
-                reported.joinToString("\n") { it.message },
+            messages.any { "answers nothing" in it && "drop the assignment" in it },
+            "expected the assignment to be refused, but got:\n${messages.joinToString("\n")}",
         )
+    }
+
+    /**
+     * A wrapper may forward a void clause unchanged, exactly as it forwards a valued one.
+     *
+     * Both clauses name no result, so the handler passes straight through and nothing needs
+     * converting — which is what makes a pass-through wrapper over a failure-only function possible
+     * without inventing a result type.
+     */
+    @Test
+    fun `a wrapper may forward a void clause`() {
+        val loaded = TestSupport.load(
+            program(
+                "class Emitter {",
+                "    static {",
+                "        fun source() {",
+                "            scratch 3",
+                "            println(\"returned\")",
+                "        } emit [int]",
+                "",
+                "        fun wrapper() {",
+                "            source()",
+                "            println(\"wrapped\")",
+                "        } emit [int]",
+                "    }",
+                "}",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            try Emitter.wrapper() { n ->",
+                "                println(\"handled \" + n)",
+                "            }",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        // `nyan` answers the `scratch` site, which is inside `source` — so control comes back there
+        // and `source` runs to its end, then `wrapper` does. Forwarding is what lets the handler
+        // declared by `main`'s `try` be reached from two frames down.
+        assertEquals("handled 3\nreturned\nwrapped\n", run(loaded))
     }
 
     /**
@@ -300,7 +430,9 @@ class EmitResultTypeTest {
      *
      * Forwarding passes the caller's handler straight into the callee, so a difference in `R` would
      * promise the caller one answer and hand its handler to sites expecting another. Matching the
-     * value types is not enough: the result is part of the same contract.
+     * value types is not enough: the result is part of the same contract. A `void` clause against a
+     * valued one is such a difference too, which is why `null` is resolved to `void` rather than left
+     * loose.
      */
     @Test
     fun `a wrapper may not forward a clause with a different result`() {
@@ -323,6 +455,34 @@ class EmitResultTypeTest {
         assertTrue(
             messages.any { "'source' declares an 'emit' clause" in it && "call it as" in it },
             "expected the forwarding to be refused, but got:\n${messages.joinToString("\n")}",
+        )
+    }
+
+    /**
+     * `void` names a type only after the clause's `->`, never anywhere else.
+     *
+     * The word is accepted in `emit [...] -> void` because that position asks what the handler
+     * answers, and "nothing" is a real answer there. A local, parameter or field of type `void` would
+     * have no value to hold, so the name stays unknown everywhere else — which is what keeps
+     * `x: void = ...` an error rather than a puzzling one.
+     */
+    @Test
+    fun `void is not a type name outside the clause's result`() {
+        val messages = errorsOf(
+            program(
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            x: void = null",
+                "            println(x)",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        assertTrue(
+            messages.isNotEmpty(),
+            "a 'void' local should be refused, but nothing was reported",
         )
     }
 

@@ -111,7 +111,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * function, so the two statements that transfer control out of it — `yield` and `return` — mean
      * something different there and are checked against this.
      */
-    private var currentExtractor: ExtractorTry? = null
+    private var currentExtractor: HandlerOwner? = null
 
     /**
      * Every `try` that declared a handler, in source order.
@@ -662,7 +662,8 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             function.resolvedParameterTypes = parameterTypes
             function.resolvedReturnType = returnType
             function.resolvedEmitTypes = function.emitTypes.map { resolveType(it) }
-            function.resolvedEmitResultType = function.emitResultType?.let { resolveType(it) }
+            function.resolvedEmitResultType =
+                if (function.hasEmitClause) resolveEmitResultType(function.emitResultType) else null
 
             val overloads = classSymbol.functions.getOrPut(function.name) { mutableListOf() }
             val clash = overloads.firstOrNull { it.parameterTypes == parameterTypes }
@@ -745,7 +746,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * The standard library's handler interface for an `emit` clause of [arity] values.
      *
      * `emit [int, int]` needs `ScratchHandler2`, because the interface is what the JVM knows how to
-     * pass: it declares `scratching(Object, Object): Object`, so the values travel boxed and the
+     * pass: it declares `dispatch(Object, Object): Object`, so the values travel boxed and the
      * answer comes back boxed. Which interface a clause needs is therefore decided by its arity
      * alone, and the argument types are checked by the analyzer rather than by the interface — the
      * library's interfaces are all `Object` so that one family serves every program.
@@ -979,23 +980,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * `scratch`, which hands values to the handler its caller's `try` declared and carries on with the
      * answer, or it may `return` normally. Declaring a return type as well is therefore meaningful —
      * it is the value the call produces whenever the function does not scratch, which is what
-     * `r = try f() { ... }` reads. Only the arity of the clause is checked here.
+     * `r = try f() { ... }` reads. Only the arity of the clause is checked here; the result half is
+     * resolved by [resolveEmitResultType], which answers [VoidType] for a clause that named none.
      */
     private fun checkEmitDeclaration(function: FunctionDeclaration, returnType: NekoType) {
         if (!function.hasEmitClause) return
-
-        // The result is what a `nyan` promises and what every `scratch` site is worth, so a clause
-        // that leaves it out has written only half of the contract. The parser accepts the half so
-        // the function around it still parses; refusing it is this pass' job, and the message spells
-        // out the missing half rather than repeating the syntax.
-        if (function.emitResultType == null) {
-            diagnostics.error(
-                "an 'emit' clause must name the result its handler answers: write " +
-                    "'emit [...] -> R', where R is the type every valued 'nyan' must produce and " +
-                    "every 'scratch' site is worth",
-                function.emitClauseSpan ?: function.nameSpan,
-            )
-        }
 
         if (function.resolvedEmitTypes.size > MAX_EMIT_VALUES) {
             diagnostics.error(
@@ -1004,6 +993,24 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 function.emitTypes[MAX_EMIT_VALUES].span,
             )
         }
+    }
+
+    /**
+     * The result an `emit` clause promises: the type it wrote after `->`, or [VoidType].
+     *
+     * A clause that names no result promises nothing, and that is a complete clause rather than half
+     * of one: the handler simply answers "I am done" instead of a value. `emit [int]` and
+     * `emit [int] -> void` therefore mean the same thing —the second is accepted so a clause whose
+     * handlers answer nothing can say so out loud next to the ones that answer.
+     *
+     * `void` is not a nullable or assignable type, and it is deliberately not in [BuiltinTypes.byName]:
+     * a local or a parameter of type `void` is meaningless, so the name is accepted in this position
+     * only. Intercepting it here is what keeps `x: void = ...` an error while `-> void` parses.
+     */
+    private fun resolveEmitResultType(reference: TypeReference?): NekoType {
+        if (reference == null) return VoidType
+        if (reference is NamedTypeReference && reference.name == VOID_TYPE_NAME) return VoidType
+        return resolveType(reference)
     }
 
     // ------------------------------------------------------------------ bodies
@@ -1202,6 +1209,12 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
         analyzeBlock(body)
 
+        // A function's body is where groups are opened and installed, so this is the last moment one
+        // that was never installed can be reported: past here the names are stale, and a group left
+        // over from this body would be reported against the next one.
+        reportUnusedGroups()
+        groupsByName.clear()
+
         // A function with an `emit` clause is exempt from the "must return on every path" rule: a
         // `yield` is a legitimate way to leave it, and the value it carries — not a `return` — is what
         // the caller's `try` receives. Requiring a return as well would make every such function
@@ -1298,6 +1311,8 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             is TryStatement -> analyzeTry(statement)
             is TryScratchStatement -> analyzeTryScratch(statement, wantedType = null)
             is PurrStatement -> analyzePurr(statement)
+            is PreGroupDeclaration -> analyzePreGroup(statement)
+            is BlepDeclaration -> analyzeBlep(statement)
             is IndexAssignmentStatement -> analyzeIndexAssignment(statement)
         }
     }
@@ -1653,18 +1668,39 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             }
         }
 
+        // The signal is an ordinary expression to type, but it has a rule of its own: only an enum
+        // constant can be one, because the branch it selects is an identity comparison against that
+        // constant. Naming nothing is fine and passes `null`, which matches no branch.
+        expression.signal?.let { signal ->
+            analyzeExpression(signal)
+            if (!signal.type.isError && !isEnumConstantAccess(signal)) {
+                diagnostics.error(
+                    "the signal of a 'scratch' must name an enum constant such as " +
+                        "'NekoSignal.ADD', because the handler's branches compare against it",
+                    expression.signalSpan ?: signal.span,
+                )
+            }
+        }
+
         // A clause that named a result fixes what the site is worth, so the handler's promise is what
         // the reader sees here — `emit [int, int] -> int` makes `v: int = scratch a, b` an ordinary
-        // `int` initialisation without the site having to repeat the type.
+        // `int` initialisation without the site having to repeat the type. A clause that named none
+        // leaves the site worth nothing, and a position that asks for a value is then the mistake.
         function.emitResultType?.let { declared ->
             if (expectedType != null && !isAssignable(declared, expectedType)) {
                 diagnostics.error(
-                    "this 'scratch' answers ${declared.displayName}, as its 'emit' clause declares, " +
-                        "but this position wants ${expectedType.displayName}",
+                    if (declared === VoidType) {
+                        "this 'scratch' answers nothing, because '${function.name}' names no result " +
+                            "in its 'emit' clause; drop the assignment to keep the value it hands " +
+                            "to the handler on its own"
+                    } else {
+                        "this 'scratch' answers ${declared.displayName}, as its 'emit' clause " +
+                            "declares, but this position wants ${expectedType.displayName}"
+                    },
                     expression.keywordSpan,
                     notes = listOf(
                         diagnostics.note(
-                            "'${function.name}' declares its result here",
+                            "'${function.name}' declares its 'emit' clause here",
                             function.span,
                         ),
                     ),
@@ -1676,9 +1712,8 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             return declared
         }
 
-        // Only reachable after the missing-result error has been reported for this function. The
-        // handler's answer is an `Object` at the boundary, so the site's expected type is still the
-        // least misleading thing to answer while the program is already known to be broken.
+        // Unreachable in a legal program: every clause answers a result, `void` included. Kept as the
+        // recovery shape while the program is already known to be broken.
         return expectedType ?: ObjectType
     }
 
@@ -1695,6 +1730,153 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      */
     private fun analyzeTry(statement: TryStatement) {
         analyzeExtractorTry(statement)
+    }
+
+    /**
+     * `try pre: label` —opens a handler group.
+     *
+     * Opening a group installs nothing, so there is nothing to type-check here; the name is recorded
+     * for the `blep` branches that follow and for the `try ... : label` that closes it. A duplicate
+     * name is refused because the two groups' branches would otherwise merge into one `dispatch`
+     * with duplicate signals.
+     */
+    private fun analyzePreGroup(statement: PreGroupDeclaration) {
+        val existing = groupsByName[statement.name]
+        if (existing != null) {
+            diagnostics.error(
+                "a handler group named '${statement.name}' is already open",
+                statement.nameSpan,
+                notes = listOf(diagnostics.note("the previous group is here", existing.nameSpan)),
+            )
+            return
+        }
+        groupsByName[statement.name] = HandlerGroup(statement.name, statement.nameSpan)
+    }
+
+    /**
+     * The handler groups opened in this function, by name.
+     *
+     * Cleared when a function's body starts, because a group is a construct of one body: its branches
+     * and the `try` that installs it have to be written side by side, and letting a name leak into
+     * the next function would make a typo there silently extend a group elsewhere.
+     */
+    private val groupsByName = LinkedHashMap<String, HandlerGroup>()
+
+    /**
+     * `blep: label NekoSignal.ADD { a, b -> ... }` —one branch of a handler group.
+     *
+     * The signal must name an enum constant, because the generated `dispatch` compares the incoming
+     * signal against it with `==`. Anything else would compare against a value no site could pass,
+     * which is worth saying now rather than leaving as a branch that never runs.
+     *
+     * The branch's *body* is analysed later, by [analyzeBlepBody], once the `try` that closes the
+     * group has been read: a branch is usually written above that `try`, and it is the `try`'s callee
+     * that supplies the `emit` clause the parameters and `nyan` are checked against. Analysing the
+     * body here would check it against nothing.
+     */
+    private fun analyzeBlep(statement: BlepDeclaration) {
+        val signalType = analyzeExpression(statement.signal)
+        if (!signalType.isError && !isEnumConstantAccess(statement.signal)) {
+            diagnostics.error(
+                "the signal of a 'blep' branch must name an enum constant such as 'NekoSignal.ADD', " +
+                    "because the generated branch compares against it",
+                statement.signal.span,
+            )
+        }
+        statement.signalType = signalType
+
+        val group = groupsByName[statement.groupName]
+        if (group == null) {
+            diagnostics.error(
+                "there is no handler group named '${statement.groupName}'; write " +
+                    "'try pre: ${statement.groupName}' above its branches to open one",
+                statement.groupNameSpan,
+            )
+            return
+        }
+        group.branches += statement
+        statement.group = group
+    }
+
+    /**
+     * Whether [expression] is a dotted access naming an entry of an enum.
+     *
+     * The shape is what distinguishes a signal from any other value: `NekoSignal.ADD` is a constant
+     * the compiler emits as a static field, so only a dotted access can name one. The receiver's
+     * resolved type is asked whether it is a `miao class` —which is what a signal has to be, because
+     * the generated branch compares against the constant's identity.
+     */
+    private fun isEnumConstantAccess(expression: Expression): Boolean {
+        if (expression !is MemberAccessExpression) return false
+        val receiver = expression.receiver.type as? ClassType ?: return false
+        return classesBySimpleName[receiver.simpleName]?.firstOrNull()?.isMiao == true
+    }
+
+    /**
+     * Checks one `blep` body against the clause of the `try` that installs its group.
+     *
+     * All the branches of a group answer the same `emit` clause, so their parameters are bound to the
+     * same value types and their `nyan`s to the same result. That is what makes them
+     * interchangeable: the generated `dispatch` picks one by signal, and every one of them must be a
+     * legal answer to the call it is serving.
+     */
+    private fun analyzeBlepBody(
+        branch: BlepDeclaration,
+        signature: List<NekoType>,
+        resultType: NekoType?,
+    ) {
+        if (branch.parameters.size > signature.size) {
+            val extra = branch.parameters[signature.size]
+            diagnostics.error(
+                "this 'blep' names ${branch.parameters.size} value(s) but the group's 'emit' clause " +
+                    "declares ${signature.size}",
+                extra.span,
+            )
+        }
+
+        val savedFunction = currentFunction
+        val savedExtractor = currentExtractor
+        val savedBoundary = currentBoundaryIdentity
+        val savedNya = currentNya
+        pushScope(identifier = branch)
+        // The body is a handler like any other: `nyan` leaves it, and it is its own method boundary.
+        currentExtractor = branch
+        currentBoundaryIdentity = branch
+        currentNya = null
+        branch.handler.signature = signature
+        branch.handler.emitResultType = resultType
+
+        for ((index, parameter) in branch.parameters.withIndex()) {
+            val type = signature.getOrNull(index) ?: ErrorType
+            parameter.resolvedType = type
+            val symbol = LocalSymbol(
+                name = parameter.name,
+                type = type,
+                span = parameter.nameSpan,
+                kind = VariableKind.VAL,
+                isParameter = true,
+                enclosingLambda = currentBoundaryIdentity,
+            )
+            val existing = scopes.last().symbols[parameter.name]
+            if (existing != null) {
+                diagnostics.error(
+                    "parameter '${parameter.name}' is already declared",
+                    parameter.nameSpan,
+                    notes = listOf(diagnostics.note("previous declaration is here", existing.span)),
+                )
+                continue
+            }
+            scopes.last().symbols[parameter.name] = symbol
+            parameter.symbol = symbol
+        }
+
+        analyzeBlock(branch.body)
+
+        currentExtractor = savedExtractor
+        currentBoundaryIdentity = savedBoundary
+        popScope()
+        currentFunction = savedFunction
+        currentNya = savedNya
     }
 
     /**
@@ -1836,7 +2018,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     /**
      * `nyan` or `nyan value` — leaves the handler, optionally answering a value.
      *
-     * A `nyan` is the handler's ordinary `return`: the generated `scratching` method answers an
+     * A `nyan` is the handler's ordinary `return`: the generated `dispatch` method answers an
      * `Object`, so a valued `nyan` boxes its value on the way out and a bare `nyan` answers `null`.
      *
      * The type is constrained by the clause the callee wrote down: an `emit [...] -> R` clause
@@ -1844,8 +2026,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * stays legal in that case too — it answers `null`, which the site reads as `R`'s default —
      * because "I have nothing to say" is a real answer, not a hole.
      *
-     * A `null` promise is only reachable after the missing-result error has been reported against the
-     * callee's own declaration, so there is nothing useful left to check the value against.
+     * A clause that named no result promises nothing, so the only `nyan` it admits is the bare one.
+     * That is the whole point of writing `emit [int]` rather than `emit [int] -> int`: the handler
+     * says it is finished and the `scratch` site is a statement rather than a value.
      */
     private fun analyzeNyan(statement: NyanStatement) {
         val value = statement.value
@@ -1866,7 +2049,23 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             return
         }
         if (promised == null) {
+            // No clause was registered at all, which only happens after a `try` whose callee was
+            // already reported: the value still needs analysing, but there is nothing to promise
+            // against.
             analyzeExpression(value)
+            return
+        }
+
+        if (promised === VoidType) {
+            // The clause promises nothing, so a valued `nyan` has nothing to answer with. Said in
+            // those words rather than as a type mismatch: `void` is not a type the reader can write a
+            // value of, so "write void" would be advice they cannot take.
+            val answered = analyzeExpression(value)
+            diagnostics.error(
+                "this 'nyan' answers ${answered.displayName}, but the 'emit' clause promises no " +
+                    "value; write a bare 'nyan' to leave the handler",
+                value.span,
+            )
             return
         }
 
@@ -1880,7 +2079,6 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             )
         }
     }
-
 
     /**
      * The part both `try` forms share: check the callee may reach a handler, then analyze the
@@ -1929,7 +2127,67 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         }
 
         analyzeTryExtractor(statement, expected)
+
+        if (statement is TryStatement) installGroup(statement, expected)
+
         return symbol
+    }
+
+    /**
+     * Handles the trailing `: label` of a `try`, which makes it the `try` that installs a group.
+     *
+     * The branches declared under `try pre: label` become this handler's `if`s and this body becomes
+     * the `else`, so it is only now —once the callee's `emit` clause is known —that a branch's
+     * parameters and `nyan` can be checked against anything.
+     *
+     * Only the statement form may install a group. The expression form is worth a `yield`, which a
+     * branch cannot produce, and requiring that would make the two spellings of one group answer
+     * differently.
+     */
+    private fun installGroup(statement: TryStatement, expected: List<NekoType>) {
+        val name = statement.groupName ?: return
+        val span = statement.groupNameSpan ?: statement.keywordSpan
+        val group = groupsByName[name]
+        if (group == null) {
+            diagnostics.error(
+                "there is no handler group named '$name'; write 'try pre: $name' above this 'try' to " +
+                    "open one",
+                span,
+            )
+            return
+        }
+        if (group.installer != null) {
+            diagnostics.error(
+                "the handler group '$name' is already installed",
+                span,
+                notes = listOf(diagnostics.note("the previous installation is here", group.installer!!.span)),
+            )
+            return
+        }
+        group.installer = statement
+        statement.handler.branches = group.branches
+        for (branch in group.branches) {
+            branch.group = group
+            analyzeBlepBody(branch, expected, statement.handler.emitResultType)
+        }
+    }
+
+    /**
+     * Reports a group that was opened but never installed.
+     *
+     * Its branches would never run, and —worse than a branch that never matches —the `try` they were
+     * meant to extend is a plain handler, so a `scratch` naming a signal would silently fall through
+     * to whatever that handler answers. Reported once per function, at the last chance to fix it.
+     */
+    private fun reportUnusedGroups() {
+        for (group in groupsByName.values) {
+            if (group.installer != null) continue
+            diagnostics.error(
+                "the handler group '${group.name}' is opened but never installed: no " +
+                    "'try ... : ${group.name}' follows its branches, so they would never run",
+                group.nameSpan,
+            )
+        }
     }
 
     /**
@@ -2033,9 +2291,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * would not be a pass-through — it would need a conversion, and a `try` is where that belongs.
      * The same holds for the result: forwarding is what carries the caller's handler through
      * unchanged, so a wrapper that names a different `R` would be promising the caller one answer
-     * and handing the callee's handler to a site expecting another. A `null` result is the
-     * already-reported missing-result shape, and matching it loosely keeps that mistake from
-     * producing a second, unrelated diagnostic.
+     * and handing the callee's handler to a site expecting another. Two clauses that both name no
+     * result are equal in that respect —`VoidType` is a result like any other here, so a wrapper
+     * over an `emit [int]` function may itself write `emit [int]` and pass the handler straight on.
      */
     private fun forwardsRaiseUnchanged(callee: FunctionSymbol): Boolean {
         val caller = currentFunction ?: return false
@@ -2044,9 +2302,8 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         if (!caller.emitTypes.zip(callee.emitTypes).all { (mine, theirs) -> mine == theirs }) return false
         val mine = caller.emitResultType
         val theirs = callee.emitResultType
-        // `null` is the already-reported missing-result shape and `ErrorType` an unresolved one; in
-        // both cases the real problem has its own diagnostic, and adding "call it as a try" here
-        // would describe the same mistake twice.
+        // `ErrorType` is the unresolved shape; the real problem has its own diagnostic, and adding
+        // "call it as a try" here would describe the same mistake twice.
         if (mine != null && theirs != null && mine != theirs && mine != ErrorType && theirs != ErrorType) {
             return false
         }
@@ -2638,10 +2895,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     /** Names the construct a `yield` answers, for a diagnostic about a value it left out. */
     private fun constructName(
         nya: NyaValue?,
-        extractor: ExtractorTry?,
+        extractor: HandlerOwner?,
         lambda: LambdaState?,
     ): String = when {
         nya != null -> "'nya'"
+        extractor is BlepDeclaration -> "'blep' branch"
         extractor != null -> "'try'"
         lambda != null -> "lambda"
         else -> "construct"
@@ -4278,9 +4536,25 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         return matching.first()
     }
 
-    /** Built-in and user-declared functions named [name] that accept [arity] arguments. */    private fun functionCandidates(name: String, arity: Int): List<FunctionSymbol> {
+    /**
+     * Built-in and user-declared functions named [name] that accept [arity] arguments.
+     *
+     * Members of the class the call is written in win, and that is not an optimisation: a bare call
+     * names the nearest declaration, and every class in a file may declare a function of the same
+     * name. Searching the whole file first would let a `a()` written in one class resolve to another
+     * class's `a` merely because that class was declared earlier, which is how a plain call came to be
+     * diagnosed as "declares an 'emit' clause" when the caller's own `a` declared none.
+     *
+     * The file-wide search stays as the fallback, because a bare call to another class's function is
+     * legal here. It is a fallback rather than an alternative, so a member only loses when the
+     * enclosing class has no declaration of that name taking this many arguments.
+     */
+    private fun functionCandidates(name: String, arity: Int): List<FunctionSymbol> {
         val builtin = builtins[name].orEmpty().filter { it.parameterTypes.size == arity }
         if (builtin.isNotEmpty()) return builtin
+        val member = currentClass?.allFunctions()?.get(name).orEmpty()
+            .filter { it.parameterTypes.size == arity }
+        if (member.isNotEmpty()) return member
         return functionNamed(name).filter { it.parameterTypes.size == arity }
     }
 
@@ -5977,6 +6251,15 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         const val MAX_EMIT_VALUES = 9
 
         /**
+         * The name a clause writes to say its handlers answer nothing: `emit [int] -> void`.
+         *
+         * It is a result-only spelling. Nowhere else can `void` name a type, because a local, a
+         * parameter or a field of type `void` has no value to hold —so this name is deliberately kept
+         * out of [BuiltinTypes.byName] and intercepted only by [resolveEmitResultType].
+         */
+        const val VOID_TYPE_NAME = "void"
+
+        /**
          * The interface a `for ... in` walks, by JVM internal name.
          *
          * `java.lang.Iterable` rather than a Neko interface of our own: the protocol the loop needs is
@@ -6120,7 +6403,7 @@ private fun Statement.alwaysReturns(): Boolean = when (this) {
     // `scratch` is not terminating: the handler it calls answers a value, and the site continues.
     is YieldStatement, is NyanStatement, is VariableDeclarationStatement, is AssignmentStatement,
     is ExpressionStatement, is TryStatement, is TryScratchStatement, is IndexAssignmentStatement,
-    is IncrementStatement,
+    is IncrementStatement, is PreGroupDeclaration, is BlepDeclaration,
     -> false
 }
 
@@ -6142,7 +6425,7 @@ private fun Statement.containsReturn(): Boolean = when (this) {
     is PurrStatement -> body.containsReturn()
     is YieldStatement, is NyanStatement, is VariableDeclarationStatement, is AssignmentStatement,
     is ExpressionStatement, is TryStatement, is TryScratchStatement, is IndexAssignmentStatement,
-    is IncrementStatement,
+    is IncrementStatement, is PreGroupDeclaration, is BlepDeclaration,
     -> false
 }
 

@@ -8,10 +8,10 @@ import kotlin.test.assertTrue
  * Tests for the `ScratchHandlerN` family that carries an `emit` clause's values.
  *
  * A function with an `emit` clause takes one of these interfaces as a hidden last parameter, so a
- * `scratch` calls `handler.scratching(...)` instead of jumping to a `static` method found by
+ * `scratch` calls `handler.dispatch(...)` instead of jumping to a `static` method found by
  * signature. The family is standard library source
  * (`com.github.kusa233.neko.stdlib.emitter.handler`), one interface per arity from zero to seven,
- * each declaring `scratching(Object…): Object`.
+ * each declaring `dispatch(Object…): Object`.
  *
  * Two consequences drive everything here: the *arity* picks the interface, and the interface's
  * erased signature is why the values are boxed at the boundary and each site converts the answer

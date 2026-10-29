@@ -1123,7 +1123,7 @@ A function that declares an `emit` clause says it may hand control to a `try`'s 
 **`scratch` enters that block and comes back with an answer** —it is an ordinary call, not a
 departure. The mechanism is a value passed alongside the arguments: a function with an `emit` clause
 takes a hidden `ScratchHandlerN` as its last parameter, and `scratch` calls
-`handler.scratching(...)` on it. The clause also names, after `->`, what that handler answers.
+`handler.dispatch(...)` on it. The clause also names, after `->`, what that handler answers.
 
 ```neko
 class Neko() {
@@ -1305,12 +1305,10 @@ class Neko() {
 }
 ```
 
-The result is **required**, and the two halves of the clause are the two halves of one promise. A
-`scratch` inside a function declaring the clause is worth `R`, so the site does not have to work the
-type out from its surroundings — and a position that wants something else is reported as one
-disagreement rather than two. A valued `nyan` in the matching `try` must produce an `R`. Writing
-`emit [...]` without `-> R` is an error, because there would be nothing to check either half
-against.
+The result is optional. When it is written, the two halves of the clause are the two halves of one
+promise: a `scratch` inside a function declaring the clause is worth `R`, so the site does not have
+to work the type out from its surroundings — and a position that wants something else is reported as
+one disagreement rather than two. A valued `nyan` in the matching `try` must produce an `R`.
 
 Leaving the *value* out of a `nyan` stays legal:
 
@@ -1321,6 +1319,31 @@ r: int = try source() { a, b -> nyan }   // r is 0: `R`'s Java default
 A bare `nyan`, or a handler body that never `nyan`s at all, answers `null`; the site reads that as
 `R`'s default. So `-> R` says what a *valued* `nyan` must produce, not that every handler must
 produce one.
+
+#### Answering nothing: `emit [int]` or `emit [int] -> void`
+
+A handler that has nothing to answer does not need a result type at all. Leaving `-> R` off says
+exactly that:
+
+```neko
+class Neko() {
+  fun ping() {
+    scratch 7
+    println("returned")
+  } emit [int]
+
+  fun invoker() {
+    // The handler answers nothing, so the `try` is a statement, not a value.
+    try ping() { n -> println("handled " + n) }
+  }
+}
+```
+
+`emit [int]` and `emit [int] -> void` mean the same thing; write `-> void` to say it out loud beside
+clauses that do answer. With no result, the only `nyan` the handler admits is the bare one — a valued
+`nyan` is refused, because there is no type for it to produce — and a `scratch` site is worth nothing,
+so assigning it is refused too. Use this for a function whose return path carries no information: the
+caller still matches it with `try`, and the values it scratches still reach the handler.
 
 #### Leaving the value out
 
@@ -1347,7 +1370,7 @@ class Neko() {
 }
 ```
 
-A handler that ends without `nyan` at all is the same thing: the generated `scratching` answers
+A handler that ends without `nyan` at all is the same thing: the generated `dispatch` answers
 `null` after the body, so the site sees the default too.
 
 * **A bare `nyan`** answers `null`, which the site reads as `R`'s default. It is allowed whatever

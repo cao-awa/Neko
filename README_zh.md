@@ -1018,7 +1018,7 @@ class Main {
 声明了 `emit` 子句的函数，等于说自己可能把控制权交给某个 `try` 的 `{ ... }` 块。**`scratch` 进入
 那个块，并带着一个答案回来**——它是一次普通调用，不是离开。机制是一个随参数一起传下去的值：声明了
 `emit` 子句的函数会在参数列表末尾多一个隐藏的 `ScratchHandlerN` 参数，而 `scratch` 就是调用它的
-`handler.scratching(...)`。子句还会在 `->` 之后写明这个 handler 应答什么。
+`handler.dispatch(...)`。子句还会在 `->` 之后写明这个 handler 应答什么。
 
 ```neko
 class Neko() {
@@ -1197,8 +1197,8 @@ class Neko() {
 而想要别的类型的位置只报**一条**冲突，不是两条。同时这个承诺会被**检查**：配对 `try` 里带值的
 `nyan` 必须产出 `R`。
 
-结果是**必需的**，子句的两半本来就是同一个承诺的两半：每个 `scratch` 点值什么，以及带值的 `nyan`
-必须产出什么。写成 `emit [...]` 而不写 `-> R` 会报错，因为两半都没有可校验的对象。
+结果是**可选**的：省略 `-> R` 就是合法写法，含义是 handler 不应答任何值（见下节）。写出来时，子句的
+两半才成为同一个承诺的两半：每个 `scratch` 点值什么，以及带值的 `nyan` 必须产出什么。
 
 `nyan` 里的**值**仍然可以省略：
 
@@ -1208,6 +1208,29 @@ r: int = try source() { a, b -> nyan }   // r 是 0，即 `R` 的 Java 默认值
 
 裸 `nyan`，或者 handler 体里根本没有 `nyan`，都应答 `null`，调用点把它读成 `R` 的默认值。所以
 `-> R` 说的是**带值**的 `nyan` 必须产出什么，而不是每个 handler 都必须产出。
+
+#### 不应答任何值：`emit [int]` 或 `emit [int] -> void`
+
+handler 没什么可应答时，根本不需要结果类型。不写 `-> R` 就是这个意思：
+
+```neko
+class Neko() {
+  fun ping() {
+    scratch 7
+    println("returned")
+  } emit [int]
+
+  fun invoker() {
+    // handler 不应答，所以这个 `try` 是语句，不是值。
+    try ping() { n -> println("handled " + n) }
+  }
+}
+```
+
+`emit [int]` 和 `emit [int] -> void` 含义相同；在会应答的子句旁边，用 `-> void` 把它写明白。没有结果
+时，handler 里只允许裸 `nyan`——带值的 `nyan` 会被拒绝，因为没有类型可供它产出——而 `scratch` 点不值
+任何东西，所以对它赋值同样会被拒绝。用于返回路径不携带任何信息的函数：调用方照旧用 `try` 匹配它，
+它 scratch 出的值也照旧送到 handler。
 
 #### 省略值
 
@@ -1234,7 +1257,7 @@ class Neko() {
 }
 ```
 
-handler 末尾根本没有 `nyan` 也是一回事：生成的 `scratching` 在主体之后应答 `null`，调用点同样拿到默认值。
+handler 末尾根本没有 `nyan` 也是一回事：生成的 `dispatch` 在主体之后应答 `null`，调用点同样拿到默认值。
 
 * **裸 `nyan`** 应答 `null`，调用点把它读成 `R` 的默认值。无论 `R` 是什么都允许——只有**带值**的
   `nyan` 才必须与子句一致。

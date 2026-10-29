@@ -11,7 +11,7 @@ locate com.github.kusa233.neko.sample.effect
 class ScratchHandlerExternal {
     static {
         fun main() {
-            try ScratchHandler.scratching() { x, y ->
+            try ScratchHandler.dispatch() { x, y ->
 
             }
         }

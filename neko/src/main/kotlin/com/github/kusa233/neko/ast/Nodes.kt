@@ -369,13 +369,15 @@ class FunctionDeclaration(
      * The `R` of `emit [int, int] -> R`.
      *
      * The clause's values are what a `scratch` hands to the handler; this is what the handler answers
-     * back. It is **required**: a clause without `-> R` is reported by the analyzer, because a
-     * handler's answer is part of the clause's contract rather than something each `scratch` site
-     * guesses. A `nyan` inside that handler must produce an `R`, and a handler that answers nothing
-     * (a bare `nyan`, or no `nyan` at all) gives the `scratch` site `R`'s Java default.
+     * back. A clause may leave it out, and `emit [int]` then means `emit [int] -> void`: the handler
+     * answers nothing, so a `nyan` inside it is a bare `nyan` and a `scratch` site is a statement
+     * rather than a value. `-> void` may also be written, which says the same thing out loud.
      *
-     * `null` only before the parser has seen the clause, or after a parse error; analysis reports it
-     * as missing for any clause that is really written without one.
+     * When a result *is* named, a `nyan` inside that handler must produce one, and a handler that
+     * answers nothing (a bare `nyan`, or no `nyan` at all) gives the `scratch` site `R`'s Java default.
+     *
+     * `null` only before the parser has seen the clause, or after a parse error; the analyzer reads it
+     * as [com.github.kusa233.neko.types.VoidType].
      */
     val emitResultType: TypeReference? = null,
     /**
@@ -383,7 +385,7 @@ class FunctionDeclaration(
      *
      * Distinct from `emitTypes.isNotEmpty()`, because `emit []` is a legal clause naming zero
      * values: a `scratch` with nothing to carry, matched by the caller's `try f() { -> ... }`. Such
-     * a clause still has to name its result: `emit [] -> int`.
+     * a clause may name a result — `emit [] -> int` — or leave it out, as `emit []`.
      */
     val hasEmitClause: Boolean = false,
     /** Span of the whole `emit [...] -> R` clause, or `null` when none was written. */
@@ -399,7 +401,7 @@ class FunctionDeclaration(
     /** Filled in by the analyzer: the types named by the `emit` clause, in declaration order. */
     var resolvedEmitTypes: List<NekoType> = emptyList()
 
-    /** Filled in by the analyzer: what `emit [...] -> R` promises to answer, or `null`. */
+    /** Filled in by the analyzer: what `emit [...] -> R` promises to answer; [com.github.kusa233.neko.types.VoidType] when the clause named none. */
     var resolvedEmitResultType: NekoType? = null
 
     /** Filled in by the analyzer: the symbol code generation needs to emit a call to this function. */
@@ -824,6 +826,17 @@ enum class PurrMode {
 class ScratchExpression(
     val keywordSpan: Span,
     val values: List<Expression>,
+    /**
+     * The `signal X.Y` half, or `null` when the site named no signal.
+     *
+     * A `blep` group's `dispatch` takes the signal as its last argument, so this is what picks the
+     * branch. Naming none is legal and passes `null`, which matches no branch and therefore reaches
+     * the group's default body — the `{ ... }` of the `try` that installed it. That is what lets a
+     * `scratch` written before signals existed go on working unchanged.
+     */
+    val signal: Expression? = null,
+    /** Span of the `signal` keyword, used when the expression it names is not an enum constant. */
+    val signalSpan: Span? = null,
     override val span: Span,
 ) : Expression()
 
@@ -845,6 +858,32 @@ class NyanStatement(
 ) : Statement
 
 /**
+ * Anything whose `{ ... }` block becomes a handler method.
+ *
+ * Both the `try` forms and a `blep` branch are handlers: each is compiled into a method of its own,
+ * each is reached by a `scratch`, and each may `nyan` an answer. What the analyzer needs to know about
+ * one is the same in every case — which clause it answers and whether it is worth a value — so the
+ * three questions live here rather than being asked of each spelling separately.
+ */
+interface HandlerOwner : Node {
+    /** Span of the keyword that introduced this handler, used when it is found in the wrong place. */
+    val keywordSpan: Span
+
+    /** `true` when a `yield` here may carry the construct's value. A `blep` branch is not its own value. */
+    val acceptsYield: Boolean
+
+    /**
+     * The type this handler's `yield` produces, fixed by the first one it writes.
+     *
+     * `null` means the body never `yield`s, so its handler never leaves that way.
+     */
+    var yieldedType: NekoType?
+
+    /** Everything the later passes learn about the method this block becomes. */
+    val handler: HandlerInfo
+}
+
+/**
  * The part of a `try` that declares a handler, shared by the statement and the expression form.
  *
  * The `{ ... }` block is compiled into a `static` method, and every `scratch` whose `emit` clause
@@ -853,10 +892,7 @@ class NyanStatement(
  * `r: int = try f(...) { a -> yield 1 }` is an expression worth what a `yield` carried — which is why
  * [acceptsYield] distinguishes the two and why only the expression form may `yield` for its value.
  */
-interface ExtractorTry : Node {
-    /** Span of the `try` keyword. */
-    val keywordSpan: Span
-
+interface ExtractorTry : HandlerOwner {
     /** The call this `try` wraps, whose callee's `emit` clause names the handler's signature. */
     val call: CallExpression
 
@@ -867,24 +903,6 @@ interface ExtractorTry : Node {
 
     /** Span of the `->` that introduces the extractor body, used when it is missing. */
     val arrowSpan: Span?
-
-    /** `true` for the expression form, whose handler produces the value the `try` is worth. */
-    val acceptsYield: Boolean
-
-    /**
-     * The type the extractor's `yield` produces, fixed by the first one it writes.
-     *
-     * `null` means the body never `yield`s, so its handler never leaves that way.
-     */
-    var yieldedType: NekoType?
-
-    /**
-     * Everything the two later passes learn about the method this `{ ... }` block becomes.
-     *
-     * An interface cannot hold initialized state in Kotlin, so the mutable half of a handler lives in
-     * this one object; both `try` forms own exactly one.
-     */
-    val handler: HandlerInfo
 }
 
 /**
@@ -913,6 +931,16 @@ class HandlerInfo {
      * than here. `null` only when the callee's declaration was itself reported as missing its result.
      */
     var emitResultType: NekoType? = null
+
+    /**
+     * The `blep` branches of the group this `try` installs, in source order.
+     *
+     * Empty for an ordinary `try`, whose whole body is the handler. For a `try ... : label` these
+     * become the generated `dispatch`'s `if`s — one branch per signal — and this `try`'s own body
+     * becomes the `else` that answers when no signal matches, including the `null` a `scratch` that
+     * named no `signal` passes.
+     */
+    var branches: List<BlepDeclaration> = emptyList()
 }
 
 /**
@@ -928,6 +956,82 @@ class ScratchSite(
     val signature: List<NekoType>,
     val wantedType: NekoType?,
 )
+
+/**
+ * `try pre: label` — opens a handler *group* called `label`.
+ *
+ * A group is a set of branches keyed on a signal, rather than the single body an ordinary `try`
+ * declares. Each `blep: label Signal { ... }` that follows adds one branch, and the `try` that
+ * closes the group — `try b() { a, b -> ... }: label` — supplies the default, installed as the group
+ * the call carries.
+ *
+ * This declaration itself installs nothing: it only says which name the `blep` declarations and the
+ * closing `try` belong to. That is why it is a statement of its own rather than a modifier on the
+ * `try` that ends the group — the branches are declared in between, in the same block.
+ */
+class PreGroupDeclaration(
+    val keywordSpan: Span,
+    /** The group's name, as written after the colon. */
+    val name: String,
+    val nameSpan: Span,
+    override val span: Span,
+) : Statement
+
+/**
+ * `blep: label Signal.NAME { a, b -> ... }` — one branch of the handler group `label`.
+ *
+ * [signal] is the enum constant that selects this branch, so it must name an entry of an enum type:
+ * the generated `dispatch` compares the incoming signal against it. [body] is what runs when it
+ * matches, and its shape — parameters and `nyan` — is checked against the same `emit` clause the
+ * group's closing `try` is checked against, because all the branches of one group answer the same
+ * clause.
+ */
+class BlepDeclaration(
+    override val keywordSpan: Span,
+    /** Name of the group this branch belongs to. */
+    val groupName: String,
+    val groupNameSpan: Span,
+    /** The enum constant that selects this branch, e.g. `NekoSignal.ADD`. */
+    val signal: Expression,
+    val parameters: List<LambdaParameter>,
+    val body: BlockStatement,
+    val arrowSpan: Span?,
+    override val span: Span,
+) : Statement, HandlerOwner {
+    /** Filled in by the analyzer: the type the [signal] expression resolved to. */
+    var signalType: NekoType = ErrorType
+
+    /** The group this branch was added to, or `null` when no `try pre` opened one by that name. */
+    var group: HandlerGroup? = null
+
+    /**
+     * A branch is not worth a value of its own: what it produces goes to the `scratch` site that
+     * entered the group, through `nyan`. `yield` there would have no construct to leave, so it is
+     * refused — the branch is inside the `try`'s handler, not beside it.
+     */
+    override val acceptsYield: Boolean get() = false
+
+    override var yieldedType: NekoType? = null
+
+    override val handler = HandlerInfo()
+}
+
+/**
+ * One `try pre: label` and the `blep` branches declared under it.
+ *
+ * The group exists only during analysis: it is what ties the branches to the one `try` that installs
+ * them, and it disappears once that `try` carries them as [HandlerInfo.branches].
+ */
+class HandlerGroup(
+    val name: String,
+    val nameSpan: Span,
+) {
+    /** The branches declared for this group, in source order. */
+    val branches: MutableList<BlepDeclaration> = mutableListOf()
+
+    /** The `try ... : name` that installs this group, or `null` while none has been read. */
+    var installer: HandlerOwner? = null
+}
 
 /**
  * `try call(args) { a, b -> ... }` — declares a handler for the call's `emit` clause, and runs
@@ -949,6 +1053,17 @@ class TryStatement(
     override val extractorBody: BlockStatement,
     /** Span of the `->` that introduces the extractor body, used when it is missing. */
     override val arrowSpan: Span?,
+    /**
+     * The group this `try` installs its handler into, when it wrote a trailing `: label`.
+     *
+     * `null` for an ordinary `try`, which installs a handler of its own. A named group's `blep`
+     * branches are what the generated `dispatch` checks first, and this `try`'s own body is the
+     * `else` — the answer when no signal matched, including the `null` a `scratch` with no `signal`
+     * passes.
+     */
+    val groupName: String? = null,
+    /** Span of the group name, used when no `try pre` opened a group by that name. */
+    val groupNameSpan: Span? = null,
     override val span: Span,
 ) : Statement, ExtractorTry {
     /** A statement is worth nothing, so its handler has no value to `yield`. */

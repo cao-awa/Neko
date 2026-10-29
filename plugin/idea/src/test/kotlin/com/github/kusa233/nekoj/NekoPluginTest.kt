@@ -269,7 +269,7 @@ class NekoPluginTest : BasePlatformTestCase() {
             locate com.github.kusa233.neko.stdlib.emitter.handler
 
             interface ScratchHandler1 {
-                fun scratching(arg0: Object): Object
+                fun dispatch(arg0: Object, var1: Enum): Object
             }
             """.trimIndent(),
         )

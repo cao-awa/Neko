@@ -104,6 +104,25 @@ enum class TokenType(val display: String) {
     NYAN("'nyan'"),
     EMIT("'emit'"),
     /**
+     * `'blep'` — declares one branch of a `try pre` handler group, keyed on a signal.
+     *
+     * `blep: label NekoSignal.ADD { a, b -> nyan a + b }` adds to the group called `label` a branch
+     * that answers whenever a `scratch` names `NekoSignal.ADD` as its signal. The whole group is
+     * installed by one `try call(...) { ... }: label`, and its branches become the `if`s of the
+     * generated `dispatch`, with that `try`'s own body as the `else`.
+     */
+    BLEP("'blep'"),
+    /**
+     * `'signal'` — names the enum constant a `scratch` is asking for.
+     *
+     * `scratch 10, 5 signal NekoSignal.ADD` reaches the handler's `dispatch` with that constant as
+     * its last argument, which is how one handler answers several different operations. The word is
+     * optional: without it the constant passed is `null`, no `blep` branch matches, and the group
+     * answers with the body the installing `try` wrote — so a plain `scratch` keeps meaning exactly
+     * what it did before signals existed.
+     */
+    SIGNAL("'signal'"),
+    /**
      * `'try'` — now only the extractor form, `try f(...) { a -> ... }`, which declares the handler a
      * `scratch` reaches and catches the `EmitYieldException` a `yield` throws.
      *
@@ -290,6 +309,8 @@ internal val KEYWORDS: Map<String, TokenType> = mapOf(
     "scratch" to TokenType.SCRATCH,
     "nyan" to TokenType.NYAN,
     "emit" to TokenType.EMIT,
+    "blep" to TokenType.BLEP,
+    "signal" to TokenType.SIGNAL,
     "try" to TokenType.TRY,
     "purr" to TokenType.PURR,
     "purred" to TokenType.PURRED,

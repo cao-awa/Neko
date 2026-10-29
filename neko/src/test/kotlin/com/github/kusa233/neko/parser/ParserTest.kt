@@ -207,9 +207,9 @@ class ParserTest {
     }
 
     @Test
-    fun `parses an emit clause without a result and leaves it for the analyzer`() {
-        // The parser accepts the half-written clause so the analyzer can refuse it at the clause,
-        // with a message that names the missing half, instead of losing the whole function.
+    fun `parses an emit clause without a result`() {
+        // Leaving the result out is legal — it means the handler answers nothing — so the parser
+        // records the clause as present with no result, and the analyzer resolves that to `void`.
         val function = function(
             """
             class Sample {
@@ -227,7 +227,7 @@ class ParserTest {
     @Test
     fun `an emit clause naming no values is still an emit clause`() {
         // `emit []` is distinct from having no clause at all: it says the function may leave early,
-        // matching a caller's `try f() { -> ... }`. The result is still required.
+        // matching a caller's `try f() { -> ... }`. A result may still be named, and this one is.
         val function = function(
             """
             class Sample {

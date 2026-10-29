@@ -1067,9 +1067,8 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
     /**
      * A parsed `emit [T, U] -> R` clause: its value types, the result it names, and its span.
      *
-     * [resultType] is the `-> R` half. The parser accepts its absence so that the analyzer can report
-     * it with a precise span and a message that names the fix, rather than failing to parse the
-     * function that carries it.
+     * [resultType] is the `-> R` half, and `null` when the clause left it out. Leaving it out is
+     * legal and means the handler answers nothing; the analyzer resolves that to `void`.
      */
     private class EmitClause(
         val types: List<TypeReference>,
@@ -1084,9 +1083,9 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
      * The brackets are required and may be empty, so `emit []` is a clause that names no values — a
      * function that can only signal failure. The `-> R` half says what the handler must answer: a
      * `nyan` inside it has to produce an `R`, and a handler that says nothing gives the `scratch`
-     * site `R`'s default. It is required, but the parser does not insist: a clause written without
-     * one is returned with a `null` result so the analyzer can report it as a semantic error and the
-     * rest of the function is still parsed. Returns `null` when no clause is present.
+     * site `R`'s default. It is optional: a clause that leaves it out promises nothing, and the
+     * analyzer reads that as `-> void`. `-> void` may also be written, which spells the same thing out.
+     * Returns `null` when no clause is present.
      */
     private fun parseEmitClause(): EmitClause? {
         val mark = index
@@ -1265,6 +1264,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         TokenType.NYA -> parseNyaStatementForm()
         TokenType.NYAN -> parseNyanStatement()
         TokenType.TRY -> parseTryStatement()
+        TokenType.BLEP -> parseBlepDeclaration()
         TokenType.PURR, TokenType.PURRED,
         TokenType.PURRCLS, TokenType.PURREDCLS,
         -> parsePurrStatement()
@@ -2024,7 +2024,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         val values = mutableListOf<Expression>()
         var end = keyword.span.end
 
-        if (!atStatementEnd() && !at(TokenType.COMMA)) {
+        if (!atStatementEnd() && !at(TokenType.COMMA) && !at(TokenType.SIGNAL)) {
             while (true) {
                 val value = parseExpression() ?: run {
                     synchronizeToStatement()
@@ -2041,9 +2041,27 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             }
         }
 
+        // `signal X.Y` picks a `blep` branch. Optional: without it the handler is called with a
+        // `null` signal, which matches no branch, so the group answers with its own default body.
+        // That is what keeps every `scratch` written before signals existed working unchanged.
+        var signal: Expression? = null
+        var signalSpan: Span? = null
+        if (at(TokenType.SIGNAL)) {
+            val signalKeyword = advance()
+            signalSpan = signalKeyword.span
+            val named = parseExpression() ?: run {
+                synchronizeToStatement()
+                return null
+            }
+            signal = named
+            end = named.span.end
+        }
+
         return ScratchExpression(
             keywordSpan = keyword.span,
             values = values,
+            signal = signal,
+            signalSpan = signalSpan,
             span = Span(source, keyword.span.start, end),
         )
     }
@@ -2146,6 +2164,12 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         // Parsing is restarted from just after the keyword so that a malformed call is reported
         // against the call itself rather than against the newline that follows it.
         index = mark
+
+        // `try pre: label` opens a group instead of wrapping a call, so it is read before the call is.
+        if (at(TokenType.IDENTIFIER) && current().text == "pre" && peek(1).type == TokenType.COLON) {
+            return parsePreGroupDeclaration(keyword)
+        }
+
         return when (val form = parseTryForm(keyword)) {
             null -> null
             is TryForm.Handler -> TryStatement(
@@ -2154,6 +2178,8 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
                 extractorParameters = form.parts.parameters,
                 extractorBody = form.parts.body,
                 arrowSpan = form.parts.arrowSpan,
+                groupName = form.parts.groupName,
+                groupNameSpan = form.parts.groupNameSpan,
                 span = form.parts.span,
             )
             is TryForm.Scratch -> TryScratchStatement(
@@ -2163,6 +2189,102 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
                 span = form.span,
             )
         }
+    }
+
+    /**
+     * `try pre: label` — opens a handler group named `label`.
+     *
+     * `pre` is read as a plain identifier rather than a keyword: it only means anything in this one
+     * position, and a keyword would stop any program from using the name. The colon that follows is
+     * what distinguishes the group from a call, since no call is written `pre:`.
+     */
+    private fun parsePreGroupDeclaration(keyword: Token): Statement? {
+        advance() // `pre`
+        advance() // `:`
+        val name = expect(
+            TokenType.IDENTIFIER,
+            "expected a name for the handler group after 'try pre:' but found ${current().describe()}",
+        ) ?: run {
+            synchronizeToStatement()
+            return null
+        }
+        expectStatementEnd("handler group declaration")
+        return PreGroupDeclaration(
+            keywordSpan = keyword.span,
+            name = name.text,
+            nameSpan = name.span,
+            span = Span(source, keyword.span.start, name.span.end),
+        )
+    }
+
+    /**
+     * `blep: label Signal.NAME { a, b -> ... }` — one branch of the group `label`.
+     *
+     * The group name comes first so a branch reads as belonging to something already named, and the
+     * signal follows because it is what the branch is *about*. Both are needed: the name picks which
+     * group is being extended, the signal picks which `if` this body becomes.
+     */
+    private fun parseBlepDeclaration(): Statement? {
+        val keyword = advance()
+        expect(TokenType.COLON, "expected ':' after 'blep' but found ${current().describe()}") ?: run {
+            synchronizeToStatement()
+            return null
+        }
+        val groupName = expect(
+            TokenType.IDENTIFIER,
+            "expected the handler group's name after 'blep:' but found ${current().describe()}",
+        ) ?: run {
+            synchronizeToStatement()
+            return null
+        }
+
+        val signal = parseExpression() ?: run {
+            synchronizeToStatement()
+            return null
+        }
+
+        skipNewlines()
+        if (!expectLeftBrace("'blep' branch")) {
+            synchronizeToStatement()
+            return null
+        }
+
+        val parameters = mutableListOf<LambdaParameter>()
+        var arrowSpan: Span? = null
+        if (!at(TokenType.ARROW)) {
+            if (!at(TokenType.RIGHT_BRACE)) {
+                parseExtractorParameters(parameters)
+            }
+            skipNewlines()
+            if (at(TokenType.ARROW)) {
+                arrowSpan = advance().span
+            } else {
+                error(
+                    "expected '->' after the parameters of a 'blep' branch but found " +
+                        current().describe(),
+                    current().span,
+                )
+            }
+        } else {
+            arrowSpan = advance().span
+        }
+
+        skipNewlines()
+        val statements = parseStatementSequence()
+        val close = expectRightBrace("'blep' branch")
+        val end = close?.span?.end ?: signal.span.end
+        val body = BlockStatement(statements, Span(source, keyword.span.start, end))
+
+        return BlepDeclaration(
+            keywordSpan = keyword.span,
+            groupName = groupName.text,
+            groupNameSpan = groupName.span,
+            signal = signal,
+            parameters = parameters,
+            body = body,
+            arrowSpan = arrowSpan,
+            span = Span(source, keyword.span.start, end),
+        )
     }
 
     /**
@@ -2266,6 +2388,9 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         val parameters: List<LambdaParameter>,
         val body: BlockStatement,
         val arrowSpan: Span?,
+        /** The `: label` a group-closing `try` writes, or `null` for an ordinary `try`. */
+        val groupName: String? = null,
+        val groupNameSpan: Span? = null,
         val span: Span,
     )
 
@@ -2327,14 +2452,35 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         skipNewlines()
         val statements = parseStatementSequence()
         val close = expectRightBrace("'try' extractor")
-        val end = close?.span?.end ?: call.span.end
+        var end = close?.span?.end ?: call.span.end
         val body = BlockStatement(statements, Span(source, keyword.span.start, end))
+
+        // `try b() { a, b -> ... }: label` installs its handler into the group `label` instead of
+        // declaring one of its own. The name is what ties this body to the `blep` branches above it:
+        // they become the generated `dispatch`'s `if`s, and this body becomes its `else`.
+        var groupName: String? = null
+        var groupNameSpan: Span? = null
+        if (at(TokenType.COLON)) {
+            advance()
+            skipNestedNewlines()
+            val name = expect(
+                TokenType.IDENTIFIER,
+                "expected the handler group's name after ':' but found ${current().describe()}",
+            )
+            if (name != null) {
+                groupName = name.text
+                groupNameSpan = name.span
+                end = name.span.end
+            }
+        }
 
         return ExtractorTryParts(
             call = call,
             parameters = parameters,
             body = body,
             arrowSpan = arrowSpan,
+            groupName = groupName,
+            groupNameSpan = groupNameSpan,
             span = Span(source, keyword.span.start, end),
         )
     }

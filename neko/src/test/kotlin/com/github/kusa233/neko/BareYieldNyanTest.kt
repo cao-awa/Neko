@@ -299,7 +299,7 @@ class BareYieldNyanTest {
      * A handler that says nothing at all is the same as a bare `nyan`: the site gets the default.
      *
      * The `{ ... }` block may simply end without `nyan` or `yield`. That is no longer a diagnostic
-     * against the handler — the generated `scratching` answers `null` after the body — and the site
+     * against the handler — the generated `dispatch` answers `null` after the body — and the site
      * converts it exactly as it would a bare `nyan`.
      */
     @Test

@@ -101,14 +101,15 @@ class EmitTest {
     }
 
     /**
-     * A `try`'s `{ ... }` block becomes `scratching` on a class of its own.
+     * A `try`'s `{ ... }` block becomes `dispatch` on a class of its own.
      *
      * It used to be a `static` method named after the function holding the `try`, found by matching
      * the emit signature across the whole program. It is now a *value*: the `try` builds one and
      * hands it to the call it wraps, which is what lets several `try` blocks answer the same clause.
      *
-     * The descriptor is the interface's, not the body's: `ScratchHandlerN.scratching` takes `Object`s
-     * and answers one, so the box is where the types are erased and refilled per site.
+     * The descriptor is the interface's, not the body's: `ScratchHandlerN.dispatch` takes `Object`s
+     * and answers one, so the box is where the types are erased and refilled per site. The trailing
+     * `Enum` is the signal a `blep` branch is selected by; a `scratch` that names none passes `null`.
      */
     @Test
     fun `a try's handler is a class implementing the clause's interface`() {
@@ -120,8 +121,8 @@ class EmitTest {
 
         val methods = methodDescriptors(result.classes.getValue(handlerClass))
         assertEquals(
-            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            methods["scratching"],
+            "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Enum;)Ljava/lang/Object;",
+            methods["dispatch"],
             "the handler implements the two-value interface it was given",
         )
     }
@@ -212,8 +213,8 @@ class EmitTest {
         val handlerClass = result.classes.keys.firstOrNull { it.contains("\$ScratchHandler\$") }
             ?: error("no handler class was generated: ${result.classes.keys}")
         assertEquals(
-            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            methodDescriptors(result.classes.getValue(handlerClass))["scratching"],
+            "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Enum;)Ljava/lang/Object;",
+            methodDescriptors(result.classes.getValue(handlerClass))["dispatch"],
             "an interface method has one signature however the body is written",
         )
     }
@@ -560,7 +561,7 @@ class EmitTest {
      *
      * This used to be an error — "declares an 'emit' clause but can never reach a 'try' handler" —
      * and the check was retired because it enforced the wrong rule. Whether a function *can* leave by
-     * scratching is a property of its declared signature, which is what a caller matches on; a body
+     * dispatching is a property of its declared signature, which is what a caller matches on; a body
      * that never scratches is simply a function that always answers normally, which is a perfectly
      * good implementation of a clause some other function may need.
      *
@@ -727,7 +728,7 @@ class EmitTest {
 
     @Test
     fun `an emit clause boxes its values at the handler boundary`() {
-        // The handler interface is `scratching(Object, Object): Object`, so a `long` and a `double`
+        // The handler interface is `dispatch(Object, Object, Enum): Object`, so a `long` and a `double`
         // are boxed on the way in and unboxed into the body's own locals. That is the price of one
         // interface family serving every clause of the same arity, and it is worth pinning: a body
         // still writes `a + b` against the declared types, and the box never reaches the source.

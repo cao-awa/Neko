@@ -1,5 +1,5 @@
 locate com.github.kusa233.neko.stdlib.emitter.handler
 
 interface ScratchHandler6 {
-    fun scratching(arg0: Object, arg1: Object, arg2: Object, arg3: Object, arg4: Object, arg5: Object): Object
+    fun dispatch(arg0: Object, arg1: Object, arg2: Object, arg3: Object, arg4: Object, arg5: Object, var6: Enum): Object
 }

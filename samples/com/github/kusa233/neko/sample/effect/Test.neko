@@ -1,0 +1,52 @@
+locate com.github.kusa233.neko.sample.effect
+
+class Test {
+    static {
+        fun main() {
+            a()
+        }
+
+        fun a() {
+            try pre: label // The try pre define a handler group, 'label' is the name
+
+            // ADD handler
+            blep: label NekoSignal.ADD { a, b ->
+                nyan a + b
+            }
+
+            // MULTIPLY handler
+            blep: label NekoSignal.MULTIPLY { a, b ->
+                nyan a * b
+            }
+
+            // MINUS handler
+            blep: label NekoSignal.MINUS { a, b ->
+                nyan a - b
+            }
+
+            // Real try-handler block
+            try b() { a, b ->
+                nyan 100
+            }: label
+        }
+
+        fun b() {
+            c()
+        } emit [int, int] -> int
+
+        fun c() {
+            addResult: int = scratch 10, 5 signal NekoSignal.ADD // Should be 15
+            println(addResult) // 15
+            multiplyResult: int = scratch 10, 10 signal NekoSignal.MULTIPLY // Should be 100
+            println(multiplyResult) // 100
+            minusResult: int = scratch 10, 5 signal NekoSignal.MINUS // Should be 5
+            println(minusResult) // 5
+        } emit [int, int] -> int
+    }
+}
+
+miao class NekoSignal {
+    ADD,
+    MULTIPLY,
+    MINUS,
+}

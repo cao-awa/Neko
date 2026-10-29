@@ -257,8 +257,12 @@ class FunctionSymbol(
      * What `emit [...] -> R` promises its handlers answer.
      *
      * A `try` handler for this function checks every `nyan` against this type, and a `scratch` inside
-     * a function declaring the same clause is worth exactly it. `null` means the declaration wrote no
-     * result; analysis reports that as an error and this symbol is then only a recovery shape.
+     * a function declaring the same clause is worth exactly it. A clause that wrote no result — and
+     * one that wrote `-> void` — is [com.github.kusa233.neko.types.VoidType]: the handler answers
+     * nothing, so a valued `nyan` is refused and a `scratch` site is a statement rather than a value.
+     *
+     * `null` only when no clause was declared at all, or after an unresolved one; [hasEmitClause]
+     * tells the two apart.
      */
     val emitResultType: NekoType? = null,
     /** `true` when the declaration carried an `emit` clause, even an empty one such as `emit []`. */

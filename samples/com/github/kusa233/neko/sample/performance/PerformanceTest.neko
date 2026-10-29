@@ -9,7 +9,7 @@ class PerformanceTest {
             for (i: int = 0; i < 10000000; i++) {
                 ExceptionMapping.main()
             }
-            println("Test used time " + (System.currentTimeMillis() - start) + "ms")
+            println("Test.neko used time " + (System.currentTimeMillis() - start) + "ms")
         }
     }
 }

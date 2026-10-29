@@ -10,7 +10,7 @@ locate com.github.kusa233.neko.sample.effect
  */
 class ScratchHandler {
     static {
-        fun scratching() {
+        fun dispatch() {
             scratch 1, 2
         } emit [int, int] -> int
     }
