@@ -20,8 +20,17 @@ class InstanceSample {
             println(var1::generic[0]) // int
             println(var4::generic[0]) // class java.lang.String
 
+            // The JDK was never compiled by this program, so there is no declaration to check
+            // `add` against — reflection answers instead. The erased signature says `Object`,
+            // which every value fits, so the *written* `int` is what the argument is held to:
+            // `add("awa")` is refused here, and the `int` is boxed on the way in exactly as a
+            // Java call site would.
             list: ArrayList<int> = ArrayList<int>()
+            println(list.isEmpty())
+            list.add(123)
             println(list)
+            println(list.size()) // 1
+            println(list.get(0)) // 123 — read back out of the list
             println(list::generic[0])
         }
 

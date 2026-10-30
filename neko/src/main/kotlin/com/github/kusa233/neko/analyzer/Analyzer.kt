@@ -2340,6 +2340,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             return
         }
         checkTypeArguments(expression, declared, name)
+        // The arguments were checked against the constructor just above, so their types are known
+        // and the written arguments can now be held against them.
+        checkTypeArgumentFits(expression, declared, name, expression.resolvedConstructor)
     }
 
     /**
@@ -2351,9 +2354,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * the wrong number — "`Box` declares 1 type parameter (T) but 2 type arguments were provided" —
      * and an argument that names no type at all, which [resolveType] reports at the name itself.
      *
-     * What is deliberately *not* checked is whether an argument "fits": after erasure every
-     * parameter is `Object`, so every type argument fits by construction. Pretending otherwise would
-     * mean inventing constraints the language does not have.
+     * This is about the `<...>` on its own, as a claim about the callee. What that claim says about
+     * the values the call passes is a separate question — one erasure makes easy to miss but does
+     * not make meaningless — and it is [checkTypeArgumentFits] that reads them together.
      */
     private fun checkTypeArguments(expression: CallExpression, declared: List<String>, name: String) {
         val written = expression.typeArguments
@@ -2378,6 +2381,85 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 "type argument${if (written.size == 1) " was" else "s were"} provided",
             written.first().span.through(written.last().span),
         )
+    }
+
+    /**
+     * Holds the type arguments a call site wrote against the values the call actually passes.
+     *
+     * Erasure is what makes this look unnecessary: `fun <T> id(value: T)` compiles to `id(Object)`,
+     * so an `int` and a `string` are equally welcome to the JVM. That is a fact about the class
+     * file, not about the source. A call that writes `id<int>("text")` has said two things that
+     * cannot both be true — that `T` is `int`, and that the value handed to a `T` is a `string` —
+     * and erasure is exactly why nothing downstream would notice: the value is stored as an
+     * `Object` and only turns back into an `int` at a use site, by which point the failure has
+     * moved a long way from the mistake.
+     *
+     * The check is deliberately narrow about *where* it applies. Only a parameter that is the type
+     * parameter itself — `value: T` — states the argument's type outright. `value: Box<T>` says
+     * only that the argument is a box of *something*, and Neko has no inference, so there is no
+     * `T` to compare a written argument against and the position is passed over rather than
+     * guessed at. `value: T?` is left out for a second reason: it admits `null`, whose type is
+     * whatever its context says, so the two would disagree about the one value the position exists
+     * to allow.
+     *
+     * A literal argument is passed over as well. A literal's whole nature is to take its type from
+     * the place it is written, and the place it is written here has already been erased to
+     * `Object`, so the type it came out with is not evidence about the type argument. Exempting it
+     * is what keeps `id<byte>(1)` meaning what it looks like. Which literal belongs to which type
+     * is the literal analysers' question, asked where the literal is written.
+     *
+     * Nothing here repeats [checkArguments]: that has already compared each argument against its
+     * parameter's erased type at every site that reaches this. What is reported is the narrower
+     * disagreement erasure hides — an argument that fits `Object` and does not fit the type the
+     * call said `Object` stands for.
+     */
+    private fun checkTypeArgumentFits(
+        expression: CallExpression,
+        declared: List<String>,
+        name: String,
+        symbol: FunctionSymbol?,
+    ) {
+        // `null` is a callee whose parameters this pass cannot see at all, not a mismatch.
+        val parameters = symbol?.declaration?.parameters ?: symbol?.constructor?.parameters ?: return
+
+        val written = expression.typeArguments
+        // Nothing written is the erased spelling, and the ordinary one: the call left the
+        // arguments to inference. A wrong *number* is [checkTypeArguments]'s own complaint, and
+        // pairing the lists up when they differ in length would blame an argument for it.
+        if (written.isEmpty() || written.size != declared.size) return
+
+        val writtenTypes = expression.resolvedTypeArguments
+        if (writtenTypes.size != written.size) return
+
+        parameters.forEachIndexed { index, parameter ->
+            val argument = expression.arguments.getOrNull(index) ?: return@forEachIndexed
+            val parameterName = bareTypeParameterOf(parameter.declaredType, declared)
+                ?: return@forEachIndexed
+            if (argument is IntegerLiteral || argument is CharLiteral || argument is DoubleLiteral) {
+                return@forEachIndexed
+            }
+            val expected = writtenTypes[declared.indexOf(parameterName)]
+            val actual = argument.resolvedType ?: return@forEachIndexed
+            if (isAssignable(actual, expected)) return@forEachIndexed
+            diagnostics.error(
+                "argument ${index + 1} of '$name' is declared as $parameterName, which is " +
+                    "${expected.displayName} here, but has type ${actual.displayName}",
+                argument.span,
+            )
+        }
+    }
+
+    /**
+     * The type parameter [reference] names outright, or `null` when it says something else.
+     *
+     * `T` is the only shape that states a parameter's type is the type argument. `T?` admits one
+     * more value, and `Box<T>` or `[T] -> U` say the argument merely *contains* one — a claim a
+     * written argument cannot be held to without inference deciding what is inside.
+     */
+    private fun bareTypeParameterOf(reference: TypeReference, declared: List<String>): String? {
+        val named = reference as? NamedTypeReference ?: return null
+        if (named.arguments.isNotEmpty()) return null
+        return named.name.takeIf { it in declared }
     }
 
     /**
@@ -4132,6 +4214,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 checkMemberReachable(selected, callee.span)
                 checkCallableNormally(selected, callee.span)
                 checkTypeArguments(expression, selected.typeParameters, callee.name)
+                // [selectOverload] has already analysed every argument, so their types are known
+                // here and the written arguments can be held against them.
+                checkTypeArgumentFits(expression, selected.typeParameters, callee.name, selected)
                 // A declared function is resolved by name, so there is no value that could be absent.
                 if (expression.isSafeCall) {
                     reportRedundantSafeCall(
@@ -4357,13 +4442,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
         val classSymbol = classOf(present)
         if (classSymbol == null) {
-            for (argument in expression.arguments) analyzeExpression(argument)
-            diagnostics.error(
-                "cannot call '${callee.memberName}': ${present.displayName} is not declared " +
-                    "in this file, so its members cannot be checked",
-                callee.memberSpan,
-            )
-            return ErrorType
+            // A JDK type: the program never compiled it, so there is no declaration to check against.
+            // Reflection answers instead — but only once the receiver has been found to be a value of
+            // a class that really exists. `platformInstanceCall` reports the rest.
+            val returned = platformInstanceCall(expression, callee, present)
+            return if (safe) nullableResultOf(returned) else returned
         }
         val returned =
             resolveMemberCall(expression, callee, classSymbol, present.displayName, viaClass = false)
@@ -4457,6 +4540,9 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         if (viaClass) checkMemberReachable(candidate, callee.memberSpan)
         checkCallableNormally(candidate, callee.memberSpan)
         checkArguments(expression, candidate.parameterTypes, candidate.name)
+        // Only now are the argument types known: `checkTypeArguments`, above, sees the `<...>` but
+        // runs before `checkArguments` has typed the values.
+        checkTypeArgumentFits(expression, candidate.typeParameters, candidate.name, candidate)
         return candidate.returnType
     }
 
@@ -5403,17 +5489,27 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         return returnType
     }
 
-    /** Wraps a reflected [method] as the symbol the emitter dispatches on. */
+    /**
+     * Wraps a reflected [method] as the symbol the emitter dispatches on.
+     *
+     * [parameterTypes] is what the call is *checked and converted against*, and for a JDK method that
+     * has to be the reflected signature rather than the argument types: `list.add(1)` passes an `int`
+     * where the JDK declares `add(Object)`, and the boxing is the difference between a call the JVM
+     * resolves and one it rejects. A static call keeps passing [arguments] because its emitter takes
+     * the descriptor from [BuiltinFunction.jvmDescriptor] and never needs the conversion decision.
+     */
     private fun platformFunction(
         callee: MemberAccessExpression,
         owner: ClassType,
         method: java.lang.reflect.Method,
         arguments: List<NekoType>,
         returnType: NekoType,
+        parameterTypes: List<NekoType> = arguments,
+        dispatchAsInterface: Boolean = false,
     ): FunctionSymbol = FunctionSymbol(
         name = callee.memberName,
         span = callee.memberSpan,
-        parameterTypes = arguments,
+        parameterTypes = parameterTypes,
         returnType = returnType,
         enclosingClass = null,
         declaration = null,
@@ -5422,8 +5518,244 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             jvmName = method.name,
             jvmDescriptor = descriptorOfReflected(method),
             receiverIsSystemOut = false,
+            dispatchAsInterface = dispatchAsInterface,
         ),
     )
+
+    /**
+     * `obj.member(...)` where `obj` is a JDK type the program does not declare.
+     *
+     * The instance counterpart of [platformStaticCall], and it exists for the same reason: the
+     * program never compiled `java.util.ArrayList`, so there is no `ClassSymbol` to check `add`
+     * against, and refusing the call told the reader nothing they could act on — the class is real,
+     * its method is real, and only the *declaration* is missing. Reflection answers instead.
+     *
+     * The arguments are converted against the **reflected** parameter types rather than the argument
+     * types. That is what makes `add(1)` work: the JDK declares `add(Object)`, so the `int` is boxed
+     * on the way in, exactly as a Java call site would.
+     */
+    private fun platformInstanceCall(
+        expression: CallExpression,
+        callee: MemberAccessExpression,
+        owner: ClassType,
+    ): NekoType {
+        val arguments = expression.arguments.map { analyzeExpression(it) }
+        if (arguments.any { it.isError }) return ErrorType
+
+        val reflected = runCatching {
+            Class.forName(owner.internalName.replace('/', '.'), false, javaClass.classLoader)
+        }.getOrNull()
+        if (reflected == null) {
+            diagnostics.error(
+                "cannot call '${callee.memberName}': ${owner.displayName} is not declared in this " +
+                    "file, so its members cannot be checked",
+                callee.memberSpan,
+            )
+            return ErrorType
+        }
+
+        // An instance method only: a static one needs no object, and the receiver here is a value.
+        val candidates = reflected.methods.filter {
+            !java.lang.reflect.Modifier.isStatic(it.modifiers) && it.name == callee.memberName
+        }
+        if (candidates.isEmpty()) {
+            diagnostics.error(
+                "${owner.simpleName} has no member named '${callee.memberName}'",
+                callee.memberSpan,
+                unresolved = true,
+            )
+            return ErrorType
+        }
+
+        // Two passes, and the order is what keeps overload choice reproducible. An argument that
+        // matches a parameter *exactly* is preferred, which is what settles `Thread.sleep(1L)` on
+        // `sleep(long)` instead of `sleep(Duration)` no matter what order reflection reports them in.
+        // Only when nothing matches exactly is boxing allowed — `list.add(1)` against `add(Object)` —
+        // because that is a conversion Neko performs everywhere else rather than a guess.
+        //
+        // When the receiver names type arguments, the program has said more than the erased signature
+        // does, and the extra thing has to be honoured: `add` takes `E`, `E` erases to `Object`, and
+        // `Object` accepts every value there is — so `ArrayList<int>.add("awa")` passed the erased
+        // check and was then boxed into a slot the descriptor calls `Object` while every `get`
+        // promises an `int`. The written question is asked of the *candidates*, not in place of the
+        // erased ones: the two passes above still decide which overload is emitted, so `remove(0)` on
+        // a `List<int>` stays `remove(int)` — its `Object` overload takes the argument just as
+        // happily, and settling that by reflection's ordering is the hazard the passes exist to
+        // remove. Filtering first and passing over the survivors keeps both properties.
+        val bound = boundTypeArguments(reflected, owner)
+        val eligible = candidates.filter { method ->
+            bound == null || platformArgumentsFit(method, arguments, strict = true, substituted = bound)
+        }
+        val chosen = eligible.firstOrNull { method -> platformArgumentsFit(method, arguments, strict = true) }
+            ?: eligible.firstOrNull { method -> platformArgumentsFit(method, arguments, strict = false) }
+        if (chosen == null) {
+            // Distinguish "no overload of this shape" from "the shape is there but the receiver's own
+            // type arguments refuse the value": the second is the mistake the code actually made, and
+            // telling the programmer to look for another overload would send them nowhere.
+            if (bound != null) {
+                val erased = candidates.firstOrNull { platformArgumentsFit(it, arguments, strict = true) }
+                    ?: candidates.firstOrNull { platformArgumentsFit(it, arguments, strict = false) }
+                if (erased != null) {
+                    reportWrittenArgumentMismatch(expression, callee, erased, arguments, bound)
+                    return ErrorType
+                }
+            }
+            val wanted = arguments.joinToString(", ") { it.displayName }
+            diagnostics.error(
+                "${owner.simpleName}.${callee.memberName} has no overload taking ($wanted); it " +
+                    "declares ${candidates.joinToString(", ") { "(${it.parameterTypes.joinToString(", ") { p -> p.simpleName }})" }}",
+                callee.memberSpan,
+            )
+            return ErrorType
+        }
+
+        val returnType = typeOfReflected(chosen.returnType)
+        val symbol = platformFunction(
+            callee = callee,
+            owner = owner,
+            method = chosen,
+            arguments = arguments,
+            returnType = returnType,
+            parameterTypes = chosen.parameterTypes.map { typeOfReflected(it) },
+            dispatchAsInterface = reflected.isInterface,
+        )
+        callee.resolvedFunction = symbol
+        callee.resolvedType = symbol.type
+        // The receiver is a value here — that is the whole difference from `platformStaticCall` — so
+        // the emitter evaluates it and dispatches on it. Recorded on the call so `emitCall` sees the
+        // same shape a Neko instance call records.
+        expression.instanceReceiver = callee.receiver
+        expression.instanceMethod = symbol
+        return returnType
+    }
+
+    /**
+     * Whether every argument of [method] is acceptable, in one of the three strengths the caller
+     * needs.
+     *
+     * The strict pass is [argumentFits] alone: a primitive must be the parameter's own box, which is
+     * what keeps overload selection independent of reflection's ordering. The relaxed pass exists for
+     * `list.add(1)`, where the JDK declares `add(Object)` and the `int` has to be boxed on the way in
+     * — the same conversion `x: Object = 1` already performs.
+     *
+     * Both of those read the **erased** signature, because that is what the call is emitted against.
+     * [substituted] asks the other question — did the program mean this argument for this slot? — by
+     * reading `genericParameterTypes` and replacing each type variable with the argument the receiver
+     * was written with. `ArrayList<int>` therefore holds `add` to `int` rather than to the `Object`
+     * its `E` erases to, and `add("awa")` is refused instead of quietly unboxed to a lie. The
+     * comparison there is [isAssignable] rather than [argumentFits] because both sides are *written*
+     * types, not a value against a JVM slot: no boxing is being decided, only whether the program
+     * meant this. A parameter naming no type variable is compared as itself, and one whose variable
+     * cannot be resolved is passed over rather than refused — silence beats a wrong complaint.
+     *
+     * That third strength **narrows** the field; it never picks the winner. The caller filters the
+     * candidates with it and then runs the other two over the survivors, so a method that survives
+     * the written check still competes on its erased signature. `remove(0)` on a `List<int>` is why:
+     * `remove(int)` and `remove(Object)` both fit an `int` written against an `E`, and only the strict
+     * pass prefers the exact one. Answering with the substituted pass alone would hand that decision
+     * back to reflection's ordering.
+     *
+     * Relaxing is only sound as far as **boxing** goes, so it is bounded by the box itself: the
+     * parameter must be able to hold `Integer` for an `int` argument, and not merely be a reference.
+     * That distinction is what stops `f(1L)` from binding to a `Duration` parameter when nothing
+     * matched exactly — `Duration` holds no `Long`, and emitting that call would box a `long` onto a
+     * stack slot the verifier expects to be a `Duration`, which is exactly the class-writer failure
+     * the strict pass was introduced to prevent. Because the relaxed pass only runs when the strict
+     * one found nothing, no overload choice depends on reflection's ordering.
+     */
+    private fun platformArgumentsFit(
+        method: java.lang.reflect.Method,
+        arguments: List<NekoType>,
+        strict: Boolean,
+        substituted: Map<java.lang.reflect.TypeVariable<*>, NekoType>? = null,
+    ): Boolean {
+        if (method.parameterCount != arguments.size) return false
+        if (substituted != null) {
+            return method.genericParameterTypes.withIndex().all { (index, parameter) ->
+                val declared = substitutedTypeOf(parameter, substituted) ?: return@all true
+                isAssignable(arguments[index], declared)
+            }
+        }
+        return method.parameterTypes.withIndex().all { (index, parameter) ->
+            val argument = arguments[index]
+            if (argumentFits(argument, parameter)) return@all true
+            if (strict) return@all false
+            val box = boxOf(argument) ?: return@all false
+            parameter.isAssignableFrom(box)
+        }
+    }
+
+    /**
+     * The type arguments [owner] was written with, keyed by the type variables [reflected] declares.
+     *
+     * `null` when the receiver names none — the erased spelling `ArrayList` — because then the
+     * program has said nothing to hold the call to, and the erased signature is all there is.
+     */
+    private fun boundTypeArguments(
+        reflected: Class<*>,
+        owner: ClassType,
+    ): Map<java.lang.reflect.TypeVariable<*>, NekoType>? {
+        val declared = reflected.typeParameters
+        if (owner.arguments.isEmpty() || declared.size != owner.arguments.size) return null
+        return declared.zip(owner.arguments).toMap()
+    }
+
+    /**
+     * The type a reflected [type] describes once [bound] replaces the type variables with what the
+     * program wrote, or `null` when that cannot be said — a method's own `<U>`, a wildcard, an
+     * array whose component depends on one.
+     *
+     * A method inherited from a generic superclass names *that* class' variable — `ArrayList` and
+     * `AbstractList` each declare an `E`, and they are different `TypeVariable`s — so a variable
+     * missing from the map is matched by name before giving up. `ArrayList<int>` binds both to
+     * `int`, which is what the inherited call site meant just as much as the declared one.
+     */
+    private fun substitutedTypeOf(
+        type: java.lang.reflect.Type,
+        bound: Map<java.lang.reflect.TypeVariable<*>, NekoType>,
+    ): NekoType? {
+        if (type is java.lang.reflect.TypeVariable<*>) {
+            bound[type]?.let { return it }
+            return bound.entries.firstOrNull { it.key.name == type.name }?.value
+        }
+        if (type is Class<*>) return typeOfReflected(type)
+        if (type is java.lang.reflect.ParameterizedType) {
+            val raw = type.rawType as? Class<*> ?: return null
+            val bare = typeOfReflected(raw) as? ClassType ?: return null
+            val arguments = type.actualTypeArguments.map { substitutedTypeOf(it, bound) ?: return null }
+            return parameterisedType(bare, arguments)
+        }
+        return null
+    }
+
+    /**
+     * Reports the argument that breaks the receiver's own type arguments, if one does.
+     *
+     * Only the caller's [chosen] overload is described, and only after every candidate was found to
+     * disagree with the written arguments — so the sentence names the call the code generator would
+     * have emitted, and one bad argument does not get blamed on an overload that another argument
+     * had already ruled out.
+     */
+    private fun reportWrittenArgumentMismatch(
+        expression: CallExpression,
+        callee: MemberAccessExpression,
+        chosen: java.lang.reflect.Method,
+        arguments: List<NekoType>,
+        bound: Map<java.lang.reflect.TypeVariable<*>, NekoType>,
+    ) {
+        for ((index, parameter) in chosen.genericParameterTypes.withIndex()) {
+            val expected = substitutedTypeOf(parameter, bound) ?: continue
+            val actual = arguments.getOrNull(index) ?: continue
+            if (isAssignable(actual, expected)) continue
+            val declared = (parameter as? java.lang.reflect.TypeVariable<*>)?.name ?: expected.displayName
+            diagnostics.error(
+                "argument ${index + 1} of '${callee.memberName}' is declared as $declared, which " +
+                    "is ${expected.displayName} here, but has type ${actual.displayName}",
+                expression.arguments.getOrNull(index)?.span ?: callee.memberSpan,
+            )
+            return
+        }
+    }
 
     /**
      * Whether a value of Neko type [argument] may be passed where the JVM declares [parameter].
@@ -5482,7 +5814,37 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         val primitive = parameterPrimitive(type)
         if (primitive != null) return primitive
         if (type == java.lang.Void.TYPE) return VoidType
-        return ClassType(type.name.replace('.', '/'), type.simpleName)
+        // A built-in reference type has to be the canonical instance, not a fresh `ClassType` that
+        // merely names the same class. The emitter decides boxing by *identity* — `ObjectType` is
+        // what a primitive boxes into — so a `ClassType("java/lang/Object")` built here would look
+        // like a different type and `list.add(1)` would reach the JVM with a primitive on a stack
+        // slot declared `Object`.
+        return referenceBuiltinOf(type) ?: ClassType(type.name.replace('.', '/'), type.simpleName)
+    }
+
+    /**
+     * The canonical built-in instance standing for the reflected [type], or `null` for any other
+     * class.
+     *
+     * Only the three reference built-ins answer, and the wrapper classes deliberately do **not**,
+     * even though [BuiltinTypes.byName] maps `Integer` to `IntType`. That table answers a different
+     * question: which type a program *writes*. A program that writes `x: Integer` means an `int`,
+     * because Neko has no separate wrapper types. Reflection is the other direction — it reports what
+     * the class file says — and there `java.lang.Integer` is a reference. `Integer.valueOf(7)`
+     * returns the wrapper, the stack holds a reference, and typing that result `int` would tell the
+     * emitter to treat it as a primitive: no unboxing would be inserted, and the next call on the
+     * value would reach the JVM with a reference where the descriptor promised an `int`. The class is
+     * therefore left as a [ClassType], which is what it is.
+     *
+     * `String`, `Object` and `Throwable` are the opposite case: they *are* the classes those types
+     * are carried as, so no conversion is wanted and identity is exactly right — and required, since
+     * the emitter compares `ObjectType` by identity to decide boxing.
+     */
+    private fun referenceBuiltinOf(type: Class<*>): NekoType? = when (type.name) {
+        "java.lang.String" -> StringType
+        "java.lang.Object" -> ObjectType
+        "java.lang.Throwable" -> ThrowableType
+        else -> null
     }
 
     /** The Neko primitive matching a JVM primitive class, or `null` when [type] is a reference. */

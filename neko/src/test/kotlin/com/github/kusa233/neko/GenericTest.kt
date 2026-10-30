@@ -163,9 +163,9 @@ class GenericTest {
      * Writing the wrong number of type arguments is refused, at each of the three places one may be
      * written: a construction, a bare call, and a member call.
      *
-     * The count is the only thing there is to check — after erasure every parameter is `Object`, so
-     * every type argument fits. A silent acceptance would let `Box<int, int>` read as if it meant
-     * something.
+     * The count is one of two things there is to check; the other is whether the value passed
+     * agrees with the argument written, which [a type argument must agree with the value passed]
+     * covers. A silent acceptance would let `Box<int, int>` read as if it meant something.
      */
     @Test
     fun `the number of type arguments must match the declaration`() {
@@ -202,6 +202,104 @@ class GenericTest {
             messages.any { "'plain' declares no type parameters but 1 type argument" in it },
             "expected a non-generic callee to be checked: $messages",
         )
+    }
+
+    /**
+     * A type argument that disagrees with the value the call passes is refused, at each of the three
+     * places one may be written: a construction, a bare call, and a member call.
+     *
+     * Erasure is what hides this: `id<int>("wrong")` compiles to `id(Object)` and runs, storing a
+     * `string` where the source said `int`. The value only turns back into an `int` where it is
+     * used, which may be nowhere near the call, so the mistake is reported here where it was made.
+     *
+     * The sentence names the parameter as well as the written argument, because "argument 1 has
+     * type string" on its own would say nothing: after erasure a `string` fits the descriptor
+     * perfectly. What it does not fit is the claim the `<...>` made about what `T` is.
+     */
+    @Test
+    fun `a type argument must agree with the value passed`() {
+        val result = TestSupport.compile(
+            program(
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            Box<int>(\"wrong\")",
+                "            id<int>(\"wrong\")",
+                "            n: int = 1",
+                "            holder: Holder = Holder(1)",
+                "            holder.take<string>(n)",
+                "        }",
+                "",
+                "        fun <T> id(value: T): T { return value }",
+                "    }",
+                "}",
+                "",
+                "meow class Box<T>(val data: T) {",
+                "}",
+                "",
+                "meow class Holder(val tag: int) {",
+                "    fun <T> take(value: T) { println(value) }",
+                "}",
+            ),
+            name = "Generic.neko",
+        )
+        val messages = TestSupport.messages(result)
+        assertTrue(
+            messages.any {
+                "argument 1 of 'Box' is declared as T, which is int here, but has type string" in it
+            },
+            "expected the construction to be checked: $messages",
+        )
+        assertTrue(
+            messages.any {
+                "argument 1 of 'id' is declared as T, which is int here, but has type string" in it
+            },
+            "expected the bare call to be checked: $messages",
+        )
+        assertTrue(
+            messages.any {
+                "argument 1 of 'take' is declared as T, which is string here, but has type int" in it
+            },
+            "expected the member call to be checked: $messages",
+        )
+    }
+
+    /**
+     * The check passes over everything it cannot hold a value to.
+     *
+     * A literal takes its type from the place it is written, and the place it is written for a `T`
+     * has already been erased to `Object`, so the type a literal came out with says nothing about
+     * the written argument — holding it against one would make `id<byte>(1)` illegal. A call that
+     * writes no type arguments is the ordinary erased spelling, and no inference is being claimed
+     * either way.
+     *
+     * The rest are calls the check has to let through: the type argument matches the value, and a
+     * `Box<int>` argument matches a `Box<int>` type argument rather than merely being an `Object`.
+     */
+    @Test
+    fun `a type argument is not held against what cannot speak for it`() {
+        val result = TestSupport.compile(
+            program(
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            id<int>(1)",
+                "            id<byte>(1)",
+                "            id(\"no argument written\")",
+                "            id<string>(\"text\")",
+                "            id<Box<int>>(Box<int>(1))",
+                "        }",
+                "",
+                "        fun <T> id(value: T): T { return value }",
+                "    }",
+                "}",
+                "",
+                "meow class Box<T>(val data: T) {",
+                "}",
+            ),
+            name = "Generic.neko",
+        )
+        assertTrue(!result.hasErrors, "expected a clean compile: ${TestSupport.messages(result)}")
     }
 
     /**

@@ -49,6 +49,43 @@ class PlatformStaticTest {
         assertEquals(listOf("true", "3.5", "43"), run(program))
     }
 
+    /**
+     * A static method returning a **wrapper** is typed as the wrapper, not as the primitive beside it.
+     *
+     * `java.lang.Integer` and `int` are one type to a *program* — Neko has no separate wrapper types,
+     * so `x: Integer` means an `int` — but reflection answers the other question: what the class file
+     * declares. There `Integer.valueOf(int)` returns a reference, and canonicalising that to `int`
+     * made the value claim to be a primitive while the stack held an `Integer`. The failure surfaced
+     * one call later, as `Integer.valueOf(7).intValue()` being refused for a receiver with no members
+     * at all — `cannot call member 'intValue' on a value of type int`. Only `String`, `Object` and
+     * `Throwable` are carried *as* those classes and so can stay identity-compared; the wrappers are
+     * ordinary classes.
+     *
+     * The second half is the control: a method that genuinely returns a primitive must still be
+     * typed as one, or the fix would have traded one wrong answer for another.
+     */
+    @Test
+    fun `a static method returning a wrapper is typed as the wrapper`() {
+        val program = TestSupport.file(
+            "class Uses {",
+            "    static {",
+            "        fun main() {",
+            "            println(Integer.valueOf(7).intValue())",
+            "            i: int = Integer.parseInt(\"42\")",
+            "            println(i + 1)",
+            "        }",
+            "    }",
+            "}",
+        )
+
+        assertEquals(
+            emptyList(),
+            TestSupport.errors(TestSupport.compile(program)).map { it.message },
+            "a wrapper-returning JDK call should compile",
+        )
+        assertEquals(listOf("7", "43"), run(program))
+    }
+
     @Test
     fun `a static field of a JDK class is read by class name`() {
         // `System.out` is the one every program meets, because `println` is modelled on it. It is a

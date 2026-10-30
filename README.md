@@ -518,15 +518,25 @@ Main.neko:6:29: error: 'java.util' has no class named 'Hashmap'
 A package it does not describe is taken on the file's word, because a class compiled elsewhere cannot
 be checked and refusing it would make qualified names useless for the case they exist for.
 
-A JDK class' **static** members are resolved reflectively and dispatched against the reflected owner and
+A JDK class' members are resolved reflectively and dispatched against the reflected owner and
 descriptor; a call that matches no overload is refused and told what the class does declare. The class
 name is matched before its receiver is treated as a value, because there is no value there —and since
 Neko has no static-import syntax, `Cls.member` is the only spelling available for a static member.
 
-Only statics, though: an *instance* of a JDK class has no members here. `System.currentTimeMillis()` and
-`System.out` work, while `m.size()` on a `HashMap` is refused —the JDK was never compiled by the
-program, so there is no symbol to check a member against, and the message says exactly that rather than
-guessing. A value the platform hands over is usable as a value: pass it on, store it, print it.
+An **instance** of a JDK class has members too, resolved the same way:
+
+```neko
+import java.util
+
+list: ArrayList<int> = ArrayList<int>()
+list.add(1)                 // the JDK's add(Object), with the int boxed
+println(list.size())        // 1
+```
+
+The arguments are converted against the **reflected** parameter types, so `add(1)` boxes into
+`add(Object)` exactly as a Java call site would; a member the class does not declare is reported by
+name. Preferring an exact match before allowing that boxing is what keeps overload choice independent
+of the order reflection happens to report the methods in.
 
 ### Class
 

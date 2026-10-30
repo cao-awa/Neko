@@ -350,7 +350,8 @@ class FunctionSymbol(
      * error to use `invokevirtual` on one. A method declared in an interface — an abstract
      * `invoke`, or a default `extract` — is therefore dispatched differently from a class method.
      */
-    val ownerIsInterface: Boolean get() = enclosingClass?.isInterface == true
+    val ownerIsInterface: Boolean
+        get() = enclosingClass?.isInterface == true || builtin?.dispatchAsInterface == true
 
     override fun toString(): String =
         if (isConstructor) "constructor(${parameterTypes.joinToString(", ") { it.displayName }})"
@@ -367,6 +368,15 @@ class BuiltinFunction(
      * `GETSTATIC java/lang/System.out` before pushing the arguments.
      */
     val receiverIsSystemOut: Boolean,
+    /**
+     * `true` when a call must be dispatched with `invokeinterface` rather than `invokevirtual`.
+     *
+     * An ordinary Neko call can tell from the symbol's enclosing class. A JDK method has no
+     * `ClassSymbol` — the program never compiled the JDK — so the fact has to be carried here, from
+     * the reflected class: `List.add(...)` on a `List` receiver must be `invokeinterface`, and using
+     * `invokevirtual` on an interface is a verification error.
+     */
+    val dispatchAsInterface: Boolean = false,
 )
 
 /** A local variable, a function parameter, or a lambda parameter. */

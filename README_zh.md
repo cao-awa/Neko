@@ -454,13 +454,23 @@ Main.neko:6:29: error: 'java.util' has no class named 'Hashmap'
 JDK 不描述的包按文件自己说的算，因为在别处编译的类无法检查，拒绝它会让限定名在它本该解决的场景里
 完全没用。
 
-JDK 类的**静态**成员通过反射解析，并按反射出的 owner 和 descriptor 派发；没有一个重载匹配的调用
+JDK 类的成员通过反射解析，并按反射出的 owner 和 descriptor 派发；没有一个重载匹配的调用
 会被拒绝，并告诉你该类到底声明了什么。类名在接收者被当作值之前就先匹配，因为那里根本没有值——而且
 既然 Neko 没有静态导入语法，`Cls.member` 就是访问静态成员唯一可用的写法。
 
-但只有静态成员：JDK 类的**实例**在这里没有成员。`System.currentTimeMillis()` 和 `System.out` 可用，
-而对 `HashMap` 调 `m.size()` 会被拒绝——程序从未编译过 JDK，所以没有符号可供逐一检查成员，消息会
-直接说明这一点而不是猜测。平台交出来的值可以当作值使用：传出去、存起来、打印。
+JDK 类的**实例**同样有成员，也用同样的方式解析：
+
+```neko
+import java.util
+
+list: ArrayList<int> = ArrayList<int>()
+list.add(1)                 // JDK 的 add(Object)，int 被装箱
+println(list.size())        // 1
+```
+
+实参按**反射出的**参数类型转换，所以 `add(1)` 会装箱成 `add(Object)`，与 Java 调用点完全一致；
+类上没有声明的成员会按名字报错。先要求精确匹配、之后才允许这种装箱，是为了让重载选择不依赖反射
+报告方法的顺序。
 
 ### 决定重载的规则
 
