@@ -213,6 +213,16 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
     private var currentClass: ClassSymbol? = null
 
     /**
+     * The type parameters of the generic function whose signature or body is being analysed.
+     *
+     * Empty everywhere else. `resolveType` consults this together with [ClassSymbol.typeParameters],
+     * because `T` in `fun <T> f(value: T)` means the function's own parameter rather than any name
+     * the enclosing class happened to declare — and a name that is neither is still an ordinary type
+     * that has to resolve normally.
+     */
+    private var currentTypeParameters: List<String> = emptyList()
+
+    /**
      * Whether the "is `EmitYieldException` loadable?" diagnostic has already been considered.
      *
      * It is a property of the program rather than of any one `try`, so it is reported once however
@@ -657,6 +667,12 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
     private fun declareFunctions(declaration: ClassDeclaration, classSymbol: ClassSymbol) {
         for (function in declaration.functions) {
+            // A generic function's own names are visible in its signature and its body, and only
+            // there. Setting them at the head of the iteration is what makes `fun <T> f(value: T)`
+            // resolve `T` without a second notion of "what is in scope" reaching `resolveType`.
+            // Every path through the body sets it before reading it, so an early `continue` cannot
+            // leak one function's names into the next.
+            currentTypeParameters = function.typeParameters
             val parameterTypes = function.parameters.map { resolveType(it.declaredType) }
             val returnType = function.returnType?.let { resolveType(it) } ?: VoidType
             function.resolvedParameterTypes = parameterTypes
@@ -724,6 +740,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                     null
                 },
                 isAbstract = function.isAbstract,
+                typeParameters = function.typeParameters,
             )
             overloads += symbol
             function.symbol = symbol
@@ -737,6 +754,10 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 )
             }
         }
+
+        // The loop above left the last function's names installed; a class's other declarations are
+        // not generic, so they must not leak into what is resolved next.
+        currentTypeParameters = emptyList()
 
         if (declaration.isMeow) declareDerivedFunctions(declaration, classSymbol)
         if (declaration.isMiao) declareEnumFunctions(declaration, classSymbol)
@@ -1186,6 +1207,10 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         // Only a non-static member has an instance to reach its instance members through.
         implicitThisClass = if (symbol.isStatic) null else classSymbol
         forwardsRaise = false
+        // The body's own type parameters, so `value: T` inside `fun <T> f(value: T)` reads `Object`
+        // rather than being looked up as a class and reported unresolved.
+        val outerTypeParameters = currentTypeParameters
+        currentTypeParameters = function.typeParameters
         // A body starts holding nothing: whatever `purr` blocks surrounded the *declaration* are not
         // around the code that runs when it is called.
         heldPurrLocks.clear()
@@ -1236,6 +1261,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         popScope()
         currentFunction = null
         implicitThisClass = null
+        currentTypeParameters = outerTypeParameters
     }
 
     // -------------------------------------------------------------- statements
@@ -2274,6 +2300,76 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 "as 'try ${symbol.name}(...) { ... -> }' to declare the handler its 'scratch' sites " +
                 "look for",
             span,
+        )
+    }
+
+    /**
+     * The type-argument check a construction needs, which is stricter than a call's.
+     *
+     * A generic value *carries* its type arguments, so the object cannot be built without knowing
+     * them: the compiler writes a `Class[]` onto every instance, and a construction that named none
+     * would leave it empty. Since `value::generic` is the way to read that field back, an instance
+     * built without arguments would answer a question the source never asked — so the arguments are
+     * required here rather than defaulted to `Object`.
+     *
+     * A call to a generic *function* is different: it builds nothing and keeps nothing, so it may
+     * leave the arguments to inference and is checked by [checkTypeArguments] alone.
+     */
+    private fun checkConstructedTypeArguments(
+        expression: CallExpression,
+        classSymbol: ClassSymbol,
+        name: String,
+    ) {
+        val declared = classSymbol.typeParameters
+        if (declared.isEmpty()) {
+            // A non-generic class takes none, so writing some is the same mistake as before.
+            checkTypeArguments(expression, declared, name)
+            return
+        }
+
+        if (expression.typeArguments.isEmpty()) {
+            diagnostics.error(
+                "'$name' is generic, so its type arguments have to be written: " +
+                    "'$name<${declared.joinToString(", ") { "?" }}>(...)'",
+                expression.argumentListSpan,
+            )
+            return
+        }
+        checkTypeArguments(expression, declared, name)
+    }
+
+    /**
+     * Checks the `<...>` a call site wrote against the type parameters its callee declares.
+     *
+     * Neko erases type arguments, so they change nothing about the call: the descriptor is the one
+     * the declaration erases to, whether or not anything was written. They are still checked,
+     * because a reader who writes them means something by it. The two mistakes worth reporting are
+     * the wrong number — "`Box` declares 1 type parameter (T) but 2 type arguments were provided" —
+     * and an argument that names no type at all, which [resolveType] reports at the name itself.
+     *
+     * What is deliberately *not* checked is whether an argument "fits": after erasure every
+     * parameter is `Object`, so every type argument fits by construction. Pretending otherwise would
+     * mean inventing constraints the language does not have.
+     */
+    private fun checkTypeArguments(expression: CallExpression, declared: List<String>, name: String) {
+        val written = expression.typeArguments
+        if (written.isEmpty()) return
+
+        // Resolved once and kept, because the code generator has to name each argument as a class
+        // token and must not resolve it a second way.
+        expression.resolvedTypeArguments = written.map { resolveType(it) }
+        if (declared.size == written.size) return
+
+        val expected = if (declared.isEmpty()) {
+            "no type parameters"
+        } else {
+            "${declared.size} type parameter${if (declared.size == 1) "" else "s"} " +
+                declared.joinToString(", ", "(", ")")
+        }
+        diagnostics.error(
+            "'$name' declares $expected but ${written.size} " +
+                "type argument${if (written.size == 1) " was" else "s were"} provided",
+            written.first().span.through(written.last().span),
         )
     }
 
@@ -3325,6 +3421,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         is CallExpression -> analyzeCall(expression, expectedType)
         is LambdaExpression -> analyzeLambda(expression, expectedType)
         is MemberAccessExpression -> analyzeMemberAccess(expression)
+        is GenericAccessExpression -> analyzeGenericAccess(expression)
         is IndexExpression -> analyzeIndexRead(expression)
         is NyaExpression -> analyzeNyaExpression(expression, expectedType)
         is TryExpression -> analyzeTryExpression(expression)
@@ -4006,6 +4103,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 // receiver to invoke it on. Reporting it here keeps the two spellings consistent.
                 checkMemberReachable(selected, callee.span)
                 checkCallableNormally(selected, callee.span)
+                checkTypeArguments(expression, selected.typeParameters, callee.name)
                 // A declared function is resolved by name, so there is no value that could be absent.
                 if (expression.isSafeCall) {
                     reportRedundantSafeCall(
@@ -4306,6 +4404,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
 
         callee.resolvedFunction = candidate
         callee.resolvedType = candidate.type
+        checkTypeArguments(expression, candidate.typeParameters, callee.memberName)
         // A static call needs no receiver; an instance one does, and it must be evaluated once.
         if (!candidate.isStatic) expression.instanceReceiver = callee.receiver
         expression.instanceMethod = candidate
@@ -4395,6 +4494,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         checkArguments(expression, constructor?.parameterTypes.orEmpty(), "${callee.name}(...)")
         expression.resolvedConstructor = constructor
         expression.constructedType = type
+        checkConstructedTypeArguments(expression, classSymbol, callee.name)
         return type
     }
 
@@ -4819,6 +4919,63 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 !method.isSynthetic && !method.isBridge
         }
         return abstracts.singleOrNull()
+    }
+
+    /**
+     * `value::generic` — the type arguments the value was constructed with, as a `Class[]`.
+     *
+     * This is the only way to see a type argument at run time, because everything else erases it. The
+     * receiver's *static* type is what decides the answer: `Instance<int>` and `Instance<string>`
+     * share one class, so the arguments cannot come from the class — they come from the field each
+     * construction writes (see [GenericAccessExpression.GENERIC_FIELD_NAME]).
+     *
+     * A value whose type declares no type parameters has nothing to report, so asking is an error
+     * rather than an empty array: an empty array would compile an `Object` receiver into something
+     * that silently answers "no arguments", which reads as if the answer were real.
+     */
+    private fun analyzeGenericAccess(expression: GenericAccessExpression): NekoType {
+        val receiverType = analyzeExpression(expression.receiver)
+
+        if (expression.memberName != GenericAccessExpression.GENERIC_MEMBER) {
+            diagnostics.error(
+                "'::' answers the type arguments of a generic value, so the only name it takes " +
+                    "is '${GenericAccessExpression.GENERIC_MEMBER}', but '${expression.memberName}' " +
+                    "was written",
+                expression.memberSpan,
+                unresolved = true,
+            )
+            return ErrorType
+        }
+
+        if (receiverType.isError) return ErrorType
+
+        val classType = receiverType as? ClassType
+        if (classType == null) {
+            diagnostics.error(
+                "'::${GenericAccessExpression.GENERIC_MEMBER}' needs a value of a generic class, but " +
+                    "this one is of type ${receiverType.displayName}",
+                expression.memberSpan,
+            )
+            return ErrorType
+        }
+
+        // Only the value's *own* declaration counts. A subclass of a generic class would carry the
+        // parent's tokens, but Neko cannot currently write a generic supertype (`class Sub: Box<int>`
+        // parses as an interface list, and `Box<int>()` does not parse at all), so there is no way to
+        // pin the arguments and the parent's field would be absent. Refusing here is what keeps
+        // `::generic` from answering `null` for a value the language could not have parameterised.
+        val declaration = classBySimpleName(classType.simpleName)
+        if (declaration == null || declaration.typeParameters.isEmpty()) {
+            diagnostics.error(
+                "'${classType.displayName}' declares no type parameters, so it has no type arguments " +
+                    "to report",
+                expression.memberSpan,
+            )
+            return ErrorType
+        }
+
+        expression.ownerInternalName = declaration.jvmInternalName
+        return ArrayType(CLASS_TYPE)
     }
 
     /**
@@ -5770,8 +5927,15 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                 // A type parameter of the class being analysed stands for "whatever the caller
                 // passes", which is exactly `Object` once the JVM erases it. That is all the
                 // standard library's extractors need, since their bodies only forward values.
+                //
+                // A generic *function's* parameter means the same thing and is checked first, because
+                // it is the nearer declaration: `fun <T> f(value: T)` may be written inside
+                // `class Box<T>`, and the body's `T` is the function's.
                 val owner = currentClass
-                if (owner != null && reference.name in owner.typeParameters) {
+                if (
+                    reference.name in currentTypeParameters ||
+                    (owner != null && reference.name in owner.typeParameters)
+                ) {
                     ObjectType
                 } else {
                     // The arguments are kept on the type rather than discarded with the erasure:
@@ -6287,6 +6451,15 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         const val ITERATOR_INTERFACE = "java/util/Iterator"
 
         /**
+         * `java.lang.Class`, as the type `value::generic` answers.
+         *
+         * The elements of the array are `Class` because that is the one type that names a class at
+         * run time, and the JVM already carries it: no class file of the program's own is needed to
+         * hold a token.
+         */
+        val CLASS_TYPE: NekoType = ClassType("java/lang/Class", "Class")
+
+        /**
          * Simple name of the exception a `yield` throws, declared in the compiler's own standard library.
          *
          * Looked up among the program's classes, because the compiler compiles the library into every
@@ -6553,8 +6726,9 @@ private fun canThrowAssertion(expression: Expression): Boolean = when (expressio
     is ChainedComparisonExpression -> expression.operands.any { canThrowAssertion(it) }
 
     // Neither reading a member nor indexing an array checks anything, but the receiver and the index
-    // are expressions in their own right and may call.
+    // are expressions in their own right and may call. `::generic` is one more field read.
     is MemberAccessExpression -> canThrowAssertion(expression.receiver)
+    is GenericAccessExpression -> canThrowAssertion(expression.receiver)
     is IndexExpression -> canThrowAssertion(expression.array) || canThrowAssertion(expression.index)
 
     // Values already in hand, and a value being built.

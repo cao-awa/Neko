@@ -344,7 +344,7 @@ class Lexer(private val source: SourceFile, private val diagnostics: DiagnosticB
             '[' -> emit(TokenType.LEFT_BRACKET, start)
             ']' -> emit(TokenType.RIGHT_BRACKET, start)
             ',' -> emit(TokenType.COMMA, start)
-            ':' -> emit(TokenType.COLON, start)
+            ':' -> if (match(':')) emit(TokenType.COLON_COLON, start) else emit(TokenType.COLON, start)
             ';' -> emit(TokenType.SEMICOLON, start)
             '.' -> emit(TokenType.DOT, start)
             '?' -> emit(TokenType.QUESTION, start)

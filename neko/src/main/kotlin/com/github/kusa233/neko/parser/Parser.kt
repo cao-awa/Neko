@@ -290,35 +290,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             }
 
         // Type parameters, erased to `Object` at run time: `class Box<T>`.
-        val typeParameters = mutableListOf<String>()
-        if (at(TokenType.LESS)) {
-            advance()
-            skipNestedNewlines()
-            while (true) {
-                skipNestedNewlines()
-                val parameter = expect(
-                    TokenType.IDENTIFIER,
-                    "expected a type parameter name but found ${current().describe()}",
-                ) ?: break
-                if (typeParameters.any { it == parameter.text }) {
-                    error("duplicate type parameter '${parameter.text}'", parameter.span)
-                } else {
-                    typeParameters += parameter.text
-                }
-                skipNestedNewlines()
-                if (at(TokenType.COMMA)) {
-                    advance()
-                    continue
-                }
-                break
-            }
-            skipNestedNewlines()
-            expect(
-                TokenType.GREATER,
-                "expected '>' to close the type parameters of $kindWord '${nameToken.text}' but " +
-                    "found ${current().describe()}",
-            )
-        }
+        val typeParameters = parseTypeParameterNames("$kindWord '${nameToken.text}'")
 
         // A `meow class` states its fields here, and the list is the whole point of the form: it is
         // parsed into the fields and a constructor below. A `miao class` states them here for the
@@ -1005,6 +977,9 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
         }
         advance()
 
+        // Type parameters, erased to `Object` at run time: `fun <T> identity(value: T)`.
+        val typeParameters = parseTypeParameterNames("function")
+
         val nameToken = expect(TokenType.IDENTIFIER, "expected a function name but found ${current().describe()}")
             ?: run {
                 synchronizeToMember()
@@ -1056,6 +1031,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             returnType = returnType,
             body = body,
             modifiers = modifiers,
+            typeParameters = typeParameters,
             emitTypes = emitClause?.types.orEmpty(),
             emitResultType = emitClause?.resultType,
             hasEmitClause = emitClause != null,
@@ -2675,8 +2651,41 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
                     expression = parseArgumentList(expression, safeCall = true)
                 }
 
+                // `Name<int>(arguments)` — explicit type arguments before a call or construction.
+                //
+                // `<` is also the relational operator, so this has to be decided by lookahead rather
+                // than by position: only a `<...>` that closes into a `(` is a type argument list,
+                // and `a < b > (c)` — a comparison chain, however contrived — still parses as one.
+                at(TokenType.LESS) && isTypeArgumentHead(expression) && typeArgumentsEndAtCall() -> {
+                    val typeArguments = parseTypeArguments()
+                    expression = parseArgumentList(
+                        expression,
+                        safeCall = false,
+                        typeArguments = typeArguments,
+                    )
+                }
+
                 at(TokenType.LEFT_PAREN) -> {
                     expression = parseArgumentList(expression, safeCall = false)
+                }
+
+                // `value::generic` — the type arguments the value was built with.
+                //
+                // Parsed like a member access but kept as its own node, because it names something
+                // the class does not declare: the analyzer checks it against the *declaration's*
+                // type parameters, which a `.` member could never reach.
+                at(TokenType.COLON_COLON) -> {
+                    advance() // `::`
+                    val member = expect(
+                        TokenType.IDENTIFIER,
+                        "expected a name after '::' but found ${current().describe()}",
+                    ) ?: return expression
+                    expression = GenericAccessExpression(
+                        receiver = expression,
+                        memberName = member.text,
+                        memberSpan = member.span,
+                        span = Span(source, expression.span.start, member.span.end),
+                    )
                 }
 
                 at(TokenType.DOT) -> {
@@ -2740,13 +2749,78 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
     }
 
     /**
+     * Whether type arguments may follow [expression] at all.
+     *
+     * Only something that can *name* a class or function may be parameterised: `Box<int>(1)` and
+     * `holder.make<int>(1)`. A literal or an operator's result has nothing for `<...>` to apply to, so
+     * `1 < 2 > (3)` is left to the comparison chain it looks like — and, more to the point, this is
+     * what keeps the lookahead from being consulted for expressions that could never start a generic
+     * instantiation.
+     */
+    private fun isTypeArgumentHead(expression: Expression): Boolean =
+        expression is NameExpression || expression is MemberAccessExpression
+
+    /**
+     * Whether the `<` at the cursor opens a type-argument list that ends at an argument list.
+     *
+     * Walks tokens without consuming them and without reporting, because the answer decides *how* to
+     * parse rather than what to say. A `<...>` whose closing `>` is followed by `(` — or by `?(` — is
+     * type arguments; anything else (`a < b`, `a < b > c`) is the comparison chain.
+     *
+     * The tokens allowed between the brackets are exactly those a type is made of, so a `<` that is
+     * really less-than stops the scan at the first token that cannot appear in a type — an integer
+     * literal, a `+`, a `&&` — rather than running on to some later `>` and misreading the two
+     * comparisons as one parameterisation.
+     */
+    private fun typeArgumentsEndAtCall(): Boolean {
+        if (!at(TokenType.LESS)) return false
+        var depth = 0
+        var cursor = index
+        while (cursor < tokens.size) {
+            when (tokens[cursor].type) {
+                TokenType.LESS -> depth++
+                TokenType.GREATER -> {
+                    depth--
+                    if (depth == 0) {
+                        var next = cursor + 1
+                        while (next < tokens.size && tokens[next].type == TokenType.NEWLINE) next++
+                        if (next < tokens.size && tokens[next].type == TokenType.LEFT_PAREN) return true
+                        // `Box<int>?(1)` guards the construction the same way `f?(1)` guards a call.
+                        return next + 1 < tokens.size &&
+                            tokens[next].type == TokenType.QUESTION &&
+                            tokens[next + 1].type == TokenType.LEFT_PAREN
+                    }
+                }
+
+                TokenType.IDENTIFIER, TokenType.DOT, TokenType.COMMA,
+                TokenType.LEFT_BRACKET, TokenType.RIGHT_BRACKET, TokenType.QUESTION,
+                TokenType.LEFT_PAREN, TokenType.RIGHT_PAREN, TokenType.ARROW,
+                TokenType.NEWLINE,
+                -> Unit
+
+                else -> return false
+            }
+            cursor++
+        }
+        return false
+    }
+
+    /**
      * Parses `(arguments)` and builds the call it belongs to.
      *
      * [safeCall] is what `callee?(...)` sets: the call is skipped when the function value being called
      * is absent. The two spellings share everything but that flag, so they share this method rather
      * than duplicating an argument list that has to stay in step with itself.
+     *
+     * [typeArguments] are the `<...>` a generic call or construction wrote before the parentheses.
+     * They were parsed by the caller because deciding that a `<` *is* a type argument list needs the
+     * lookahead in [typeArgumentsEndAtCall]; once that is settled they are just carried through.
      */
-    private fun parseArgumentList(callee: Expression, safeCall: Boolean): Expression {
+    private fun parseArgumentList(
+        callee: Expression,
+        safeCall: Boolean,
+        typeArguments: List<TypeReference> = emptyList(),
+    ): Expression {
         val open = advance() // `(`
         newlineInsensitiveDepth++
         skipNestedNewlines()
@@ -2776,6 +2850,7 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
             arguments = arguments,
             argumentListSpan = Span(source, open.span.start, end),
             span = Span(source, callee.span.start, end),
+            typeArguments = typeArguments,
             isSafeCall = safeCall,
         )
     }
@@ -3005,6 +3080,47 @@ class Parser(private val source: SourceFile, private val diagnostics: Diagnostic
     }
 
     // -------------------------------------------------------------------- types
+
+    /**
+     * Parses the `<T, U>` that introduces a generic declaration, and returns the names.
+     *
+     * Shared by `class Box<T>` and `fun <T> f(...)` so both spell the list the same way, accept a
+     * newline inside it for the same reason, and refuse a duplicate the same way. Returns an empty
+     * list when no `<` is present, which is the ordinary non-generic declaration.
+     */
+    private fun parseTypeParameterNames(what: String): List<String> {
+        if (!at(TokenType.LESS)) return emptyList()
+        advance()
+
+        val names = mutableListOf<String>()
+        // A newline inside `<...>` is not a statement boundary: the delimiters already say where the
+        // list ends, so a long parameter list may be wrapped.
+        skipNestedNewlines()
+        while (true) {
+            skipNestedNewlines()
+            val parameter = expect(
+                TokenType.IDENTIFIER,
+                "expected a type parameter name but found ${current().describe()}",
+            ) ?: break
+            if (names.any { it == parameter.text }) {
+                error("duplicate type parameter '${parameter.text}'", parameter.span)
+            } else {
+                names += parameter.text
+            }
+            skipNestedNewlines()
+            if (at(TokenType.COMMA)) {
+                advance()
+                continue
+            }
+            break
+        }
+        skipNestedNewlines()
+        expect(
+            TokenType.GREATER,
+            "expected '>' to close the type parameters of $what but found ${current().describe()}",
+        )
+        return names
+    }
 
     /**
      * `<string>`, `<T1, T2>` — the type arguments written after a type's name, or an empty list.

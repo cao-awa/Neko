@@ -354,6 +354,15 @@ class FunctionDeclaration(
     val body: BlockStatement?,
     val modifiers: List<Modifier>,
     /**
+     * Type parameters written as `fun <T> f(value: T)`, erased to `Object` at run time.
+     *
+     * A method's type parameters are independent of its class': `class Box<T>` may declare
+     * `fun <U> map(f: [T] -> U)`, and each name means what its own declaration says. Inside the body
+     * every one of them is `Object`, which is what the JVM erases it to, so a body may only hand the
+     * value on or print it — exactly what the standard library's forwarders do.
+     */
+    val typeParameters: List<String> = emptyList(),
+    /**
      * The value types named by a trailing `emit [int, int] -> int` clause, always empty when the
      * clause is absent.
      *
@@ -1339,6 +1348,16 @@ class CallExpression(
     val argumentListSpan: Span,
     override val span: Span,
     /**
+     * Type arguments written before the argument list — `Box<int>(1)`, `map<string>(f)`.
+     *
+     * Neko erases them, so they decide nothing about the call's *shape*: the descriptor is the one
+     * the callee's declaration erases to, exactly as if they had not been written. They are still
+     * parses and checked, because a reader who writes them means something by it and a wrong number
+     * of them — "`Box` declares 1 type parameter (T) but 2 type arguments were provided" — is worth
+     * saying. Empty when none were written, which is the ordinary spelling.
+     */
+    val typeArguments: List<TypeReference> = emptyList(),
+    /**
      * Whether this is `callee?(arguments)` — a call that is skipped when the *function value* being
      * called is absent.
      *
@@ -1349,6 +1368,16 @@ class CallExpression(
      */
     val isSafeCall: Boolean = false,
 ) : Expression() {
+    /**
+     * Filled in by the analyzer: [typeArguments] resolved, in the same order.
+     *
+     * The code generator needs the *types*, not the references, because it has to turn each one into
+     * the class token that names it at run time — `int` becomes `Integer.TYPE`, `string` becomes
+     * `String.class`. Empty when none were written, and for a call that turned out to construct
+     * nothing.
+     */
+    var resolvedTypeArguments: List<NekoType> = emptyList()
+
     /**
      * Filled in by the analyzer when the call constructs a class rather than invoking a function.
      *
@@ -1381,7 +1410,55 @@ class CallExpression(
     var instanceMethod: FunctionSymbol? = null
 }
 
+/**
+ * `receiver::generic` — the type arguments a generic value was built with.
+ *
+ * This is the one place Neko's erasure is undone, and it is deliberately an explicit operator
+ * rather than a member: a value of a generic class carries the classes it was parameterised by, and
+ * `::generic` reads them back as a `java.lang.Class[]`. It is written with `::` rather than `.`
+ * because it names something no class declares — asking a value for its own instantiation is a
+ * property of the *compiler*, not of the class.
+ *
+ * The result is always an array, even for a class with a single type parameter, so one rule serves
+ * `Instance<T>` and `Map<K, V>` alike: `value::generic[0]` is the first argument either way.
+ *
+ * [memberName] is parsed rather than fixed so that the diagnostic for `value::foo` can name what was
+ * written; the analyzer accepts only [GENERIC_MEMBER].
+ */
+class GenericAccessExpression(
+    val receiver: Expression,
+    val memberName: String,
+    val memberSpan: Span,
+    override val span: Span,
+) : Expression() {
+
+    /**
+     * Filled in by the analyzer: the class whose type tokens this reads.
+     *
+     * The JVM owner of the field, not the receiver's runtime class, because erasure means one class
+     * serves every instantiation — `Instance<int>` and `Instance<string>` read the same field.
+     */
+    var ownerInternalName: String? = null
+
+    companion object {
+        /** The only member `::` currently answers. */
+        const val GENERIC_MEMBER: String = "generic"
+
+        /**
+         * The field the compiler adds to a generic class, holding its type arguments.
+         *
+         * The `$` is what makes the name unwritable: a Neko identifier may not contain one, so no
+         * declaration can collide with this field however the class is written.
+         */
+        const val GENERIC_FIELD_NAME: String = "generic$"
+
+        /** The descriptor of [GENERIC_FIELD_NAME]: an array of classes. */
+        const val GENERIC_FIELD_DESCRIPTOR: String = "[Ljava/lang/Class;"
+    }
+}
+
 /** `receiver.member`, or `receiver?.member` when [isSafeCall] is set. */
+
 class MemberAccessExpression(
     val receiver: Expression,
     val memberName: String,

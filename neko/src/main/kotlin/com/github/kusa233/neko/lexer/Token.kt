@@ -186,6 +186,14 @@ enum class TokenType(val display: String) {
     RIGHT_BRACKET("']'"),
     COMMA("','"),
     COLON("':'"),
+    /**
+     * `'::'` — the separator in `value::generic`.
+     *
+     * Its own token rather than two [COLON]s, because the two characters are a single operator here:
+     * `:` already introduces a type announcement (`x: int`), and `a::b` is not a `:` followed by
+     * something that begins with `:`.
+     */
+    COLON_COLON("'::'"),
     DOT("'.'"),
     SEMICOLON("';'"),
     ARROW("'->'"),

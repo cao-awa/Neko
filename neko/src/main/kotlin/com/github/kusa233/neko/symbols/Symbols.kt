@@ -304,6 +304,16 @@ class FunctionSymbol(
      * `null` when the method is declared in [enclosingClass] itself, which is the ordinary case.
      */
     val inheritedFrom: String? = null,
+    /**
+     * Type parameters written as `fun <T> f(value: T)`, empty for an ordinary function.
+     *
+     * They are erased, so they are not part of the descriptor and do not take part in overload
+     * resolution — two declarations differing only in their type parameters are the same method. What
+     * they are used for is the two places that have to agree with the declaration: resolving `T`
+     * inside the body to `Object`, and checking that a call site which spelled `f<int>(...)` named a
+     * number of type arguments the declaration can take.
+     */
+    val typeParameters: List<String> = emptyList(),
 ) : Symbol {
     /** The function's own type, e.g. `[] -> [int, int] -> int`. */
     override val type: NekoType = FunctionType(parameterTypes, returnType)

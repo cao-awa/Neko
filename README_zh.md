@@ -544,6 +544,87 @@ class Neko() {
 }
 ```
 
+### 泛型
+
+类型参数写在类名之后，函数则写在 `fun` 之后：
+
+```neko
+meow class Instance<T>(val data: T) {
+}
+
+class Neko() {
+  static {
+    fun <T> methodGeneric(value: T) {
+      println(value)
+    }
+  }
+}
+```
+
+它们会被**擦除**，和 JVM 的擦除完全一致：在函数体里 `T` 就是 `Object`，所以 `T` 类型的参数能接受
+任何引用，而函数体能对它做的只有转交、打印或保存。想读取 `T` 的成员会被拒绝，原因也在这里——
+`Object` 没有那个成员：
+
+```neko
+fun <T> first(value: T) {
+  println(value)        // 可以：打印是擦除后的值唯一能做的事
+  value.length          // 错误：Object 没有成员 'length'
+}
+```
+
+调用处可以显式写出类型实参。它们会和被调方声明对照检查，但除此之外不改变任何东西——描述符仍然是
+声明擦除后的那个，写与不写都一样：
+
+```neko
+class Neko() {
+  static {
+    fun main() {
+      var1: Instance = Instance<int>(123)   // 可以
+      Instance<int, int>(1)                 // 错误：'Instance' 声明了 1 个类型参数 (T)
+      println<int>(1)                       // 错误：'println' 没有声明类型参数
+    }
+  }
+}
+```
+
+因为规则就是擦除，两个实例化共享同一个类：`Instance<int>` 和 `Instance<string>` 在运行时是同一个
+类型，`T` 类型的字段两者都能放。泛型类和泛型函数都会把参数记录到类文件的 `Signature` 属性里，所以
+`fun <T> f(value: T)` 对读者来说仍然和 `fun f(value: Object)` 不同——尽管 JVM 看到的是同一个描述符。
+
+#### 读取值的类型实参：`::generic`
+
+擦除把类型实参从**类型系统**里藏了起来，但没有从**值**里藏起来。每个构造点都会把它写下的实参记在对象
+上，`value::generic` 再把它读回来，类型是 `java.lang.Class[]`：
+
+```neko
+class Neko() {
+  static {
+    fun main() {
+      a: Instance = Instance<int>(123)
+      b: Instance = Instance<string>("hi")
+      println(a::generic[0])     // int
+      println(b::generic[0])     // class java.lang.String
+    }
+  }
+}
+
+meow class Instance<T>(val data: T) {
+}
+```
+
+结果**总是数组**，与实参个数无关，因此 `Pair<A, B>` 回答两个元素，一条规则同时覆盖两者。这里写 `::`
+而不是 `.`，因为它命名的是没有哪个类声明过的东西——实例化是**构造**的事实，不是类的成员。
+
+随之有三条结论，每条都是有意为之：
+
+* **构造时必须写出类型实参。** `Instance(1)` 是错误：值必须带上它被构造时写的东西，而什么都没写时
+  就没有东西可带。
+* **它们属于这个值。** `meow class` 派生的 `equals`、`hashCode` 和 `toString` 都会带上它们，所以
+  `Instance<int>(123)` 和 `Instance<string>(123)` 是两个不同的值，尽管字段里装的是同一个装箱的
+  `Integer`。`toString` 会把它们显示出来：`Instance(data=123, generic=[int])`。
+* **它们从声明类型的类上读取。** `::generic` 需要一个泛型类的接收者；在没有声明类型参数的类上，
+  没有任何东西可报告，这是一个错误而不是空数组。
+
 ### Lambda
 
 Lambda 写作 `{ 参数 -> 主体 }`，凡是期望函数类型或单抽象方法接口的地方都能写：

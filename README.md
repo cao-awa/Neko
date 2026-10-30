@@ -595,6 +595,91 @@ class Neko() {
 }
 ```
 
+### Generics
+
+Type parameters are written after the name for a class and after `fun` for a function:
+
+```neko
+meow class Instance<T>(val data: T) {
+}
+
+class Neko() {
+  static {
+    fun <T> methodGeneric(value: T) {
+      println(value)
+    }
+  }
+}
+```
+
+They are **erased**, exactly as the JVM erases them: inside a body `T` *is* `Object`, so a parameter
+of type `T` accepts any reference and a body may hand the value on, print it, or store it. Reading a
+member off a `T` is refused for the same reason — `Object` has no such member:
+
+```neko
+fun <T> first(value: T) {
+  println(value)        // fine: printing is all an erased value can do
+  value.length          // Error: Object has no member 'length'
+}
+```
+
+A call site may write the arguments explicitly. They are checked against what the callee declares, and
+they change nothing else — the descriptor is the one the declaration erases to, written or not:
+
+```neko
+class Neko() {
+  static {
+    fun main() {
+      var1: Instance = Instance<int>(123)   // fine
+      Instance<int, int>(1)                 // Error: 'Instance' declares 1 type parameter (T)
+      println<int>(1)                       // Error: 'println' declares no type parameters
+    }
+  }
+}
+```
+
+Because erasure is the rule, two instantiations share one class: `Instance<int>` and
+`Instance<string>` are the same runtime type, and a field of type `T` holds either. A generic class
+and a generic function each record their parameters in the class file's `Signature` attribute, so
+`fun <T> f(value: T)` stays distinguishable from `fun f(value: Object)` for a reader — even though the
+JVM sees the same descriptor.
+
+#### Reading a value's type arguments: `::generic`
+
+Erasure hides the arguments from the *type system*, not from the *value*. Every construction writes
+what it named onto the object, and `value::generic` reads it back as a `java.lang.Class[]`:
+
+```neko
+class Neko() {
+  static {
+    fun main() {
+      a: Instance = Instance<int>(123)
+      b: Instance = Instance<string>("hi")
+      println(a::generic[0])     // int
+      println(b::generic[0])     // class java.lang.String
+    }
+  }
+}
+
+meow class Instance<T>(val data: T) {
+}
+```
+
+The result is always an array, whatever the arity, so `Pair<A, B>` answers two elements and one rule
+covers both. `::` is written rather than `.` because it names something no class declares — the
+instantiation is a fact about the *construction*, not a member of the class.
+
+Three consequences follow, and each is deliberate:
+
+* **The arguments are required at a construction.** `Instance(1)` is an error: the value has to carry
+  what it was built with, and there is nothing to carry when nothing was written.
+* **They are part of the value.** A `meow class`'s derived `equals`, `hashCode` and `toString` include
+  them, so `Instance<int>(123)` and `Instance<string>(123)` are different values even though their
+  fields hold the same boxed `Integer`. `toString` shows them: `Instance(data=123, generic=[int])`.
+* **They are read from the *declared* type's class.** `::generic` needs a receiver of a generic class;
+  on a class that declares no type parameters there is nothing to report, which is an error rather
+  than an empty array.
+
 ### Lambda
 
 A lambda is `{ parameters -> body }`, and it can be written wherever a function type or a

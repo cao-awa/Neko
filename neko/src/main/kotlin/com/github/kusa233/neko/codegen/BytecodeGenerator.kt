@@ -223,6 +223,20 @@ class BytecodeGenerator(
         // locks the class actually uses.
         emitPurrLockFields(writer, declaration, symbol)
 
+        // A generic class carries the classes it was parameterised by, so `value::generic` can answer
+        // after the JVM has erased them. The field is `public` because the *call site* writes it —
+        // only the construction knows which arguments were written, and erasure means one class
+        // serves every instantiation — and `synthetic` because the source never declares it.
+        if (declaration.typeParameters.isNotEmpty()) {
+            writer.visitField(
+                ACC_PUBLIC or ACC_SYNTHETIC,
+                GenericAccessExpression.GENERIC_FIELD_NAME,
+                GenericAccessExpression.GENERIC_FIELD_DESCRIPTOR,
+                null,
+                null,
+            ).visitEnd()
+        }
+
         val staticFields = declaration.fields.filter { it.isStatic }
         val instanceFields = declaration.fields.filterNot { it.isStatic }
         // An enum's `<clinit>` has to do more than run field initializers 鈥?it builds every constant,
@@ -931,6 +945,36 @@ class BytecodeGenerator(
             }
         }
 
+        // The type arguments are part of the value's identity, so they are compared like any other
+        // field — with `Arrays.equals`, because two `Class[]`s holding the same classes are different
+        // objects and `Objects.equals` would compare the array references. `Arrays.equals` also
+        // answers `true` for two absent arrays, which is what an object nothing parameterised would
+        // have.
+        if (symbol.typeParameters.isNotEmpty()) {
+            mv.visitVarInsn(ALOAD, 0)
+            mv.visitFieldInsn(
+                GETFIELD,
+                internalName,
+                GenericAccessExpression.GENERIC_FIELD_NAME,
+                GenericAccessExpression.GENERIC_FIELD_DESCRIPTOR,
+            )
+            mv.visitVarInsn(ALOAD, 2)
+            mv.visitFieldInsn(
+                GETFIELD,
+                internalName,
+                GenericAccessExpression.GENERIC_FIELD_NAME,
+                GenericAccessExpression.GENERIC_FIELD_DESCRIPTOR,
+            )
+            mv.visitMethodInsn(
+                INVOKESTATIC,
+                "java/util/Arrays",
+                "equals",
+                "([Ljava/lang/Object;[Ljava/lang/Object;)Z",
+                false,
+            )
+            mv.visitJumpInsn(IFEQ, notEqual)
+        }
+
         mv.visitInsn(ICONST_1)
         mv.visitInsn(IRETURN)
 
@@ -985,6 +1029,41 @@ class BytecodeGenerator(
                     false,
                 )
             }
+            mv.visitInsn(IADD)
+            mv.visitVarInsn(ISTORE, 1)
+        }
+
+        // The type arguments fold in last, for the same reason `equals` compares them: two instances
+        // that differ only in their arguments are not equal, so they must not hash alike.
+        // `Arrays.hashCode` is the null-safe half here — the field is absent only on an object
+        // nothing built, and a branch is cheaper than catching that.
+        if (symbol.typeParameters.isNotEmpty()) {
+            mv.visitIntInsn(BIPUSH, 31)
+            mv.visitVarInsn(ILOAD, 1)
+            mv.visitInsn(IMUL)
+            mv.visitVarInsn(ALOAD, 0)
+            mv.visitFieldInsn(
+                GETFIELD,
+                internalName,
+                GenericAccessExpression.GENERIC_FIELD_NAME,
+                GenericAccessExpression.GENERIC_FIELD_DESCRIPTOR,
+            )
+            val absent = Label()
+            val folded = Label()
+            mv.visitInsn(DUP)
+            mv.visitJumpInsn(IFNULL, absent)
+            mv.visitMethodInsn(
+                INVOKESTATIC,
+                "java/util/Arrays",
+                "hashCode",
+                "([Ljava/lang/Object;)I",
+                false,
+            )
+            mv.visitJumpInsn(GOTO, folded)
+            mv.visitLabel(absent)
+            mv.visitInsn(POP)
+            mv.visitInsn(ICONST_0)
+            mv.visitLabel(folded)
             mv.visitInsn(IADD)
             mv.visitVarInsn(ISTORE, 1)
         }
@@ -1067,6 +1146,46 @@ class BytecodeGenerator(
                     if (plainString) appendConstant(mv, "\"")
                 }
             }
+        }
+
+        // The type arguments print last, so a reader can see which instantiation a value is:
+        // `Instance(data=123, generic=[int])`. `Arrays.toString` is used rather than `append(Object)`,
+        // which would print the array's identity hash — a number that changes between runs and says
+        // nothing about the value.
+        if (symbol.typeParameters.isNotEmpty()) {
+            appendConstant(mv, ", generic=")
+            mv.visitVarInsn(ALOAD, 0)
+            mv.visitFieldInsn(
+                GETFIELD,
+                internalName,
+                GenericAccessExpression.GENERIC_FIELD_NAME,
+                GenericAccessExpression.GENERIC_FIELD_DESCRIPTOR,
+            )
+            val absent = Label()
+            val appended = Label()
+            mv.visitInsn(DUP)
+            mv.visitJumpInsn(IFNULL, absent)
+            mv.visitMethodInsn(
+                INVOKESTATIC,
+                "java/util/Arrays",
+                "toString",
+                "([Ljava/lang/Object;)Ljava/lang/String;",
+                false,
+            )
+            mv.visitJumpInsn(GOTO, appended)
+            mv.visitLabel(absent)
+            mv.visitInsn(POP)
+            // The bare word, pushed rather than appended: the builder is already on the stack and the
+            // shared `append` below consumes it, so both arms have to arrive holding a string.
+            mv.visitLdcInsn("null")
+            mv.visitLabel(appended)
+            mv.visitMethodInsn(
+                INVOKEVIRTUAL,
+                "java/lang/StringBuilder",
+                "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+                false,
+            )
         }
 
         appendConstant(mv, ")")
@@ -1309,6 +1428,11 @@ class BytecodeGenerator(
         // `ScratchHandlerN` at the end. The source never mentions it, but the JVM must see it, so the
         // descriptor is built from the wider list.
         val descriptor = descriptorOf(symbol.descriptorParameterTypes, returnType)
+        // A generic function records its type parameters and the places they appear, so a reader of
+        // the class file sees `fun <T> f(value: T)` rather than a bare erasure — the same courtesy
+        // a generic class gets above. The *descriptor* stays erased either way; this attribute is
+        // the only place the names survive.
+        val signature = genericMethodSignature(function, symbol)
         // `main` is a JVM entry point only when the source says `static`; nothing is added on the
         // author's behalf, so a program without a static `main` simply has no entry point.
         var access = ACC_PUBLIC or if (symbol.isStatic) ACC_STATIC else 0
@@ -1318,7 +1442,7 @@ class BytecodeGenerator(
         // emitted, because there is nothing to emit after the signature.
         if (function.isAbstract) {
             access = access or ACC_ABSTRACT
-            writer.visitMethod(access, function.name, descriptor, null, null).visitEnd()
+            writer.visitMethod(access, function.name, descriptor, signature, null).visitEnd()
             return
         }
 
@@ -1332,7 +1456,7 @@ class BytecodeGenerator(
             else -> null
         }
 
-        val mv = writer.visitMethod(access, function.name, descriptor, null, declaredExceptions)
+        val mv = writer.visitMethod(access, function.name, descriptor, signature, declaredExceptions)
         mv.visitCode()
 
         // Parameters occupy the first slots; an instance method's `this` occupies slot 0.
@@ -3363,6 +3487,7 @@ class BytecodeGenerator(
             is CallExpression -> emitCall(expression, scope)
             is LambdaExpression -> emitLambda(expression, scope)
             is MemberAccessExpression -> emitMemberAccess(expression, scope)
+            is GenericAccessExpression -> emitGenericAccess(expression, scope)
             is IndexExpression -> emitIndex(expression, scope)
             is NyaExpression -> emitNyaExpression(expression, scope)
             is TryExpression -> emitTryExpression(expression, scope)
@@ -3416,6 +3541,31 @@ class BytecodeGenerator(
             if (argument.type == parameterType || argument.type === ErrorType) return@forEachIndexed
             emitCoerce(argument.type, parameterType, scope)
         }
+    }
+
+    /**
+     * `value::generic` — reads back the `Class[]` the construction stored.
+     *
+     * A plain `getfield`, and that is the whole point: erasure made the arguments invisible, so the
+     * only way to see them again is the copy the construction site left on the object. The owner is
+     * the *declared* class rather than the receiver's runtime class, because one class serves every
+     * instantiation.
+     */
+    private fun emitGenericAccess(expression: GenericAccessExpression, scope: MethodScope) {
+        val owner = expression.ownerInternalName
+        if (owner == null) {
+            // Analysis already reported why this cannot resolve; `null` is what a `Class[]`-typed
+            // slot can hold, so the rest of the expression still has a value to work with.
+            scope.mv.visitInsn(ACONST_NULL)
+            return
+        }
+        emitExpression(expression.receiver, scope)
+        scope.mv.visitFieldInsn(
+            GETFIELD,
+            owner,
+            GenericAccessExpression.GENERIC_FIELD_NAME,
+            GenericAccessExpression.GENERIC_FIELD_DESCRIPTOR,
+        )
     }
 
     /**
@@ -4257,12 +4407,88 @@ class BytecodeGenerator(
                 descriptorOf(constructor.parameterTypes, VoidType),
                 false,
             )
-            return
+        } else {
+            for (argument in expression.arguments) emitExpression(argument, scope)
+            val descriptor = descriptorOf(expression.arguments.map { it.type }, VoidType)
+            mv.visitMethodInsn(INVOKESPECIAL, type.internalName, "<init>", descriptor, false)
         }
 
-        for (argument in expression.arguments) emitExpression(argument, scope)
-        val descriptor = descriptorOf(expression.arguments.map { it.type }, VoidType)
-        mv.visitMethodInsn(INVOKESPECIAL, type.internalName, "<init>", descriptor, false)
+        emitGenericTokens(expression, type, scope)
+    }
+
+    /**
+     * Writes the type arguments a construction named into the object it just built.
+     *
+     * This is what makes `value::generic` possible at all. Erasure means one class serves every
+     * instantiation, so the class file cannot say which arguments a *particular* object was built
+     * with — only the construction site knows. So the site stores them on the object, and the read
+     * side ([emitGenericAccess]) is a plain field read.
+     *
+     * The constructor has already consumed its reference and the expression still owes one value, so
+     * the sequence is `dup` (one reference to write through, one to leave behind), the new array, then
+     * `putfield`.
+     */
+    private fun emitGenericTokens(
+        expression: CallExpression,
+        type: ClassType,
+        scope: MethodScope,
+    ) {
+        val arguments = expression.resolvedTypeArguments
+        if (arguments.isEmpty()) return
+
+        val mv = scope.mv
+        mv.visitInsn(DUP)
+        emitClassArray(arguments, mv)
+        mv.visitFieldInsn(
+            PUTFIELD,
+            type.internalName,
+            GenericAccessExpression.GENERIC_FIELD_NAME,
+            GenericAccessExpression.GENERIC_FIELD_DESCRIPTOR,
+        )
+    }
+
+    /** Pushes `new Class[] { tokenOf(type) … }` for [types], in order. */
+    private fun emitClassArray(types: List<NekoType>, mv: MethodVisitor) {
+        pushInt(types.size, mv)
+        mv.visitTypeInsn(ANEWARRAY, "java/lang/Class")
+        for ((index, argument) in types.withIndex()) {
+            mv.visitInsn(DUP)
+            pushInt(index, mv)
+            emitClassToken(argument, mv)
+            mv.visitInsn(AASTORE)
+        }
+    }
+
+    /**
+     * Pushes the `java.lang.Class` that names [type].
+     *
+     * A primitive has no class constant to load — `int.class` is `Integer.TYPE` at the class-file
+     * level — so it is read from its box's `TYPE` field, which is the same object `int.class` denotes.
+     * Everything else, arrays and the erased `Object` included, is a class constant the constant pool
+     * can hold directly.
+     */
+    private fun emitClassToken(type: NekoType, mv: MethodVisitor) {
+        val box = primitiveBoxClass(type)
+        if (box != null) {
+            mv.visitFieldInsn(GETSTATIC, box, "TYPE", "Ljava/lang/Class;")
+            return
+        }
+        // An erased type parameter is `Object`, and this is where that shows: `Box<T>` built inside
+        // another generic class records `Object.class`, because `T` names no class at run time.
+        mv.visitLdcInsn(org.objectweb.asm.Type.getType(descriptorOf(type)))
+    }
+
+    /** The box class of a primitive type, or `null` when [type] is already a reference type. */
+    private fun primitiveBoxClass(type: NekoType): String? = when (type) {
+        ByteType -> "java/lang/Byte"
+        ShortType -> "java/lang/Short"
+        CharType -> "java/lang/Character"
+        IntType -> "java/lang/Integer"
+        LongType -> "java/lang/Long"
+        FloatType -> "java/lang/Float"
+        DoubleType -> "java/lang/Double"
+        BoolType -> "java/lang/Boolean"
+        else -> null
     }
 
     /**
@@ -4670,6 +4896,48 @@ class BytecodeGenerator(
         }
 
     // ------------------------------------------------------------ descriptors
+
+    /**
+     * The `Signature` attribute for a generic function, or `null` for an ordinary one.
+     *
+     * A method's generic signature is `<T:Ljava/lang/Object;>(...)R` with each occurrence of a type
+     * parameter written as `TT;`. Neko erases them, so the *descriptor* is `Object` where the source
+     * wrote `T` — this attribute is what keeps the name a reader wrote, which is the whole reason to
+     * emit it: without it, `fun <T> f(value: T)` and `fun f(value: Object)` would be indistinguishable
+     * in the class file even though the source says something different.
+     *
+     * Only type variables are rewritten. Everything else keeps its erased form, which is legal in a
+     * signature — `Ljava/util/List;` is as valid there as `Ljava/util/List<...>;` — and is what keeps
+     * this from having to re-derive the arguments of every nested type.
+     */
+    private fun genericMethodSignature(function: FunctionDeclaration, symbol: FunctionSymbol): String? {
+        if (function.typeParameters.isEmpty()) return null
+
+        fun typeVariable(reference: TypeReference?): String? = when {
+            reference is NamedTypeReference && reference.name in function.typeParameters ->
+                "T${reference.name};"
+
+            // `T[]` is legal in a signature too, and an array of a type variable is the one
+            // composition worth handling: it is what a parameter like `items: T[]` declares.
+            reference is ArrayTypeReference ->
+                typeVariable(reference.element)?.let { "[$it" }
+
+            else -> null
+        }
+
+        return buildString {
+            append('<')
+            for (name in function.typeParameters) append(name).append(":Ljava/lang/Object;")
+            append('>')
+            append('(')
+            for ((index, parameterType) in symbol.descriptorParameterTypes.withIndex()) {
+                val written = function.parameters.getOrNull(index)?.declaredType
+                append(typeVariable(written) ?: descriptorOf(parameterType))
+            }
+            append(')')
+            append(typeVariable(function.returnType) ?: descriptorOf(symbol.returnType))
+        }
+    }
 
     private fun descriptorOf(type: NekoType): String = when (type) {
         ByteType -> "B"

@@ -3,16 +3,28 @@ locate com.github.kusa233.neko.sample.instance
 class InstanceSample {
     static {
         fun main() {
-            var1: Instance = Instance(123)
-            var2: Instance = Instance(123)
-            var3: Instance = Instance(456)
+            var1: Instance = Instance<int>(123)
+            var2: Instance = Instance<int>(123)
+            var3: Instance = Instance<int>(456)
             println(var1 == var2)
             println(var2 == var3)
             println(var1)
+
+            methodGeneric<int>(123)
+
+            // `::generic` reads back what the construction named. The type is erased from the
+            // value's own signature, so this is the only way to see it at run time.
+            var4: Instance = Instance<string>("hello")
+            println(var1::generic[0]) // int
+            println(var4::generic[0]) // class java.lang.String
+        }
+
+        fun <T> methodGeneric(value: T) {
+            println(value)
         }
     }
 }
 
-meow class Instance(val data: int) {
+meow class Instance<T>(val data: T) {
 
 }
