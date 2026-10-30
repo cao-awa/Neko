@@ -3552,6 +3552,17 @@ class BytecodeGenerator(
      * instantiation.
      */
     private fun emitGenericAccess(expression: GenericAccessExpression, scope: MethodScope) {
+        // A platform class has no field to read: the arguments came from the *declared type* instead,
+        // so they are known here and the answer is a constant array. The receiver is still evaluated,
+        // because it may be a call with side effects — only its value is unused.
+        val constants = expression.constantTypeArguments
+        if (constants.isNotEmpty()) {
+            emitExpression(expression.receiver, scope)
+            scope.mv.visitInsn(POP)
+            emitClassArray(constants, scope.mv)
+            return
+        }
+
         val owner = expression.ownerInternalName
         if (owner == null) {
             // Analysis already reported why this cannot resolve; `null` is what a `Class[]`-typed
@@ -4433,6 +4444,10 @@ class BytecodeGenerator(
         type: ClassType,
         scope: MethodScope,
     ) {
+        // Only a generic class the program declares has the field: the compiler emits it with the
+        // class, so `ArrayList<int>()` — whose arguments are the JDK's business — must not try to
+        // write one. The analyzer decides this, because only it knows whether the class was declared.
+        if (!expression.storesGenericTokens) return
         val arguments = expression.resolvedTypeArguments
         if (arguments.isEmpty()) return
 

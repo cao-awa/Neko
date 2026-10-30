@@ -2327,6 +2327,10 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             return
         }
 
+        // This class has the field the compiler emits for a generic declaration, so the construction
+        // is the one that fills it in.
+        expression.storesGenericTokens = expression.typeArguments.isNotEmpty()
+
         if (expression.typeArguments.isEmpty()) {
             diagnostics.error(
                 "'$name' is generic, so its type arguments have to be written: " +
@@ -2356,8 +2360,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         if (written.isEmpty()) return
 
         // Resolved once and kept, because the code generator has to name each argument as a class
-        // token and must not resolve it a second way.
-        expression.resolvedTypeArguments = written.map { resolveType(it) }
+        // token and must not resolve it a second way. A construction has already resolved them, to
+        // build the type it produces, so only a call has any work left here.
+        if (expression.resolvedTypeArguments.isEmpty()) {
+            expression.resolvedTypeArguments = written.map { resolveType(it) }
+        }
         if (declared.size == written.size) return
 
         val expected = if (declared.isEmpty()) {
@@ -3371,6 +3378,11 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      */
     private fun isAssignable(actual: NekoType, expected: NekoType): Boolean {
         if (actual.isAssignableTo(expected)) return true
+        // Two uses of one class that name different type arguments are already settled — false — and
+        // the hierarchy below must not overrule it. `isSubtype` answers "is this class a kind of that
+        // one", and for the same class the answer is trivially yes; that is exactly why the arguments
+        // have to be checked before the question is asked rather than after.
+        if (!actual.agreesOnTypeArguments(expected)) return false
         // A nullable value never fits a non-nullable type. That direction is the whole point of the
         // suffix, so it is refused before the class hierarchy is consulted — otherwise a declared
         // subtype would let `Cat?` through where a `Cat` is expected.
@@ -3381,6 +3393,22 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
         val source = if (actual is NullableType) actual.inner else actual
         val target = if (expected is NullableType) expected.inner else expected
         return isSubtype(source, target)
+    }
+
+    /**
+     * A class type as the source wrote it, with its type arguments in the name.
+     *
+     * `displayName` is what diagnostics print, and a message about a mismatch has to show what
+     * differs: `declared as ArrayList<int> but its initializer has type ArrayList<string>`. Left bare,
+     * the same sentence would name one type twice and read as if the compiler had contradicted itself.
+     */
+    private fun parameterisedType(bare: ClassType, arguments: List<NekoType>): ClassType {
+        if (arguments.isEmpty()) return bare
+        return ClassType(
+            bare.internalName,
+            "${bare.displayName}<${arguments.joinToString(", ") { it.displayName }}>",
+            arguments,
+        )
     }
 
     private fun requireBool(type: NekoType, span: Span, construct: String) {
@@ -4441,10 +4469,21 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
      * and left to the JVM verifier to match up.
      */
     private fun analyzeConstruction(expression: CallExpression, callee: NameExpression): NekoType {
-        val type = resolveClassType(callee.name, callee.span)
-        if (type !is ClassType) {
+        val bare = resolveClassType(callee.name, callee.span)
+        if (bare !is ClassType) {
             for (argument in expression.arguments) analyzeExpression(argument)
             return ErrorType
+        }
+
+        // The type arguments written on the construction are part of the *type it produces*, not
+        // just a decoration on the call: `ArrayList<int>()` builds an `ArrayList<int>`, and a
+        // variable declared with that type has to accept it. Resolving them here — rather than only
+        // checking their number later — is what keeps the two sides the same type.
+        val type = if (expression.typeArguments.isEmpty()) {
+            bare
+        } else {
+            expression.resolvedTypeArguments = expression.typeArguments.map { resolveType(it) }
+            parameterisedType(bare, expression.resolvedTypeArguments)
         }
 
         val classSymbol = classBySimpleName(callee.name)
@@ -4959,13 +4998,36 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
             return ErrorType
         }
 
+        // Two sources of truth, in the order that keeps them honest.
+        //
+        // A class the *program* declares carries the arguments on each object, so the field is what
+        // the construction actually named — authoritative even when the declared type disagrees.
+        //
+        // A class from outside the program (`java.util.ArrayList`) has no such field: it was compiled
+        // long ago, and writing one would be a `putfield` against a field that does not exist. But if
+        // the *declared type* names the arguments, they are already known here, so the read becomes a
+        // constant array. That is reification by the compiler rather than by the class file, and it is
+        // the only reading available for a JDK generic.
+        val declaration = classBySimpleName(classType.simpleName)
+        if (declaration == null) {
+            if (classType.arguments.isEmpty()) {
+                diagnostics.error(
+                    "'${classType.displayName}' declares no type parameters, so it has no type " +
+                        "arguments to report",
+                    expression.memberSpan,
+                )
+                return ErrorType
+            }
+            expression.constantTypeArguments = classType.arguments
+            return ArrayType(CLASS_TYPE)
+        }
+
         // Only the value's *own* declaration counts. A subclass of a generic class would carry the
         // parent's tokens, but Neko cannot currently write a generic supertype (`class Sub: Box<int>`
         // parses as an interface list, and `Box<int>()` does not parse at all), so there is no way to
         // pin the arguments and the parent's field would be absent. Refusing here is what keeps
         // `::generic` from answering `null` for a value the language could not have parameterised.
-        val declaration = classBySimpleName(classType.simpleName)
-        if (declaration == null || declaration.typeParameters.isEmpty()) {
+        if (declaration.typeParameters.isEmpty()) {
             diagnostics.error(
                 "'${classType.displayName}' declares no type parameters, so it has no type arguments " +
                     "to report",
@@ -5948,7 +6010,7 @@ class Analyzer(private val program: NekoProgram, private val diagnostics: Diagno
                     if (arguments.isEmpty() || resolved !is ClassType) {
                         resolved
                     } else {
-                        ClassType(resolved.internalName, resolved.displayName, arguments)
+                        parameterisedType(resolved, arguments)
                     }
                 }
             }

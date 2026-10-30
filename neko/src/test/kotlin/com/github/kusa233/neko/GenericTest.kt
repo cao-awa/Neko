@@ -480,6 +480,162 @@ class GenericTest {
         )
     }
 
+    // ------------------------------------------------- type arguments on a platform class
+
+    /**
+     * A JDK generic builds and runs when both sides name the arguments.
+     *
+     * `ArrayList<int>()` is a construction whose class the program does *not* declare, so there is no
+     * `generic$` field to fill in and none is emitted — writing one would be a `putfield` against a
+     * field the JDK never had, which surfaces as `NoSuchFieldError` the moment the class runs. The
+     * type arguments matter here only to the type checker.
+     */
+    @Test
+    fun `a platform generic class is constructible with type arguments`() {
+        val loaded = TestSupport.load(
+            program(
+                "import java.util",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            list: ArrayList<int> = ArrayList<int>()",
+                "            println(list)",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        assertEquals("[]\n", run(loaded, "com.github.kusa233.neko.sample.Main"))
+    }
+
+    /**
+     * `::generic` answers a JDK generic's arguments from the *declared type*.
+     *
+     * `java.util.ArrayList` was compiled long before this program, so no `generic$` field was ever
+     * added to it and there is nothing on the object to read. The arguments are still knowable when
+     * the variable names them — `list: ArrayList<int>` — so the compiler answers them itself, as a
+     * constant array. Without this the operator would be unusable for every platform generic.
+     */
+    @Test
+    fun `generic access answers a platform class from the declared type`() {
+        val loaded = TestSupport.load(
+            program(
+                "import java.util",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            list: ArrayList<int> = ArrayList<int>()",
+                "            println(list::generic[0])",
+                "        }",
+                "    }",
+                "}",
+            ),
+        )
+        assertEquals("int\n", run(loaded, "com.github.kusa233.neko.sample.Main"))
+    }
+
+    /**
+     * A side that writes *no* arguments accepts any, so the erased spelling stays usable.
+     *
+     * `ArrayList` and `ArrayList<int>` are one run-time type, and writing `ArrayList` on one side is
+     * how this language says "whatever fits". Only a *disagreement between two written lists* is
+     * refused — see the test below — so the erased form remains a way to write the same statement.
+     */
+    @Test
+    fun `an erased side accepts any type arguments`() {
+        val result = TestSupport.compileWithLibrary(
+            program(
+                "import java.util",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            a: ArrayList = ArrayList<int>()",
+                "            b: ArrayList<string> = ArrayList()",
+                "            println(a)",
+                "            println(b)",
+                "        }",
+                "    }",
+                "}",
+            ),
+            name = "Platform.neko",
+        )
+        assertTrue(
+            !result.hasErrors,
+            "expected an omitted argument list to accept any, but got: " +
+                TestSupport.messages(result),
+        )
+    }
+
+    /**
+     * Two *written* argument lists that differ are refused, and the message shows both.
+     *
+     * Erasure does not make `ArrayList<int>` and `ArrayList<string>` the same promise: they are one
+     * class at run time and two different types in the source, so writing the arguments and having
+     * them disagree is a mistake rather than a liberty. This is the case the reader is most likely to
+     * make, so the diagnostic has to name the arguments — "declared as ArrayList<int> but its
+     * initializer has type ArrayList<string>" — and not print `ArrayList` twice.
+     */
+    @Test
+    fun `mismatched type arguments are refused and named in the message`() {
+        val result = TestSupport.compileWithLibrary(
+            program(
+                "import java.util",
+                "",
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            list: ArrayList<int> = ArrayList<string>()",
+                "            println(list)",
+                "        }",
+                "    }",
+                "}",
+            ),
+            name = "Platform.neko",
+        )
+        assertTrue(
+            TestSupport.messages(result).any {
+                "declared as ArrayList<int> but its initializer has type ArrayList<string>" in it
+            },
+            "expected the mismatch to name both argument lists: ${TestSupport.messages(result)}",
+        )
+    }
+
+    /**
+     * The same rule holds for a class the program declares.
+     *
+     * A declared generic is where the arguments are *most* meaningful — they decide what the value
+     * reports through `::generic` — so a construction that disagrees with the declared type is refused
+     * even though both sides are the same class file.
+     */
+    @Test
+    fun `mismatched type arguments are refused for a declared generic`() {
+        val result = TestSupport.compile(
+            program(
+                "class Main {",
+                "    static {",
+                "        fun main() {",
+                "            b: Box<int> = Box<string>(\"x\")",
+                "            println(b)",
+                "        }",
+                "    }",
+                "}",
+                "",
+                "meow class Box<T>(val data: T) {",
+                "}",
+            ),
+            name = "Generic.neko",
+        )
+        assertTrue(
+            TestSupport.messages(result).any {
+                "declared as Box<int> but its initializer has type Box<string>" in it
+            },
+            "expected the mismatch to name both argument lists: ${TestSupport.messages(result)}",
+        )
+    }
+
     /** `::` names only `generic`, so anything else is reported at the name that was written. */
     @Test
     fun `an unknown name after double colon is refused`() {

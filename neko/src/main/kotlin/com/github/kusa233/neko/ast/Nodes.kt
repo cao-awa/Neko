@@ -1379,6 +1379,17 @@ class CallExpression(
     var resolvedTypeArguments: List<NekoType> = emptyList()
 
     /**
+     * Filled in by the analyzer: whether the constructed class carries a type-argument field.
+     *
+     * Only a generic class the *program* declares has one — the compiler adds the field when it
+     * emits the class, and a class from the JDK was compiled long ago without it. A construction of
+     * a platform generic such as `ArrayList<int>()` therefore names its arguments for the type
+     * checker's benefit only, and writing them onto the object would be a `putfield` against a field
+     * that does not exist (`NoSuchFieldError` at run time).
+     */
+    var storesGenericTokens: Boolean = false
+
+    /**
      * Filled in by the analyzer when the call constructs a class rather than invoking a function.
      *
      * Neko has no `new`, so `CustomException()` — a capitalized name that is not a function — is a
@@ -1439,6 +1450,17 @@ class GenericAccessExpression(
      * serves every instantiation — `Instance<int>` and `Instance<string>` read the same field.
      */
     var ownerInternalName: String? = null
+
+    /**
+     * Filled in by the analyzer: the arguments to answer from the *source*, when there is no field.
+     *
+     * A class the program does not declare — `java.util.ArrayList` — was compiled long before this
+     * one and has no `generic$` field, so nothing was stored on the value. But if the receiver's
+     * declared type already names the arguments (`list: ArrayList<int>`), they are known here,
+     * statically, and the read becomes a constant array rather than a field read. Empty when the
+     * answer has to come from [ownerInternalName]'s field instead.
+     */
+    var constantTypeArguments: List<NekoType> = emptyList()
 
     companion object {
         /** The only member `::` currently answers. */

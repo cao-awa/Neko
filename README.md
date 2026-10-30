@@ -679,6 +679,23 @@ Three consequences follow, and each is deliberate:
 * **They are read from the *declared* type's class.** `::generic` needs a receiver of a generic class;
   on a class that declares no type parameters there is nothing to report, which is an error rather
   than an empty array.
+* **Two written argument lists must agree.** The two sides of an assignment are checked against each
+  other: `ArrayList<int> = ArrayList<string>()` is refused, because the same class at run time is two
+  different promises in the source. A side that writes *none* accepts any — `ArrayList` is how this
+  language spells "whatever fits" — so the erased spelling stays usable.
+
+A class the program does not declare — a JDK generic such as `java.util.ArrayList` — carries no such
+field, because it was compiled long before this program. Its arguments are still answerable when the
+variable names them, so the compiler supplies them itself:
+
+```neko
+import java.util
+
+list: ArrayList<int> = ArrayList<int>()
+println(list::generic[0])   // int — read from the declared type, not from the object
+
+other: ArrayList<int> = ArrayList<string>()   // Error: mismatched type arguments
+```
 
 ### Lambda
 

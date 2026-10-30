@@ -232,9 +232,43 @@ val NekoType.isError: Boolean get() = this === ErrorType
  *  * A `T?` may *not* be used where `T` is expected. That direction is the one that would need a
  *    run-time check the language refuses to perform implicitly, so it is a compile-time error.
  */
+/**
+ * Whether two uses of the *same* class agree about their type arguments.
+ *
+ * Erasure means the JVM does not care, but the source does: `ArrayList<int>` and `ArrayList<string>`
+ * are one class at run time and two different promises in the code. Naming arguments on both sides
+ * and having them differ is a mistake the reader made, so it is refused rather than quietly allowed.
+ *
+ * A side that names *none* is the one disagreement the rule permits, because "no arguments written"
+ * is how this language spells "whatever fits" — `ArrayList = ArrayList<int>()` is the erased form of
+ * the same statement, and requiring it to be spelled out would make the erased type unwritable. Two
+ * *different* classes are never compared here: their relationship is the class hierarchy's business,
+ * and whether their arguments line up is part of that question rather than this one.
+ */
+fun NekoType.agreesOnTypeArguments(other: NekoType): Boolean {
+    val mine = withoutNullability()
+    val theirs = other.withoutNullability()
+    if (mine !is ClassType || theirs !is ClassType) return true
+    if (mine.internalName != theirs.internalName) return true
+    if (mine.arguments.isEmpty() || theirs.arguments.isEmpty()) return true
+    return mine.arguments == theirs.arguments
+}
+
+/** This type with any `?` stripped, which never changes the class a value is of. */
+private fun NekoType.withoutNullability(): NekoType =
+    if (this is NullableType) inner.withoutNullability() else this
+
 fun NekoType.isAssignableTo(target: NekoType): Boolean {
     if (this === ErrorType || target === ErrorType) return true
     if (this == target) return true
+    // Uses of one class that name *different* arguments are not the same promise, even though they
+    // are the same class.
+    if (!agreesOnTypeArguments(target)) return false
+    // Uses of one class are then interchangeable: erasure means the JVM copies one class per
+    // declaration, so `ArrayList` and `ArrayList<int>` are the same run-time type and neither needs a
+    // check this language could express. Only the case where *both* sides name arguments and disagree
+    // is refused, and that was settled above.
+    if (this is ClassType && target is ClassType && internalName == target.internalName) return true
     if (target is NullableType) {
         // Both nullable: the inner types decide. A non-null value: it fits if its own type does,
         // which is the "non-null to nullable is allowed" direction.

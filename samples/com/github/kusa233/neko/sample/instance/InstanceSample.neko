@@ -1,5 +1,7 @@
 locate com.github.kusa233.neko.sample.instance
 
+import java.util
+
 class InstanceSample {
     static {
         fun main() {
@@ -17,6 +19,10 @@ class InstanceSample {
             var4: Instance = Instance<string>("hello")
             println(var1::generic[0]) // int
             println(var4::generic[0]) // class java.lang.String
+
+            list: ArrayList<int> = ArrayList<int>()
+            println(list)
+            println(list::generic[0])
         }
 
         fun <T> methodGeneric(value: T) {

@@ -624,6 +624,21 @@ meow class Instance<T>(val data: T) {
   `Integer`。`toString` 会把它们显示出来：`Instance(data=123, generic=[int])`。
 * **它们从声明类型的类上读取。** `::generic` 需要一个泛型类的接收者；在没有声明类型参数的类上，
   没有任何东西可报告，这是一个错误而不是空数组。
+* **两侧都写了实参时必须一致。** 赋值两侧会互相检查：`ArrayList<int> = ArrayList<string>()` 会被拒绝，
+  因为运行时是同一个类，在源码里却是两个不同的承诺。只写一侧则接受任意实参——`ArrayList` 就是这门语言
+  表达「随便哪个都行」的写法——所以擦除形式仍然可用。
+
+程序**没有声明**的类——比如 JDK 的 `java.util.ArrayList`——没有这个字段，因为它早在本程序之前就编译好了。
+但如果变量写明了实参，答案仍然是可知的，这时由编译器直接给出：
+
+```neko
+import java.util
+
+list: ArrayList<int> = ArrayList<int>()
+println(list::generic[0])   // int —— 来自声明类型，而不是来自对象
+
+other: ArrayList<int> = ArrayList<string>()   // 错误：类型实参不匹配
+```
 
 ### Lambda
 
